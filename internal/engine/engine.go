@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/marcboeker/go-duckdb/v2"
+	"github.com/duckdb/duckdb-go/v2"
 	"github.com/prochac/duckflight/internal/config"
 )
 
@@ -30,8 +30,6 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 			fmt.Sprintf("SET memory_limit = '%s'", cfg.MemoryLimit),
 			fmt.Sprintf("SET threads = %d", cfg.MaxThreads),
 		}
-
-
 
 		for _, sql := range bootSQL {
 			if _, err := execer.ExecContext(context.Background(), sql, nil); err != nil {

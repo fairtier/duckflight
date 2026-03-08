@@ -6,7 +6,7 @@ import (
 	"context"
 	"database/sql/driver"
 
-	"github.com/marcboeker/go-duckdb/v2"
+	"github.com/duckdb/duckdb-go/v2"
 )
 
 // ArrowConn wraps a raw DuckDB connection and its Arrow interface.

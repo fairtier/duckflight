@@ -70,12 +70,12 @@ A SaaS platform where each tenant gets their own Iceberg data lake. Tenants quer
 
 ## 3. Dependencies
 
-| Library | Import Path | Version | Purpose |
-|---|---|---|---|
-| go-duckdb | `github.com/marcboeker/go-duckdb/v2` | v2.4+ | DuckDB driver with Arrow C Data Interface |
-| arrow-go | `github.com/apache/arrow-go/v18` | v18 | Arrow types, Flight, Flight SQL server framework |
-| DuckDB Iceberg ext | auto-installed | latest | Iceberg catalog ATTACH, reads, writes |
-| prometheus/client_golang | `github.com/prometheus/client_golang` | v1.x | Metrics exposition |
+| Library                  | Import Path                           | Version | Purpose                                          |
+|--------------------------|---------------------------------------|---------|--------------------------------------------------|
+| go-duckdb                | `github.com/duckdb/duckdb-go/v2`      | v2.5+   | DuckDB driver with Arrow C Data Interface        |
+| arrow-go                 | `github.com/apache/arrow-go/v18`      | v18     | Arrow types, Flight, Flight SQL server framework |
+| DuckDB Iceberg ext       | auto-installed                        | latest  | Iceberg catalog ATTACH, reads, writes            |
+| prometheus/client_golang | `github.com/prometheus/client_golang` | v1.x    | Metrics exposition                               |
 
 ### Build
 
@@ -344,21 +344,21 @@ Modeled after `arrow-go/v18/arrow/flight/flightsql/example/sqlite_server.go`. Em
 
 **Core methods to implement:**
 
-| Method | Description | State |
-|---|---|---|
-| `GetFlightInfoStatement` | Accept SQL, store handle, return FlightInfo (no Location) | Stateless or session-bound |
-| `DoGetStatement` | Execute query, stream Arrow batches back | Uses pool or session conn |
-| `CreatePreparedStatement` | Prepare SQL, return schema + handle | Session-bound |
-| `DoGetPreparedStatement` | Execute prepared stmt, stream results | Session-bound |
-| `DoPutPreparedStatementQuery` | Bind parameters | Session-bound |
-| `ClosePreparedStatement` | Clean up | Session-bound |
-| `DoPutCommandStatementUpdate` | Execute DML (INSERT/UPDATE/DELETE) | Acquires write lock |
-| `BeginTransaction` | BEGIN on session connection | Session-bound |
-| `EndTransaction` | COMMIT or ROLLBACK | Session-bound |
-| `GetFlightInfoCatalogs` / `DoGetCatalogs` | `information_schema.schemata` | Stateless |
-| `GetFlightInfoSchemas` / `DoGetDBSchemas` | `information_schema.schemata` | Stateless |
-| `GetFlightInfoTables` / `DoGetTables` | `information_schema.tables` | Stateless |
-| `DoGetTableTypes` | Returns static list | Stateless |
+| Method                                    | Description                                               | State                      |
+|-------------------------------------------|-----------------------------------------------------------|----------------------------|
+| `GetFlightInfoStatement`                  | Accept SQL, store handle, return FlightInfo (no Location) | Stateless or session-bound |
+| `DoGetStatement`                          | Execute query, stream Arrow batches back                  | Uses pool or session conn  |
+| `CreatePreparedStatement`                 | Prepare SQL, return schema + handle                       | Session-bound              |
+| `DoGetPreparedStatement`                  | Execute prepared stmt, stream results                     | Session-bound              |
+| `DoPutPreparedStatementQuery`             | Bind parameters                                           | Session-bound              |
+| `ClosePreparedStatement`                  | Clean up                                                  | Session-bound              |
+| `DoPutCommandStatementUpdate`             | Execute DML (INSERT/UPDATE/DELETE)                        | Acquires write lock        |
+| `BeginTransaction`                        | BEGIN on session connection                               | Session-bound              |
+| `EndTransaction`                          | COMMIT or ROLLBACK                                        | Session-bound              |
+| `GetFlightInfoCatalogs` / `DoGetCatalogs` | `information_schema.schemata`                             | Stateless                  |
+| `GetFlightInfoSchemas` / `DoGetDBSchemas` | `information_schema.schemata`                             | Stateless                  |
+| `GetFlightInfoTables` / `DoGetTables`     | `information_schema.tables`                               | Stateless                  |
+| `DoGetTableTypes`                         | Returns static list                                       | Stateless                  |
 
 **The critical bridge — DoGetStatement:**
 
@@ -435,26 +435,26 @@ func (s *DuckDBFlightSQLServer) GetFlightInfoStatement(
 
 DuckDB's `information_schema` covers both local and attached Iceberg catalogs:
 
-| Flight SQL Call | DuckDB Query |
-|---|---|
-| `GetCatalogs` | `SELECT DISTINCT catalog_name FROM information_schema.schemata` |
-| `GetDBSchemas` | `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE ...` |
-| `GetTables` | `SELECT * FROM information_schema.tables WHERE ...` |
-| `GetTableTypes` | Static: `['BASE TABLE', 'VIEW', 'LOCAL TEMPORARY']` |
-| `GetPrimaryKeys` | `SELECT * FROM information_schema.key_column_usage WHERE ...` |
+| Flight SQL Call  | DuckDB Query                                                                  |
+|------------------|-------------------------------------------------------------------------------|
+| `GetCatalogs`    | `SELECT DISTINCT catalog_name FROM information_schema.schemata`               |
+| `GetDBSchemas`   | `SELECT catalog_name, schema_name FROM information_schema.schemata WHERE ...` |
+| `GetTables`      | `SELECT * FROM information_schema.tables WHERE ...`                           |
+| `GetTableTypes`  | Static: `['BASE TABLE', 'VIEW', 'LOCAL TEMPORARY']`                           |
+| `GetPrimaryKeys` | `SELECT * FROM information_schema.key_column_usage WHERE ...`                 |
 
 ### 6.6 Concurrency Summary
 
-| Scenario | Connection | Lock |
-|---|---|---|
-| Stateless SELECT | Pool | None |
-| Session SELECT (no txn) | Dedicated | None |
-| Session SELECT (in txn) | Dedicated | None (reads are free) |
-| Stateless DML | Pool | `writeMu` for duration of exec |
-| Session DML (in txn) | Dedicated | `writeMu` from first write until commit/rollback |
-| Multiple readers | Concurrent | None |
-| Multiple writers | Serialized | `writeMu` |
-| Cross-replica | Independent | Each replica has its own DuckDB, own locks |
+| Scenario                | Connection  | Lock                                             |
+|-------------------------|-------------|--------------------------------------------------|
+| Stateless SELECT        | Pool        | None                                             |
+| Session SELECT (no txn) | Dedicated   | None                                             |
+| Session SELECT (in txn) | Dedicated   | None (reads are free)                            |
+| Stateless DML           | Pool        | `writeMu` for duration of exec                   |
+| Session DML (in txn)    | Dedicated   | `writeMu` from first write until commit/rollback |
+| Multiple readers        | Concurrent  | None                                             |
+| Multiple writers        | Serialized  | `writeMu`                                        |
+| Cross-replica           | Independent | Each replica has its own DuckDB, own locks       |
 
 ---
 
@@ -550,11 +550,11 @@ bootSQL := []string{
 
 DuckDB `memory_limit` should be ~70–80% of the K8s memory limit, leaving headroom for Go runtime, gRPC buffers, Arrow allocations, and extension overhead.
 
-| Tier | `memory_limit` | `threads` | `statement_timeout` | K8s memory | K8s CPU | HPA max |
-|---|---|---|---|---|---|---|
-| Free | 512MB | 1 | 10s | 768Mi | 0.5 | 1 |
-| Pro | 2GB | 4 | 60s | 2560Mi | 2 | 4 |
-| Enterprise | 8GB | 8 | 300s | 10Gi | 4 | 8 |
+| Tier       | `memory_limit` | `threads` | `statement_timeout` | K8s memory | K8s CPU | HPA max |
+|------------|----------------|-----------|---------------------|------------|---------|---------|
+| Free       | 512MB          | 1         | 10s                 | 768Mi      | 0.5     | 1       |
+| Pro        | 2GB            | 4         | 60s                 | 2560Mi     | 2       | 4       |
+| Enterprise | 8GB            | 8         | 300s                | 10Gi       | 4       | 8       |
 
 ### Application-Level Guardrails
 
@@ -1340,24 +1340,24 @@ spec:
 
 ## 13. Implementation Milestones
 
-| # | Milestone | Tests Turn Green | Effort |
-|---|---|---|---|
-| **M1** | Project scaffold + Engine boots with in-memory DuckDB + pool | — | 0.5 day |
-| **M2** | `GetFlightInfoStatement` + `DoGetStatement` | TestExecuteSimpleQuery, TestExecuteEmptyResult, TestExecuteSyntaxError | 2 days |
-| **M3** | Metadata endpoints (catalogs, schemas, tables, table types) | TestGetCatalogs, TestGetSchemas, TestGetTables, TestGetTableTypes | 1 day |
-| **M4** | Prepared statements | TestPreparedStatement | 1 day |
-| **M5** | DML via `DoPutCommandStatementUpdate` | TestStatementUpdate | 0.5 day |
-| **M6** | Sessions + session-bound connections | — (infra for M7-M8) | 1 day |
-| **M7** | Transactions (BEGIN, COMMIT, ROLLBACK) + write serialization | TestTransactionCommit, TestTransactionRollback | 1.5 days |
-| **M8** | Concurrency: pool under load, write serialization, reaping | concurrency_test.go suite | 1 day |
-| **M9** | Statement timeout + guardrails | TestStatementTimeout | 0.5 day |
-| **M10** | Metering: Prometheus metrics + metered reader | — (verify via /metrics endpoint) | 0.5 day |
-| **M11** | Auth middleware (bearer token validation) | — | 0.5 day |
-| **M12** | Iceberg ATTACH integration | iceberg_integration_test.go suite | 1 day |
-| **M13** | Dockerfile + docker-compose + CI pipeline | — | 0.5 day |
-| **M14** | K8s manifests + HPA + Envoy auth-header routing | — | 1 day |
-| **M15** | TLS | — | 0.5 day |
-| **M16** | Load testing + tuning | — | 1 day |
+| #       | Milestone                                                    | Tests Turn Green                                                       | Effort   |
+|---------|--------------------------------------------------------------|------------------------------------------------------------------------|----------|
+| **M1**  | Project scaffold + Engine boots with in-memory DuckDB + pool | —                                                                      | 0.5 day  |
+| **M2**  | `GetFlightInfoStatement` + `DoGetStatement`                  | TestExecuteSimpleQuery, TestExecuteEmptyResult, TestExecuteSyntaxError | 2 days   |
+| **M3**  | Metadata endpoints (catalogs, schemas, tables, table types)  | TestGetCatalogs, TestGetSchemas, TestGetTables, TestGetTableTypes      | 1 day    |
+| **M4**  | Prepared statements                                          | TestPreparedStatement                                                  | 1 day    |
+| **M5**  | DML via `DoPutCommandStatementUpdate`                        | TestStatementUpdate                                                    | 0.5 day  |
+| **M6**  | Sessions + session-bound connections                         | — (infra for M7-M8)                                                    | 1 day    |
+| **M7**  | Transactions (BEGIN, COMMIT, ROLLBACK) + write serialization | TestTransactionCommit, TestTransactionRollback                         | 1.5 days |
+| **M8**  | Concurrency: pool under load, write serialization, reaping   | concurrency_test.go suite                                              | 1 day    |
+| **M9**  | Statement timeout + guardrails                               | TestStatementTimeout                                                   | 0.5 day  |
+| **M10** | Metering: Prometheus metrics + metered reader                | — (verify via /metrics endpoint)                                       | 0.5 day  |
+| **M11** | Auth middleware (bearer token validation)                    | —                                                                      | 0.5 day  |
+| **M12** | Iceberg ATTACH integration                                   | iceberg_integration_test.go suite                                      | 1 day    |
+| **M13** | Dockerfile + docker-compose + CI pipeline                    | —                                                                      | 0.5 day  |
+| **M14** | K8s manifests + HPA + Envoy auth-header routing              | —                                                                      | 1 day    |
+| **M15** | TLS                                                          | —                                                                      | 0.5 day  |
+| **M16** | Load testing + tuning                                        | —                                                                      | 1 day    |
 
 **Total: ~13 days** from scaffold to production-ready, with tests green at each step.
 
@@ -1365,15 +1365,15 @@ spec:
 
 ## 14. Reference Materials
 
-| Resource | What to Use It For |
-|---|---|
-| `apache/arrow-go/v18/arrow/flight/flightsql/example/sqlite_server.go` | Primary template — every method you need to implement has a working example here |
-| `apache/arrow-go/v18/arrow/flight/flightsql/sqlite_server_test.go` | Test patterns — how to boot an in-process server and test with a Flight SQL client |
-| `marcboeker/go-duckdb/blob/main/arrow.go` | Arrow interface usage — `QueryContext`, `RegisterView`, `NewArrowFromConn` |
-| `voltrondata/sqlflite` | Production reference with DuckDB backend (Python, but same architecture) |
-| `duckdb.org/docs/stable/core_extensions/iceberg/` | Iceberg ATTACH, secrets, catalog options |
-| `duckdb.org/2025/11/28/iceberg-writes-in-duckdb` | Iceberg write support (INSERT, UPDATE, DELETE), transaction semantics |
-| `arrow.apache.org/docs/format/FlightSql.html` | Flight SQL protocol spec — all RPC methods and Protobuf message definitions |
+| Resource                                                              | What to Use It For                                                                 |
+|-----------------------------------------------------------------------|------------------------------------------------------------------------------------|
+| `apache/arrow-go/v18/arrow/flight/flightsql/example/sqlite_server.go` | Primary template — every method you need to implement has a working example here   |
+| `apache/arrow-go/v18/arrow/flight/flightsql/sqlite_server_test.go`    | Test patterns — how to boot an in-process server and test with a Flight SQL client |
+| `duckdb/duckdb-go/blob/main/arrow.go`                                 | Arrow interface usage — `QueryContext`, `RegisterView`, `NewArrowFromConn`         |
+| `voltrondata/sqlflite`                                                | Production reference with DuckDB backend (Python, but same architecture)           |
+| `duckdb.org/docs/stable/core_extensions/iceberg/`                     | Iceberg ATTACH, secrets, catalog options                                           |
+| `duckdb.org/2025/11/28/iceberg-writes-in-duckdb`                      | Iceberg write support (INSERT, UPDATE, DELETE), transaction semantics              |
+| `arrow.apache.org/docs/format/FlightSql.html`                         | Flight SQL protocol spec — all RPC methods and Protobuf message definitions        |
 
 ---
 
