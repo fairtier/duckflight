@@ -46,7 +46,7 @@ func (s *DuckFlightSQLServer) queryStrings(ctx context.Context, query string) ([
 		rec := rdr.Record()
 		col := rec.Column(0).(*array.String)
 		for i := 0; i < col.Len(); i++ {
-			results = append(results, col.Value(i))
+			results = append(results, strings.Clone(col.Value(i)))
 		}
 	}
 	if err := rdr.Err(); err != nil {
@@ -75,7 +75,7 @@ func (s *DuckFlightSQLServer) queryStringPairs(ctx context.Context, query string
 		col0 := rec.Column(0).(*array.String)
 		col1 := rec.Column(1).(*array.String)
 		for i := 0; i < col0.Len(); i++ {
-			results = append(results, [2]string{col0.Value(i), col1.Value(i)})
+			results = append(results, [2]string{strings.Clone(col0.Value(i)), strings.Clone(col1.Value(i))})
 		}
 	}
 	if err := rdr.Err(); err != nil {
