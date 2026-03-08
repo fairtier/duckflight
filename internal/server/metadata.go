@@ -244,6 +244,35 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	outSchema := schema_ref.Tables
 	cols := []arrow.Array{catArr, schArr, nameArr, typeArr}
 
+	if cmd.GetIncludeSchema() {
+		outSchema = schema_ref.TablesWithIncludedSchema
+
+		// For each table, get its Arrow schema by querying with LIMIT 0.
+		binaryBldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		defer binaryBldr.Release()
+
+		catStrings := catArr.(*array.String)
+		schStrings := schArr.(*array.String)
+		nameStrings := nameArr.(*array.String)
+
+		for i := 0; i < int(numRows); i++ {
+			tableFQN := fmt.Sprintf("%s.%s.%s",
+				catStrings.Value(i), schStrings.Value(i), nameStrings.Value(i))
+			tblRdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableFQN))
+			if err != nil {
+				binaryBldr.AppendNull()
+				continue
+			}
+			tblSchema := tblRdr.Schema()
+			tblRdr.Release()
+			binaryBldr.Append(flight.SerializeSchema(tblSchema, s.Alloc))
+		}
+
+		schemaArr := binaryBldr.NewArray()
+		defer schemaArr.Release()
+		cols = append(cols, schemaArr)
+	}
+
 	batch := array.NewRecord(outSchema, cols, numRows)
 
 	ch := make(chan flight.StreamChunk, 1)

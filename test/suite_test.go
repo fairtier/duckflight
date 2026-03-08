@@ -72,7 +72,10 @@ func (s *DuckFlightSQLSuite) SetupTest() {
 	// Seed canonical test tables fresh for each test.
 	s.seedSQL(`CREATE OR REPLACE TABLE foreignTable (id INTEGER PRIMARY KEY, foreignName VARCHAR, value BIGINT)`)
 	s.seedSQL(`INSERT INTO foreignTable VALUES (1, 'one', 1)`)
-	s.seedSQL(`CREATE OR REPLACE TABLE intTable (id INTEGER PRIMARY KEY, keyName VARCHAR, value BIGINT, foreignId BIGINT)`)
+	s.seedSQL(`DROP TABLE IF EXISTS intTable`)
+	s.seedSQL(`DROP SEQUENCE IF EXISTS intTable_id_seq`)
+	s.seedSQL(`CREATE SEQUENCE intTable_id_seq START 100`)
+	s.seedSQL(`CREATE TABLE intTable (id INTEGER DEFAULT nextval('intTable_id_seq') PRIMARY KEY, keyName VARCHAR, value BIGINT, foreignId BIGINT)`)
 	s.seedSQL(`INSERT INTO intTable VALUES (1, 'one', 1, 1), (2, 'zero', 0, 1), (3, 'negative one', -1, 1), (4, NULL, NULL, NULL)`)
 }
 

@@ -12,18 +12,42 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/prochac/duckflight/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
+type cachedQuery struct {
+	query         string
+	transactionID string
+}
+
 var (
-	queryCache sync.Map // handle string -> query string
+	queryCache sync.Map // handle string -> cachedQuery
 )
 
 func genHandle() []byte {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
 	return []byte(hex.EncodeToString(b))
+}
+
+// acquireConn returns either the transaction's connection or a pool connection.
+// If fromPool is true, the caller must release it when done.
+func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (ac *engine.ArrowConn, fromPool bool, err error) {
+	if txnID != "" {
+		val, ok := s.openTransactions.Load(txnID)
+		if !ok {
+			return nil, false, status.Error(codes.InvalidArgument, "invalid transaction handle")
+		}
+		ts := val.(*txnState)
+		return ts.conn, false, nil
+	}
+	ac, err = s.engine.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, false, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+	}
+	return ac, true, nil
 }
 
 // GetFlightInfoStatement validates the query and stores it for
@@ -34,15 +58,23 @@ func (s *DuckFlightSQLServer) GetFlightInfoStatement(
 	desc *flight.FlightDescriptor,
 ) (*flight.FlightInfo, error) {
 	query := cmd.GetQuery()
+	txnID := string(cmd.GetTransactionId())
 
 	// Validate the query by running EXPLAIN — catches syntax errors
 	// without actually executing the query.
-	if err := s.engine.ExecSQL(ctx, "EXPLAIN "+query); err != nil {
+	ac, fromPool, err := s.acquireConn(ctx, txnID)
+	if err != nil {
+		return nil, err
+	}
+	if fromPool {
+		defer s.engine.Pool.Release(ac)
+	}
+	if _, err := ac.ExecContext(ctx, "EXPLAIN "+query); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "query error: %s", err)
 	}
 
 	handle := genHandle()
-	queryCache.Store(string(handle), query)
+	queryCache.Store(string(handle), cachedQuery{query: query, transactionID: txnID})
 
 	tkt, err := flightsql.CreateStatementQueryTicket(handle)
 	if err != nil {
@@ -72,16 +104,18 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	if !ok {
 		return nil, nil, status.Error(codes.NotFound, fmt.Sprintf("statement handle not found: %q", handle))
 	}
-	query := val.(string)
+	cq := val.(cachedQuery)
 
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, fromPool, err := s.acquireConn(ctx, cq.transactionID)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, nil, err
 	}
 
-	rdr, err := ac.Arrow.QueryContext(ctx, query)
+	rdr, err := ac.Arrow.QueryContext(ctx, cq.query)
 	if err != nil {
-		s.engine.Pool.Release(ac)
+		if fromPool {
+			s.engine.Pool.Release(ac)
+		}
 		return nil, nil, status.Errorf(codes.Internal, "query execution error: %s", err)
 	}
 
@@ -91,7 +125,9 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	go func() {
 		defer close(ch)
 		defer rdr.Release()
-		defer s.engine.Pool.Release(ac)
+		if fromPool {
+			defer s.engine.Pool.Release(ac)
+		}
 
 		for rdr.Next() {
 			rec := rdr.Record()
@@ -111,4 +147,53 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	}()
 
 	return schema, ch, nil
+}
+
+// DoPutCommandStatementUpdate executes a SQL update (INSERT/UPDATE/DELETE/DDL).
+func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
+	ctx context.Context,
+	cmd flightsql.StatementUpdate,
+) (int64, error) {
+	txnID := string(cmd.GetTransactionId())
+
+	ac, fromPool, err := s.acquireConn(ctx, txnID)
+	if err != nil {
+		return 0, err
+	}
+	if fromPool {
+		defer s.engine.Pool.Release(ac)
+	}
+
+	n, err := ac.ExecContext(ctx, cmd.GetQuery())
+	if err != nil {
+		return 0, status.Errorf(codes.Internal, "update error: %s", err)
+	}
+	return n, nil
+}
+
+// GetSchemaStatement returns the schema of a query without executing it.
+func (s *DuckFlightSQLServer) GetSchemaStatement(
+	ctx context.Context,
+	cmd flightsql.StatementQuery,
+	desc *flight.FlightDescriptor,
+) (*flight.SchemaResult, error) {
+	query := cmd.GetQuery()
+
+	ac, err := s.engine.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+	}
+	defer s.engine.Pool.Release(ac)
+
+	// Execute with LIMIT 0 to get schema without results.
+	rdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query))
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "query error: %s", err)
+	}
+	defer rdr.Release()
+
+	schema := rdr.Schema()
+	return &flight.SchemaResult{
+		Schema: flight.SerializeSchema(schema, s.Alloc),
+	}, nil
 }

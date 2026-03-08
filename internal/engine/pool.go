@@ -15,6 +15,29 @@ type ArrowConn struct {
 	Arrow *duckdb.Arrow
 }
 
+// ExecContext executes a SQL statement that does not return rows.
+func (ac *ArrowConn) ExecContext(ctx context.Context, query string) (int64, error) {
+	execer, ok := ac.conn.(driver.ExecerContext)
+	if !ok {
+		return 0, context.Canceled
+	}
+	result, err := execer.ExecContext(ctx, query, nil)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := result.RowsAffected()
+	return n, nil
+}
+
+// BeginTx starts a transaction on the connection.
+func (ac *ArrowConn) BeginTx(ctx context.Context) (driver.Tx, error) {
+	beginner, ok := ac.conn.(driver.ConnBeginTx)
+	if !ok {
+		return nil, context.Canceled
+	}
+	return beginner.BeginTx(ctx, driver.TxOptions{})
+}
+
 // ArrowPool is a bounded pool of Arrow-enabled DuckDB connections.
 type ArrowPool struct {
 	pool chan *ArrowConn

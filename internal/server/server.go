@@ -24,8 +24,10 @@ type Config struct {
 type DuckFlightSQLServer struct {
 	flightsql.BaseServer
 
-	engine *engine.Engine
-	mu     sync.RWMutex
+	engine           *engine.Engine
+	mu               sync.RWMutex
+	preparedStmts    sync.Map // handle string -> preparedStatement
+	openTransactions sync.Map // handle string -> *engine.ArrowConn
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
