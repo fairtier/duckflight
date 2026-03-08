@@ -31,9 +31,7 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 			fmt.Sprintf("SET threads = %d", cfg.MaxThreads),
 		}
 
-		if cfg.QueryTimeout != "" {
-			bootSQL = append(bootSQL, fmt.Sprintf("SET statement_timeout = '%s'", cfg.QueryTimeout))
-		}
+
 
 		for _, sql := range bootSQL {
 			if _, err := execer.ExecContext(context.Background(), sql, nil); err != nil {

@@ -17,21 +17,19 @@ package duckflight_test
 
 import (
 	"context"
-	"fmt"
+	_ "fmt"
 	"testing"
-	"time"
+	_ "time"
 
-	"github.com/apache/arrow-go/v18/arrow"
+	_ "github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/stretchr/testify/require"
+	_ "github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
-	// This import will fail until the server package exists.
-	// M1's first job is to create the stub that makes this compile.
 	duckserver "github.com/prochac/duckflight/internal/server"
 )
 
