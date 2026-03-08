@@ -32,7 +32,7 @@ import (
 
 	// This import will fail until the server package exists.
 	// M1's first job is to create the stub that makes this compile.
-	duckserver "github.com/yourorg/duckflight/internal/server"
+	duckserver "github.com/prochac/duckflight/internal/server"
 )
 
 // ---------------------------------------------------------------------------
