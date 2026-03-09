@@ -22,8 +22,8 @@ A SaaS platform where each tenant gets their own Iceberg data lake. Tenants quer
                            │ gRPC + auth header
                            ▼
                 ┌─────────────────────┐
-                │  L7 Load Balancer   │
-                │  (Envoy / Istio)    │
+                │  Envoy Gateway      │
+                │  (Gateway API)      │
                 │                     │
                 │  consistent hash on │
                 │  authorization hdr  │
@@ -62,7 +62,7 @@ A SaaS platform where each tenant gets their own Iceberg data lake. Tenants quer
 
 **One service = one tenant = one DuckDB = one Iceberg ATTACH.** No multi-tenant multiplexing within a process. Tenant isolation comes from deployment isolation. Each replica is an independent, stateless-ish compute node that attaches to the same Iceberg catalog.
 
-**Auth header hashing for stickiness.** L7 load balancer uses consistent hashing on the `authorization` header. Same token → same replica → sessions and transactions stay pinned. No `Location` in `FlightEndpoint`, no direct pod connections, no client cooperation needed.
+**Auth header hashing for stickiness.** Envoy Gateway (via Gateway API + `BackendTrafficPolicy`) uses consistent hashing on the `authorization` header. Same token → same replica → sessions and transactions stay pinned. No `Location` in `FlightEndpoint`, no direct pod connections, no client cooperation needed.
 
 **DuckDB is ephemeral compute.** All durable state lives in Iceberg (object storage + catalog). DuckDB instances are in-memory, disposable, and can be killed and restarted at any time. The only cost of a restart is re-attaching the Iceberg catalog and re-downloading extension cache.
 
@@ -76,6 +76,7 @@ A SaaS platform where each tenant gets their own Iceberg data lake. Tenants quer
 | arrow-go                 | `github.com/apache/arrow-go/v18`      | v18     | Arrow types, Flight, Flight SQL server framework |
 | DuckDB Iceberg ext       | auto-installed                        | latest  | Iceberg catalog ATTACH, reads, writes            |
 | prometheus/client_golang | `github.com/prometheus/client_golang` | v1.x    | Metrics exposition                               |
+| Envoy Gateway            | K8s CRDs (BackendTrafficPolicy)       | v1.x    | Consistent hash routing via Gateway API extension |
 
 ### Build
 
@@ -157,10 +158,16 @@ flightsql-duckberg/
 ├── deploy/
 │   ├── Dockerfile
 │   ├── docker-compose.yml          # Local dev: Lakekeeper + MinIO + server
-│   └── k8s/
-│       ├── deployment.yaml
-│       ├── service.yaml
-│       └── hpa.yaml
+│   └── helm/
+│       └── duckflight/             # Helm chart
+│           ├── Chart.yaml
+│           ├── values.yaml
+│           └── templates/
+│               ├── deployment.yaml
+│               ├── service.yaml
+│               ├── hpa.yaml
+│               ├── grpcroute.yaml  # Gateway API GRPCRoute
+│               └── backend-policy.yaml # Envoy Gateway BackendTrafficPolicy
 ├── go.mod
 └── go.sum
 ```
@@ -460,23 +467,46 @@ DuckDB's `information_schema` covers both local and attached Iceberg catalogs:
 
 ## 7. Load Balancing and Routing
 
+Uses **Gateway API** (standard K8s API) with **Envoy Gateway** as the implementation. Envoy Gateway adds `BackendTrafficPolicy` CRD for advanced load balancing features like consistent hashing — extending the standard Gateway API without vendor lock-in.
+
 ### Auth Header Stickiness
 
-Every Flight SQL client sends an `authorization` header on every RPC. L7 load balancer hashes on this header for consistent routing:
+Every Flight SQL client sends an `authorization` header on every RPC. Envoy Gateway hashes on this header for consistent routing.
+
+**GRPCRoute** (standard Gateway API):
 
 ```yaml
-# Envoy route config
-route_config:
-  virtual_hosts:
-    - name: flightsql
-      routes:
-        - match:
-            prefix: "/"
-          route:
-            cluster: flightsql
-            hash_policy:
-              - header:
-                  header_name: "authorization"
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: flightsql
+spec:
+  parentRefs:
+    - name: flightsql-gateway
+  rules:
+    - backendRefs:
+        - name: flightsql
+          port: 31337
+```
+
+**BackendTrafficPolicy** (Envoy Gateway extension — consistent hash on auth header):
+
+```yaml
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: flightsql-sticky
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: GRPCRoute
+      name: flightsql
+  loadBalancer:
+    type: ConsistentHash
+    consistentHash:
+      type: Header
+      header:
+        name: authorization
 ```
 
 Same token → same hash → same replica → sessions and transactions stay pinned automatically. No cookies, no Location, no client cooperation.
@@ -494,35 +524,7 @@ A generic Flight SQL client:
 If the client refreshes its bearer token (OAuth2 expiry), the hash changes and the LB may route to a different replica. Mitigations:
 
 - **Long enough token TTL.** If tokens live 1 hour and transactions live seconds, this is a non-issue.
-- **Hash on a stable claim.** Extract tenant ID from JWT via an Envoy Lua filter, hash on that instead of the full auth header.
-
-```yaml
-http_filters:
-  - name: envoy.filters.http.lua
-    typed_config:
-      inline_code: |
-        function envoy_on_request(handle)
-          local auth = handle:headers():get("authorization")
-          if auth then
-            local tenant = extract_tenant_from_jwt(auth)
-            if tenant then
-              handle:headers():add("x-tenant-id", tenant)
-            end
-          end
-        end
-
-route_config:
-  virtual_hosts:
-    - name: flightsql
-      routes:
-        - match:
-            prefix: "/"
-          route:
-            cluster: flightsql
-            hash_policy:
-              - header:
-                  header_name: "x-tenant-id"
-```
+- **Hash on a stable claim.** Use an Envoy Gateway `EnvoyExtensionPolicy` to extract tenant ID from JWT and hash on that instead of the full auth header.
 
 ### Replica failure
 
@@ -1222,118 +1224,67 @@ EXPOSE 31337 9090
 ENTRYPOINT ["flightsql-server"]
 ```
 
-### Kubernetes
+### Helm Chart
+
+All K8s resources are packaged as a Helm chart at `deploy/helm/duckflight/`. One chart release per tenant.
 
 ```yaml
-# deploy/k8s/deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: flightsql
-  labels:
-    app: flightsql
-    tenant: "{{ .tenant }}"
-spec:
-  replicas: 1   # HPA manages scaling
-  selector:
-    matchLabels:
-      app: flightsql
-      tenant: "{{ .tenant }}"
-  template:
-    metadata:
-      labels:
-        app: flightsql
-        tenant: "{{ .tenant }}"
-    spec:
-      containers:
-        - name: flightsql
-          image: yourorg/flightsql-server:latest
-          ports:
-            - name: grpc
-              containerPort: 31337
-            - name: metrics
-              containerPort: 9090
-          env:
-            - name: TENANT_ID
-              value: "{{ .tenant }}"
-            - name: INSTANCE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: ICEBERG_ENDPOINT
-              value: "{{ .icebergEndpoint }}"
-            - name: ICEBERG_WAREHOUSE
-              value: "{{ .icebergWarehouse }}"
-            - name: ICEBERG_CLIENT_ID
-              valueFrom:
-                secretKeyRef:
-                  name: iceberg-credentials
-                  key: client-id
-            - name: ICEBERG_CLIENT_SECRET
-              valueFrom:
-                secretKeyRef:
-                  name: iceberg-credentials
-                  key: client-secret
-            - name: MEMORY_LIMIT
-              value: "{{ .tier.memoryLimit }}"
-            - name: MAX_THREADS
-              value: "{{ .tier.maxThreads }}"
-            - name: QUERY_TIMEOUT
-              value: "{{ .tier.queryTimeout }}"
-          resources:
-            requests:
-              memory: "{{ .tier.k8sMemoryRequest }}"
-              cpu: "{{ .tier.k8sCpuRequest }}"
-            limits:
-              memory: "{{ .tier.k8sMemoryLimit }}"
-              cpu: "{{ .tier.k8sCpuLimit }}"
-          readinessProbe:
-            grpc:
-              port: 31337
-            initialDelaySeconds: 5
-          livenessProbe:
-            grpc:
-              port: 31337
-            initialDelaySeconds: 10
+# deploy/helm/duckflight/values.yaml (defaults)
+image:
+  repository: yourorg/duckflight
+  tag: latest
 
----
-# deploy/k8s/service.yaml
-apiVersion: v1
-kind: Service
-metadata:
-  name: flightsql
-spec:
-  selector:
-    app: flightsql
-    tenant: "{{ .tenant }}"
-  ports:
-    - name: grpc
-      port: 31337
-      targetPort: 31337
-    - name: metrics
-      port: 9090
-      targetPort: 9090
+tenant: ""
 
----
-# deploy/k8s/hpa.yaml
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: flightsql
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: flightsql
-  minReplicas: {{ .tier.hpaMin }}
-  maxReplicas: {{ .tier.hpaMax }}
-  metrics:
-    - type: Resource
-      resource:
-        name: cpu
-        target:
-          type: Utilization
-          averageUtilization: 70
+iceberg:
+  endpoint: ""
+  warehouse: ""
+  existingSecret: "iceberg-credentials"  # must have client-id, client-secret keys
+
+# S3 storage credentials (optional — for when catalog doesn't vend credentials)
+s3:
+  endpoint: ""
+  existingSecret: ""  # must have access-key, secret-key keys
+  region: ""
+  urlStyle: "path"
+
+resources:
+  memoryLimit: "2GB"
+  maxThreads: 4
+  queryTimeout: "60s"
+  poolSize: 8
+
+  requests:
+    memory: "2560Mi"
+    cpu: "1"
+  limits:
+    memory: "2560Mi"
+    cpu: "2"
+
+hpa:
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilization: 70
+
+gateway:
+  enabled: true
+  parentRef: "flightsql-gateway"  # name of the Gateway resource
+```
+
+Templates include:
+- **deployment.yaml** — Deployment with env vars from values + secrets
+- **service.yaml** — ClusterIP service exposing gRPC (31337) and metrics (9090)
+- **hpa.yaml** — HorizontalPodAutoscaler with CPU target
+- **grpcroute.yaml** — Gateway API `GRPCRoute` (standard, when `gateway.enabled`)
+- **backend-policy.yaml** — Envoy Gateway `BackendTrafficPolicy` for consistent hash on `authorization` header (when `gateway.enabled`)
+
+Install per tenant:
+
+```bash
+helm install flightsql-tenant-abc deploy/helm/duckflight/ \
+  --set tenant=abc \
+  --set iceberg.endpoint=https://catalog.example.com/v1 \
+  --set iceberg.warehouse=abc_warehouse
 ```
 
 ---
@@ -1355,7 +1306,7 @@ spec:
 | **M11** | Auth middleware (bearer token validation)                    | —                                                                      | 0.5 day  |
 | **M12** | Iceberg ATTACH integration                                   | iceberg_integration_test.go suite                                      | 1 day    |
 | **M13** | Dockerfile + docker-compose + CI pipeline                    | —                                                                      | 0.5 day  |
-| **M14** | K8s manifests + HPA + Envoy auth-header routing              | —                                                                      | 1 day    |
+| **M14** | Helm chart + Gateway API (GRPCRoute) + Envoy Gateway BackendTrafficPolicy (consistent hash) + HPA | — | 1 day |
 | **M15** | TLS                                                          | —                                                                      | 0.5 day  |
 | **M16** | Load testing + tuning                                        | —                                                                      | 1 day    |
 
