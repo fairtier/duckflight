@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -111,38 +112,69 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		return nil, nil, err
 	}
 
-	rdr, err := ac.Arrow.QueryContext(ctx, cq.query)
+	queryCtx := ctx
+	var queryCancel context.CancelFunc
+	if s.queryTimeout > 0 {
+		queryCtx, queryCancel = context.WithTimeout(ctx, s.queryTimeout)
+	}
+
+	rdr, err := ac.Arrow.QueryContext(queryCtx, cq.query)
 	if err != nil {
+		if queryCancel != nil {
+			queryCancel()
+		}
 		if fromPool {
 			s.engine.Pool.Release(ac)
+		}
+		if queryCtx.Err() == context.DeadlineExceeded {
+			return nil, nil, status.Error(codes.DeadlineExceeded, "query exceeded time limit")
 		}
 		return nil, nil, status.Errorf(codes.Internal, "query execution error: %s", err)
 	}
 
-	schema := rdr.Schema()
+	metered := newMeteredReader(rdr, s.maxResultBytes)
+	schema := metered.Schema()
 	ch := make(chan flight.StreamChunk)
+
+	start := time.Now()
+	activeQueries.Inc()
 
 	go func() {
 		defer close(ch)
-		defer rdr.Release()
+		defer metered.Release()
+		if queryCancel != nil {
+			defer queryCancel()
+		}
 		if fromPool {
 			defer s.engine.Pool.Release(ac)
 		}
+		defer func() {
+			activeQueries.Dec()
+			queryDuration.WithLabelValues().Observe(time.Since(start).Seconds())
+		}()
 
-		for rdr.Next() {
-			rec := rdr.Record()
+		errored := false
+		for metered.Next() {
+			rec := metered.Record()
 			rec.Retain()
 			select {
 			case ch <- flight.StreamChunk{Data: rec}:
-			case <-ctx.Done():
+			case <-queryCtx.Done():
+				errored = true
+				queryCount.WithLabelValues("timeout").Inc()
 				return
 			}
 		}
-		if err := rdr.Err(); err != nil {
+		if err := metered.Err(); err != nil {
+			errored = true
+			queryCount.WithLabelValues("error").Inc()
 			select {
 			case ch <- flight.StreamChunk{Err: err}:
-			case <-ctx.Done():
+			case <-queryCtx.Done():
 			}
+		}
+		if !errored {
+			queryCount.WithLabelValues("ok").Inc()
 		}
 	}()
 

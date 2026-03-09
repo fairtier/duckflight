@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
@@ -14,10 +15,11 @@ import (
 
 // Config mirrors the test's expected configuration surface.
 type Config struct {
-	MemoryLimit  string
-	MaxThreads   int
-	QueryTimeout string
-	PoolSize     int
+	MemoryLimit    string
+	MaxThreads     int
+	QueryTimeout   string
+	PoolSize       int
+	MaxResultBytes int64
 }
 
 // DuckFlightSQLServer implements the FlightSQL server interface backed by DuckDB.
@@ -28,6 +30,8 @@ type DuckFlightSQLServer struct {
 	mu               sync.RWMutex
 	preparedStmts    sync.Map // handle string -> preparedStatement
 	openTransactions sync.Map // handle string -> *engine.ArrowConn
+	queryTimeout     time.Duration
+	maxResultBytes   int64
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
@@ -45,8 +49,18 @@ func New(cfg Config) (*DuckFlightSQLServer, error) {
 		return nil, err
 	}
 
+	var timeout time.Duration
+	if cfg.QueryTimeout != "" {
+		timeout, err = time.ParseDuration(cfg.QueryTimeout)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	srv := &DuckFlightSQLServer{
-		engine: eng,
+		engine:         eng,
+		queryTimeout:   timeout,
+		maxResultBytes: cfg.MaxResultBytes,
 	}
 	srv.Alloc = memory.DefaultAllocator
 

@@ -19,6 +19,15 @@ type Config struct {
 
 	// Server
 	ListenAddr string
+
+	// Metrics
+	MetricAddr string
+
+	// Auth
+	AuthTokens []string
+
+	// Metering
+	MaxResultBytes int64
 }
 
 // DefaultConfig returns a Config with sensible defaults for development.
