@@ -1398,3 +1398,5 @@ spec:
 9. **DuckDB single writer.** Only one connection can write at a time across the entire instance. Serialize writes with a mutex. For transactions with writes, hold the mutex from first write to commit/rollback.
 
 10. **`information_schema` unifies catalogs.** After `ATTACH`, Iceberg tables appear in `information_schema` under the attached catalog name. Your metadata endpoints get Iceberg tables for free.
+
+11. Good inspiration can be GizmoSQL, DuckDB Flight SQL server implemented in C++: https://github.com/gizmodata/gizmosql
