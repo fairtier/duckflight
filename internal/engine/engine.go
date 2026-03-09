@@ -78,6 +78,9 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 			}
 			attachSQL += ")"
 			bootSQL = append(bootSQL, attachSQL)
+
+			// Make the Iceberg catalog the default so users can omit the "lake.default." prefix.
+			bootSQL = append(bootSQL, "USE lake.\"default\"")
 		}
 
 		for _, sql := range bootSQL {

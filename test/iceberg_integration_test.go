@@ -312,15 +312,15 @@ func (s *IcebergSuite) TestIceberg_WriteAndReadBack() {
 	ctx := context.Background()
 
 	_, err := s.client.ExecuteUpdate(ctx,
-		"CREATE TABLE lake.default.test_rw (id INTEGER, name VARCHAR)")
+		"CREATE TABLE test_rw (id INTEGER, name VARCHAR)")
 	s.Require().NoError(err)
 
 	result, err := s.client.ExecuteUpdate(ctx,
-		"INSERT INTO lake.default.test_rw VALUES (1, 'alice'), (2, 'bob')")
+		"INSERT INTO test_rw VALUES (1, 'alice'), (2, 'bob')")
 	s.Require().NoError(err)
 	s.EqualValues(2, result)
 
-	_, recs := s.execQuery("SELECT id, name FROM lake.default.test_rw ORDER BY id")
+	_, recs := s.execQuery("SELECT id, name FROM test_rw ORDER BY id")
 	defer releaseRecs(recs)
 
 	s.Require().NotEmpty(recs)
@@ -339,7 +339,7 @@ func (s *IcebergSuite) TestIceberg_TablesAppearInMetadata() {
 	ctx := context.Background()
 
 	_, err := s.client.ExecuteUpdate(ctx,
-		"CREATE TABLE IF NOT EXISTS lake.default.meta_test (x INTEGER)")
+		"CREATE TABLE IF NOT EXISTS meta_test (x INTEGER)")
 	s.Require().NoError(err)
 
 	// GetCatalogs should include "lake"
@@ -379,18 +379,18 @@ func (s *IcebergSuite) TestIceberg_SchemaEvolution() {
 	ctx := context.Background()
 
 	_, err := s.client.ExecuteUpdate(ctx,
-		"CREATE TABLE lake.default.schema_evo (id INTEGER)")
+		"CREATE TABLE schema_evo (id INTEGER)")
 	s.Require().NoError(err)
 
 	_, err = s.client.ExecuteUpdate(ctx,
-		"INSERT INTO lake.default.schema_evo VALUES (1)")
+		"INSERT INTO schema_evo VALUES (1)")
 	s.Require().NoError(err)
 
 	_, err = s.client.ExecuteUpdate(ctx,
-		"ALTER TABLE lake.default.schema_evo ADD COLUMN name VARCHAR")
+		"ALTER TABLE schema_evo ADD COLUMN name VARCHAR")
 	s.Require().NoError(err)
 
-	schema, recs := s.execQuery("SELECT * FROM lake.default.schema_evo")
+	schema, recs := s.execQuery("SELECT * FROM schema_evo")
 	defer releaseRecs(recs)
 
 	s.Equal(2, schema.NumFields())
@@ -402,19 +402,19 @@ func (s *IcebergSuite) TestIceberg_TransactionCommit() {
 	ctx := context.Background()
 
 	_, err := s.client.ExecuteUpdate(ctx,
-		"CREATE TABLE lake.default.txn_commit (id INTEGER, val VARCHAR)")
+		"CREATE TABLE txn_commit (id INTEGER, val VARCHAR)")
 	s.Require().NoError(err)
 
 	tx, err := s.client.BeginTransaction(ctx)
 	s.Require().NoError(err)
 
 	_, err = tx.ExecuteUpdate(ctx,
-		"INSERT INTO lake.default.txn_commit VALUES (1, 'committed')")
+		"INSERT INTO txn_commit VALUES (1, 'committed')")
 	s.Require().NoError(err)
 
 	s.Require().NoError(tx.Commit(ctx))
 
-	_, recs := s.execQuery("SELECT * FROM lake.default.txn_commit")
+	_, recs := s.execQuery("SELECT * FROM txn_commit")
 	defer releaseRecs(recs)
 
 	var totalRows int64
@@ -428,19 +428,19 @@ func (s *IcebergSuite) TestIceberg_TransactionRollback() {
 	ctx := context.Background()
 
 	_, err := s.client.ExecuteUpdate(ctx,
-		"CREATE TABLE lake.default.txn_rollback (id INTEGER, val VARCHAR)")
+		"CREATE TABLE txn_rollback (id INTEGER, val VARCHAR)")
 	s.Require().NoError(err)
 
 	tx, err := s.client.BeginTransaction(ctx)
 	s.Require().NoError(err)
 
 	_, err = tx.ExecuteUpdate(ctx,
-		"INSERT INTO lake.default.txn_rollback VALUES (1, 'rolled_back')")
+		"INSERT INTO txn_rollback VALUES (1, 'rolled_back')")
 	s.Require().NoError(err)
 
 	s.Require().NoError(tx.Rollback(ctx))
 
-	_, recs := s.execQuery("SELECT * FROM lake.default.txn_rollback")
+	_, recs := s.execQuery("SELECT * FROM txn_rollback")
 	defer releaseRecs(recs)
 
 	var totalRows int64
