@@ -10,12 +10,22 @@ type Config struct {
 	// Arrow connection pool
 	PoolSize int
 
-	// Iceberg catalog (M12)
+	// Iceberg catalog
+	IcebergEndpoint  string // REST catalog URL (e.g. http://host:8181/catalog)
+	IcebergWarehouse string // Warehouse name to ATTACH
+
+	// Iceberg catalog auth (OAuth2) — optional, skip CREATE SECRET if empty
 	IcebergClientID     string
 	IcebergClientSecret string
 	IcebergOAuth2URI    string
-	IcebergWarehouse    string
-	IcebergEndpoint     string
+
+	// Storage credentials — optional, for when catalog doesn't vend credentials
+	// S3-compatible storage
+	S3Endpoint  string // e.g. http://minio:9000
+	S3AccessKey string
+	S3SecretKey string
+	S3Region    string
+	S3URLStyle  string // "path" for MinIO, "vhost" for AWS (default)
 
 	// Server
 	ListenAddr string
