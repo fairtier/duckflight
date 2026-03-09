@@ -17,7 +17,9 @@ import (
 	duckserver "github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // ---------------------------------------------------------------------------
@@ -732,21 +734,29 @@ func (s *DuckFlightSQLSuite) TestTransactionIsolation() {
 // DuckDB-specific tests
 // =========================================================================
 
-func (s *DuckFlightSQLSuite) TestStatementTimeout() {
+func (s *DuckFlightSQLSuite) TestStatementTimeoutReturnsDeadlineExceeded() {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	// Cross-join should exceed the 10s timeout configured on the engine.
+	timeoutBefore := getMetricValue("flightsql_queries_total", map[string]string{"status": "timeout"})
+
+	// Cross-join aggregation blocks in QueryContext and never returns rows,
+	// so the server-side timeout always fires there, returning DeadlineExceeded.
 	info, err := s.client.Execute(ctx,
 		"SELECT count(*) FROM range(100000000) t1, range(100000000) t2")
 	if err != nil {
-		// Error at Execute time is acceptable.
+		st, ok := status.FromError(err)
+		s.Require().True(ok)
+		s.Equal(codes.DeadlineExceeded, st.Code(), "expected DeadlineExceeded, got: %v", err)
 		return
 	}
 
 	// If Execute succeeds (lazy), the error should occur during DoGet.
 	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
 	if err != nil {
+		st, ok := status.FromError(err)
+		s.Require().True(ok)
+		s.Equal(codes.DeadlineExceeded, st.Code(), "expected DeadlineExceeded, got: %v", err)
 		return
 	}
 	defer rdr.Release()
@@ -754,7 +764,44 @@ func (s *DuckFlightSQLSuite) TestStatementTimeout() {
 	// Consume all batches — timeout should trigger during iteration.
 	for rdr.Next() {
 	}
-	s.Error(rdr.Err(), "expected timeout error during query execution")
+	s.Require().Error(rdr.Err(), "expected timeout error during query execution")
+
+	timeoutAfter := getMetricValue("flightsql_queries_total", map[string]string{"status": "timeout"})
+	s.Greater(timeoutAfter, timeoutBefore, "flightsql_queries_total{status=timeout} should increment")
+}
+
+func (s *DuckFlightSQLSuite) TestMetricsQueryCountOK() {
+	before := getMetricValue("flightsql_queries_total", map[string]string{"status": "ok"})
+
+	ctx := context.Background()
+	info, err := s.client.Execute(ctx, "SELECT 1")
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+	for rdr.Next() {
+	}
+	s.NoError(rdr.Err())
+
+	after := getMetricValue("flightsql_queries_total", map[string]string{"status": "ok"})
+	s.Equal(before+1, after, "flightsql_queries_total{status=ok} should increment by 1")
+}
+
+func (s *DuckFlightSQLSuite) TestMetricsBytesStreamed() {
+	before := getMetricValue("flightsql_bytes_streamed_total", nil)
+
+	ctx := context.Background()
+	info, err := s.client.Execute(ctx, "SELECT * FROM range(1000) t(id)")
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+	for rdr.Next() {
+	}
+	s.NoError(rdr.Err())
+
+	after := getMetricValue("flightsql_bytes_streamed_total", nil)
+	s.Greater(after, before, "flightsql_bytes_streamed_total should increase after streaming")
 }
 
 func (s *DuckFlightSQLSuite) TestGetExecuteSchema() {
