@@ -86,6 +86,7 @@ func New(cfg Config) (*DuckFlightSQLServer, error) {
 		maxResultBytes: cfg.MaxResultBytes,
 	}
 	srv.Alloc = memory.DefaultAllocator
+	_ = srv.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerTransaction, int32(flightsql.SqlTransactionTransaction))
 
 	globalEngine = eng
 	return srv, nil

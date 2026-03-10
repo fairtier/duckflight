@@ -23,12 +23,6 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 ) (flightsql.ActionCreatePreparedStatementResult, error) {
 	query := req.GetQuery()
 
-	// Validate by running EXPLAIN.
-	if err := s.engine.ExecSQL(ctx, "EXPLAIN "+query); err != nil {
-		return flightsql.ActionCreatePreparedStatementResult{},
-			status.Errorf(codes.InvalidArgument, "query error: %s", err)
-	}
-
 	handle := genHandle()
 	s.preparedStmts.Store(string(handle), preparedStatement{query: query})
 

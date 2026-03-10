@@ -608,8 +608,14 @@ func (s *DuckFlightSQLSuite) TestCommandPreparedStatementClose() {
 
 func (s *DuckFlightSQLSuite) TestCommandPreparedStatementUpdateNoTable() {
 	ctx := context.Background()
+	// Prepare succeeds (validation is deferred to execution time).
 	stmt, err := s.client.Prepare(ctx, "INSERT INTO thisTableDoesNotExist (keyName, value) VALUES ('new_value', 2)")
-	s.Nil(stmt)
+	s.Require().NoError(err)
+	s.Require().NotNil(stmt)
+	defer func() { _ = stmt.Close(ctx) }()
+
+	// Execution fails because the table does not exist.
+	_, err = stmt.ExecuteUpdate(ctx)
 	s.Error(err)
 }
 

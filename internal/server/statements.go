@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/prochac/duckflight/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -26,6 +28,15 @@ type cachedQuery struct {
 var (
 	queryCache sync.Map // handle string -> cachedQuery
 )
+
+// duckDBToGRPCCode maps DuckDB error types to appropriate gRPC status codes.
+func duckDBToGRPCCode(err error) codes.Code {
+	var duckErr *duckdb.Error
+	if errors.As(err, &duckErr) && duckErr.Type == duckdb.ErrorTypeCatalog {
+		return codes.NotFound
+	}
+	return codes.InvalidArgument
+}
 
 func genHandle() []byte {
 	b := make([]byte, 16)
@@ -71,7 +82,7 @@ func (s *DuckFlightSQLServer) GetFlightInfoStatement(
 		defer s.engine.Pool.Release(ac)
 	}
 	if _, err := ac.ExecContext(ctx, "EXPLAIN "+query); err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "query error: %s", err)
+		return nil, status.Errorf(duckDBToGRPCCode(err), "query error: %s", err)
 	}
 
 	handle := genHandle()
@@ -216,7 +227,7 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 	// Execute with LIMIT 0 to get schema without results.
 	rdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query))
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "query error: %s", err)
+		return nil, status.Errorf(duckDBToGRPCCode(err), "query error: %s", err)
 	}
 	defer rdr.Release()
 
