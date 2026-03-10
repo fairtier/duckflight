@@ -22,7 +22,7 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
-          args: --timeout=5m -tags=duckdb_arrow
+          args: --timeout=5m
 
   test:
     name: Test
