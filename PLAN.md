@@ -407,7 +407,7 @@ func (s *DuckDBFlightSQLServer) DoGetStatement(
         defer reader.Release()
         if release != nil { defer release() }
         for reader.Next() {
-            rec := reader.Record()
+            rec := reader.RecordBatch()
             rec.Retain()
             ch <- flight.StreamChunk{Data: rec}
         }
@@ -662,7 +662,7 @@ func (r *meteredReader) Next() bool {
         r.finish()
         return false
     }
-    rec := r.RecordReader.Record()
+    rec := r.RecordReader.RecordBatch()
     for i := 0; i < int(rec.NumCols()); i++ {
         for _, buf := range rec.Column(i).Data().Buffers() {
             if buf != nil {
@@ -834,7 +834,7 @@ func (s *FlightSQLSuite) TestExecuteSimpleQuery() {
     defer rdr.Release()
 
     s.True(rdr.Next())
-    rec := rdr.Record()
+    rec := rdr.RecordBatch()
     s.Equal(int64(2), rec.NumRows())
     s.Equal("id", rec.ColumnName(0))
     s.Equal("name", rec.ColumnName(1))
@@ -877,7 +877,7 @@ func (s *FlightSQLSuite) TestGetCatalogs() {
     defer rdr.Release()
 
     s.True(rdr.Next())
-    s.Greater(rdr.Record().NumRows(), int64(0))
+    s.Greater(rdr.RecordBatch().NumRows(), int64(0))
 }
 
 func (s *FlightSQLSuite) TestGetSchemas() {
@@ -936,7 +936,7 @@ func (s *FlightSQLSuite) TestPreparedStatement() {
     defer rdr.Release()
 
     s.True(rdr.Next())
-    s.Equal(int64(1), rdr.Record().NumRows())
+    s.Equal(int64(1), rdr.RecordBatch().NumRows())
 }
 
 // --- DML ---
@@ -1116,7 +1116,7 @@ func TestIceberg_WriteAndReadBack(t *testing.T) {
     defer rdr.Release()
 
     require.True(t, rdr.Next())
-    assert.Equal(t, int64(1), rdr.Record().NumRows())
+    assert.Equal(t, int64(1), rdr.RecordBatch().NumRows())
 }
 
 func TestIceberg_SchemaEvolution(t *testing.T) {

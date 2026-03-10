@@ -71,7 +71,7 @@ func TestPoolAcquireRelease(t *testing.T) {
 		eng.Pool.Release(ac)
 		t.Fatal("expected at least one record batch")
 	}
-	rec := rdr.Record()
+	rec := rdr.RecordBatch()
 	if rec.NumRows() != 1 {
 		eng.Pool.Release(ac)
 		t.Fatalf("expected 1 row, got %d", rec.NumRows())
