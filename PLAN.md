@@ -1291,24 +1291,24 @@ helm install flightsql-tenant-abc deploy/helm/duckflight/ \
 
 ## 13. Implementation Milestones
 
-| #       | Milestone                                                    | Tests Turn Green                                                       | Effort   |
-|---------|--------------------------------------------------------------|------------------------------------------------------------------------|----------|
-| **M1**  | Project scaffold + Engine boots with in-memory DuckDB + pool | —                                                                      | 0.5 day  |
-| **M2**  | `GetFlightInfoStatement` + `DoGetStatement`                  | TestExecuteSimpleQuery, TestExecuteEmptyResult, TestExecuteSyntaxError | 2 days   |
-| **M3**  | Metadata endpoints (catalogs, schemas, tables, table types)  | TestGetCatalogs, TestGetSchemas, TestGetTables, TestGetTableTypes      | 1 day    |
-| **M4**  | Prepared statements                                          | TestPreparedStatement                                                  | 1 day    |
-| **M5**  | DML via `DoPutCommandStatementUpdate`                        | TestStatementUpdate                                                    | 0.5 day  |
-| **M6**  | Sessions + session-bound connections                         | — (infra for M7-M8)                                                    | 1 day    |
-| **M7**  | Transactions (BEGIN, COMMIT, ROLLBACK) + write serialization | TestTransactionCommit, TestTransactionRollback                         | 1.5 days |
-| **M8**  | Concurrency: pool under load, write serialization, reaping   | concurrency_test.go suite                                              | 1 day    |
-| **M9**  | Statement timeout + guardrails                               | TestStatementTimeout                                                   | 0.5 day  |
-| **M10** | Metering: Prometheus metrics + metered reader                | — (verify via /metrics endpoint)                                       | 0.5 day  |
-| **M11** | Auth middleware (bearer token validation)                    | —                                                                      | 0.5 day  |
-| **M12** | Iceberg ATTACH integration                                   | iceberg_integration_test.go suite                                      | 1 day    |
-| **M13** | Dockerfile + docker-compose + CI pipeline                    | —                                                                      | 0.5 day  |
-| **M14** | Helm chart + Gateway API (GRPCRoute) + Envoy Gateway BackendTrafficPolicy (consistent hash) + HPA | — | 1 day |
-| **M15** | TLS                                                          | —                                                                      | 0.5 day  |
-| **M16** | Load testing + tuning                                        | —                                                                      | 1 day    |
+| #       | Milestone                                                                                         | Tests Turn Green                                                       | Effort   |
+|---------|---------------------------------------------------------------------------------------------------|------------------------------------------------------------------------|----------|
+| **M1**  | Project scaffold + Engine boots with in-memory DuckDB + pool                                      | —                                                                      | 0.5 day  |
+| **M2**  | `GetFlightInfoStatement` + `DoGetStatement`                                                       | TestExecuteSimpleQuery, TestExecuteEmptyResult, TestExecuteSyntaxError | 2 days   |
+| **M3**  | Metadata endpoints (catalogs, schemas, tables, table types)                                       | TestGetCatalogs, TestGetSchemas, TestGetTables, TestGetTableTypes      | 1 day    |
+| **M4**  | Prepared statements                                                                               | TestPreparedStatement                                                  | 1 day    |
+| **M5**  | DML via `DoPutCommandStatementUpdate`                                                             | TestStatementUpdate                                                    | 0.5 day  |
+| **M6**  | Sessions + session-bound connections                                                              | — (infra for M7-M8)                                                    | 1 day    |
+| **M7**  | Transactions (BEGIN, COMMIT, ROLLBACK) + write serialization                                      | TestTransactionCommit, TestTransactionRollback                         | 1.5 days |
+| **M8**  | Concurrency: pool under load, write serialization, reaping                                        | concurrency_test.go suite                                              | 1 day    |
+| **M9**  | Statement timeout + guardrails                                                                    | TestStatementTimeout                                                   | 0.5 day  |
+| **M10** | Metering: Prometheus metrics + metered reader                                                     | — (verify via /metrics endpoint)                                       | 0.5 day  |
+| **M11** | Auth middleware (bearer token validation)                                                         | —                                                                      | 0.5 day  |
+| **M12** | Iceberg ATTACH integration                                                                        | iceberg_integration_test.go suite                                      | 1 day    |
+| **M13** | Dockerfile + docker-compose + CI pipeline                                                         | —                                                                      | 0.5 day  |
+| **M14** | Helm chart + Gateway API (GRPCRoute) + Envoy Gateway BackendTrafficPolicy (consistent hash) + HPA | —                                                                      | 1 day    |
+| **M15** | TLS                                                                                               | —                                                                      | 0.5 day  |
+| **M16** | Load testing + tuning                                                                             | —                                                                      | 1 day    |
 
 **Total: ~13 days** from scaffold to production-ready, with tests green at each step.
 

@@ -1,0 +1,26 @@
+name: Release Helm
+
+on:
+  push:
+    tags: ["helm/v*"]
+
+jobs:
+  helm:
+    name: Helm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+
+      - name: Helm lint
+        run: helm lint helm/duckflight/
+
+      - name: Helm package
+        run: helm package helm/duckflight/
+
+      - name: Upload chart artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: helm-chart
+          path: "*.tgz"
