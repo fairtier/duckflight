@@ -1,0 +1,96 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "duckflight.fullname" . }}
+  labels:
+    {{- include "duckflight.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "duckflight.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "duckflight.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: duckflight
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: grpc
+              containerPort: 31337
+              protocol: TCP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: "0.0.0.0:31337"
+            - name: METRIC_ADDR
+              value: "0.0.0.0:9090"
+            - name: MEMORY_LIMIT
+              value: {{ .Values.resources.memoryLimit | quote }}
+            - name: MAX_THREADS
+              value: {{ .Values.resources.maxThreads | quote }}
+            - name: QUERY_TIMEOUT
+              value: {{ .Values.resources.queryTimeout | quote }}
+            - name: POOL_SIZE
+              value: {{ .Values.resources.poolSize | quote }}
+            - name: ICEBERG_ENDPOINT
+              value: {{ .Values.iceberg.endpoint | quote }}
+            - name: ICEBERG_WAREHOUSE
+              value: {{ .Values.iceberg.warehouse | quote }}
+            {{- if .Values.iceberg.existingSecret }}
+            - name: ICEBERG_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.iceberg.existingSecret }}
+                  key: client-id
+            - name: ICEBERG_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.iceberg.existingSecret }}
+                  key: client-secret
+            {{- end }}
+            {{- if .Values.s3.endpoint }}
+            - name: S3_ENDPOINT
+              value: {{ .Values.s3.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.s3.existingSecret }}
+            - name: S3_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.existingSecret }}
+                  key: access-key
+            - name: S3_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3.existingSecret }}
+                  key: secret-key
+            {{- end }}
+            {{- if .Values.s3.region }}
+            - name: S3_REGION
+              value: {{ .Values.s3.region | quote }}
+            {{- end }}
+            {{- if .Values.s3.urlStyle }}
+            - name: S3_URL_STYLE
+              value: {{ .Values.s3.urlStyle | quote }}
+            {{- end }}
+          resources:
+            requests:
+              memory: {{ .Values.resources.requests.memory | quote }}
+              cpu: {{ .Values.resources.requests.cpu | quote }}
+            limits:
+              memory: {{ .Values.resources.limits.memory | quote }}
+              cpu: {{ .Values.resources.limits.cpu | quote }}
+          readinessProbe:
+            grpc:
+              port: 31337
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            grpc:
+              port: 31337
+            initialDelaySeconds: 10
+            periodSeconds: 30

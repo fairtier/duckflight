@@ -1,0 +1,128 @@
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio-root-user
+      MINIO_ROOT_PASSWORD: minio-root-password
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        mc alias set myminio http://minio:9000 minio-root-user minio-root-password
+        mc mb myminio/warehouse --ignore-existing
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@postgres:5432/lakekeeper
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: serve
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://postgres:postgres@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://postgres:postgres@postgres:5432/lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8181/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    ports:
+      - "8181:8181"
+
+  lakekeeper-init:
+    image: curlimages/curl:latest
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        curl -sf -X POST http://lakekeeper:8181/management/v1/bootstrap \
+          -H 'Content-Type: application/json' \
+          -d '{"accept-terms-of-use": true}'
+
+        curl -sf -X POST http://lakekeeper:8181/management/v1/warehouse \
+          -H 'Content-Type: application/json' \
+          -d '{
+            "warehouse-name": "demo",
+            "storage-profile": {
+              "type": "s3",
+              "bucket": "warehouse",
+              "endpoint": "http://minio:9000",
+              "region": "local-01",
+              "path-style-access": true,
+              "flavor": "s3-compat",
+              "sts-enabled": false,
+              "remote-signing-enabled": false
+            },
+            "storage-credential": {
+              "type": "s3",
+              "credential-type": "access-key",
+              "aws-access-key-id": "minio-root-user",
+              "aws-secret-access-key": "minio-root-password"
+            }
+          }'
+
+        curl -sf -X POST "http://lakekeeper:8181/catalog/v1/demo/namespaces" \
+          -H 'Content-Type: application/json' \
+          -d '{"namespace": ["default"]}'
+
+  duckflight:
+    build: .
+    depends_on:
+      lakekeeper-init:
+        condition: service_completed_successfully
+    environment:
+      LISTEN_ADDR: "0.0.0.0:31337"
+      METRIC_ADDR: "0.0.0.0:9090"
+      MEMORY_LIMIT: "1GB"
+      MAX_THREADS: "4"
+      QUERY_TIMEOUT: "30s"
+      POOL_SIZE: "8"
+      ICEBERG_ENDPOINT: "http://lakekeeper:8181/catalog"
+      ICEBERG_WAREHOUSE: "demo"
+      S3_ENDPOINT: "minio:9000"
+      S3_ACCESS_KEY: "minio-root-user"
+      S3_SECRET_KEY: "minio-root-password"
+      S3_REGION: "local-01"
+      S3_URL_STYLE: "path"
+    ports:
+      - "31337:31337"
+      - "9090:9090"

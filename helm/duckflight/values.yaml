@@ -1,0 +1,39 @@
+image:
+  repository: yourorg/duckflight
+  tag: latest
+  pullPolicy: IfNotPresent
+
+tenant: ""
+
+iceberg:
+  endpoint: ""
+  warehouse: ""
+  existingSecret: "iceberg-credentials"  # must have client-id, client-secret keys
+
+s3:
+  endpoint: ""
+  existingSecret: ""  # must have access-key, secret-key keys
+  region: ""
+  urlStyle: "path"
+
+resources:
+  memoryLimit: "2GB"
+  maxThreads: 4
+  queryTimeout: "60s"
+  poolSize: 8
+
+  requests:
+    memory: "2560Mi"
+    cpu: "1"
+  limits:
+    memory: "2560Mi"
+    cpu: "2"
+
+hpa:
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilization: 70
+
+gateway:
+  enabled: true
+  parentRef: "flightsql-gateway"

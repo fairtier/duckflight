@@ -1,0 +1,15 @@
+{{- if .Values.gateway.enabled }}
+apiVersion: gateway.networking.k8s.io/v1
+kind: GRPCRoute
+metadata:
+  name: {{ include "duckflight.fullname" . }}
+  labels:
+    {{- include "duckflight.labels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ .Values.gateway.parentRef }}
+  rules:
+    - backendRefs:
+        - name: {{ include "duckflight.fullname" . }}
+          port: 31337
+{{- end }}
