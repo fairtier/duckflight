@@ -153,29 +153,25 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 			queryDuration.WithLabelValues().Observe(time.Since(start).Seconds())
 		}()
 
-		errored := false
 		for metered.Next() {
-			rec := metered.Record()
+			rec := metered.RecordBatch()
 			rec.Retain()
 			select {
 			case ch <- flight.StreamChunk{Data: rec}:
 			case <-queryCtx.Done():
-				errored = true
 				queryCount.WithLabelValues("timeout").Inc()
 				return
 			}
 		}
 		if err := metered.Err(); err != nil {
-			errored = true
 			queryCount.WithLabelValues("error").Inc()
 			select {
 			case ch <- flight.StreamChunk{Err: err}:
 			case <-queryCtx.Done():
 			}
+			return
 		}
-		if !errored {
-			queryCount.WithLabelValues("ok").Inc()
-		}
+		queryCount.WithLabelValues("ok").Inc()
 	}()
 
 	return schema, ch, nil

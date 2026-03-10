@@ -91,7 +91,7 @@ func (s *MeteringSuite) SetupSuite() {
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
 	s.Require().NoError(s.server.Init("localhost:0"))
 
-	go s.server.Serve()
+	go func() { _ = s.server.Serve() }()
 
 	cl, err := flightsql.NewClient(
 		s.server.Addr().String(),
@@ -104,7 +104,7 @@ func (s *MeteringSuite) SetupSuite() {
 
 func (s *MeteringSuite) TearDownSuite() {
 	if s.client != nil {
-		s.client.Close()
+		_ = s.client.Close()
 	}
 	if s.server != nil {
 		s.server.Shutdown()

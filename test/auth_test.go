@@ -57,7 +57,7 @@ func (s *AuthSuite) SetupSuite() {
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
 	s.Require().NoError(s.server.Init("localhost:0"))
 
-	go s.server.Serve()
+	go func() { _ = s.server.Serve() }()
 }
 
 func (s *AuthSuite) TearDownSuite() {
@@ -94,7 +94,7 @@ func (s *AuthSuite) dialClient(token string) *flightsql.Client {
 
 func (s *AuthSuite) TestAuthValidToken() {
 	cl := s.dialClient("test-secret")
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	ctx := context.Background()
 	info, err := cl.Execute(ctx, "SELECT 1 AS val")
@@ -110,7 +110,7 @@ func (s *AuthSuite) TestAuthValidToken() {
 
 func (s *AuthSuite) TestAuthMissingToken() {
 	cl := s.dialClient("")
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	ctx := context.Background()
 	_, err := cl.Execute(ctx, "SELECT 1")
@@ -124,7 +124,7 @@ func (s *AuthSuite) TestAuthMissingToken() {
 
 func (s *AuthSuite) TestAuthInvalidToken() {
 	cl := s.dialClient("wrong-token")
-	defer cl.Close()
+	defer func() { _ = cl.Close() }()
 
 	ctx := context.Background()
 	_, err := cl.Execute(ctx, "SELECT 1")
@@ -139,7 +139,7 @@ func (s *AuthSuite) TestAuthInvalidToken() {
 func (s *AuthSuite) TestAuthStreamRejectsNoAuth() {
 	// First get a valid ticket using an authenticated client.
 	authCl := s.dialClient("test-secret")
-	defer authCl.Close()
+	defer func() { _ = authCl.Close() }()
 
 	ctx := context.Background()
 	info, err := authCl.Execute(ctx, "SELECT 1")
@@ -147,7 +147,7 @@ func (s *AuthSuite) TestAuthStreamRejectsNoAuth() {
 
 	// Now try DoGet with an unauthenticated client.
 	noAuthCl := s.dialClient("")
-	defer noAuthCl.Close()
+	defer func() { _ = noAuthCl.Close() }()
 
 	_, err = noAuthCl.DoGet(ctx, info.Endpoint[0].Ticket)
 	s.Require().Error(err)

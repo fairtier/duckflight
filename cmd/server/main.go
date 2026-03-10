@@ -76,7 +76,11 @@ func main() {
 
 	fmt.Printf("DuckFlight SQL server listening on %s\n", addr)
 
-	go server.Serve()
+	go func() {
+		if err := server.Serve(); err != nil {
+			log.Printf("server error: %v", err)
+		}
+	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

@@ -62,7 +62,7 @@ func (r *meteredReader) Next() bool {
 		r.finish()
 		return false
 	}
-	rec := r.RecordReader.Record()
+	rec := r.RecordBatch()
 	for i := 0; i < int(rec.NumCols()); i++ {
 		r.bytes += r.arrayBytes(rec.Column(i))
 	}

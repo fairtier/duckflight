@@ -69,7 +69,7 @@ func (s *DuckFlightSQLServer) DoGetPrimaryKeys(
 	seqBldr := bldr.Field(4).(*array.Int32Builder)
 
 	for rdr.Next() {
-		rec := rdr.Record()
+		rec := rdr.RecordBatch()
 		catCol := rec.Column(0).(*array.String)
 		schCol := rec.Column(1).(*array.String)
 		tblCol := rec.Column(2).(*array.String)

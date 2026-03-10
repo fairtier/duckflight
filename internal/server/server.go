@@ -41,7 +41,6 @@ type DuckFlightSQLServer struct {
 	flightsql.BaseServer
 
 	engine           *engine.Engine
-	mu               sync.RWMutex
 	preparedStmts    sync.Map // handle string -> preparedStatement
 	openTransactions sync.Map // handle string -> *engine.ArrowConn
 	queryTimeout     time.Duration

@@ -47,7 +47,7 @@ func (s *DuckFlightSQLSuite) SetupSuite() {
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
 	s.Require().NoError(s.server.Init("localhost:0"))
 
-	go s.server.Serve()
+	go func() { _ = s.server.Serve() }()
 
 	cl, err := flightsql.NewClient(
 		s.server.Addr().String(),
@@ -60,7 +60,7 @@ func (s *DuckFlightSQLSuite) SetupSuite() {
 
 func (s *DuckFlightSQLSuite) TearDownSuite() {
 	if s.client != nil {
-		s.client.Close()
+		_ = s.client.Close()
 	}
 	if s.server != nil {
 		s.server.Shutdown()
@@ -100,8 +100,8 @@ func (s *DuckFlightSQLSuite) fromJSON(dt arrow.DataType, json string) arrow.Arra
 	return arr
 }
 
-func (s *DuckFlightSQLSuite) execCountQuery(query string) int64 {
-	info, err := s.client.Execute(context.Background(), query)
+func (s *DuckFlightSQLSuite) execCountQuery() int64 {
+	info, err := s.client.Execute(context.Background(), "SELECT COUNT(*) FROM intTable")
 	s.NoError(err)
 	rdr, err := s.client.DoGet(context.Background(), info.Endpoint[0].Ticket)
 	s.NoError(err)
@@ -543,7 +543,7 @@ func (s *DuckFlightSQLSuite) TestCommandPreparedStatementQuery() {
 	ctx := context.Background()
 	prep, err := s.client.Prepare(ctx, "SELECT * FROM intTable")
 	s.NoError(err)
-	defer prep.Close(ctx)
+	defer func() { _ = prep.Close(ctx) }()
 
 	info, err := prep.Execute(ctx)
 	s.NoError(err)
@@ -580,17 +580,17 @@ func (s *DuckFlightSQLSuite) TestCommandPreparedStatementUpdate() {
 	ctx := context.Background()
 	stmt, err := s.client.Prepare(ctx, "INSERT INTO intTable (keyName, value) VALUES ('new_value', 999)")
 	s.NoError(err)
-	defer stmt.Close(ctx)
+	defer func() { _ = stmt.Close(ctx) }()
 
-	s.EqualValues(4, s.execCountQuery("SELECT COUNT(*) FROM intTable"))
+	s.EqualValues(4, s.execCountQuery())
 	result, err := stmt.ExecuteUpdate(ctx)
 	s.NoError(err)
 	s.EqualValues(1, result)
-	s.EqualValues(5, s.execCountQuery("SELECT COUNT(*) FROM intTable"))
+	s.EqualValues(5, s.execCountQuery())
 	result, err = s.client.ExecuteUpdate(ctx, "DELETE FROM intTable WHERE keyName = 'new_value'")
 	s.NoError(err)
 	s.EqualValues(1, result)
-	s.EqualValues(4, s.execCountQuery("SELECT COUNT(*) FROM intTable"))
+	s.EqualValues(4, s.execCountQuery())
 }
 
 func (s *DuckFlightSQLSuite) TestCommandPreparedStatementClose() {
@@ -708,7 +708,7 @@ func (s *DuckFlightSQLSuite) TestTransactionIsolation() {
 	s.Require().NoError(err)
 
 	// Read initial count within transaction.
-	s.EqualValues(4, s.execCountQuery("SELECT COUNT(*) FROM intTable"))
+	s.EqualValues(4, s.execCountQuery())
 
 	// Insert outside the transaction (via seedSQL, bypasses Flight SQL).
 	s.seedSQL("INSERT INTO intTable VALUES (100, 'outside_txn', 100, 1)")

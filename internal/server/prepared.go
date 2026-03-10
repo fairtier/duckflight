@@ -113,7 +113,7 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 		defer s.engine.Pool.Release(ac)
 
 		for rdr.Next() {
-			rec := rdr.Record()
+			rec := rdr.RecordBatch()
 			rec.Retain()
 			select {
 			case ch <- flight.StreamChunk{Data: rec}:

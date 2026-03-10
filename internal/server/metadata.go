@@ -43,7 +43,7 @@ func (s *DuckFlightSQLServer) queryStrings(ctx context.Context, query string) ([
 
 	var results []string
 	for rdr.Next() {
-		rec := rdr.Record()
+		rec := rdr.RecordBatch()
 		col := rec.Column(0).(*array.String)
 		for i := 0; i < col.Len(); i++ {
 			results = append(results, strings.Clone(col.Value(i)))
@@ -71,7 +71,7 @@ func (s *DuckFlightSQLServer) queryStringPairs(ctx context.Context, query string
 
 	var results [][2]string
 	for rdr.Next() {
-		rec := rdr.Record()
+		rec := rdr.RecordBatch()
 		col0 := rec.Column(0).(*array.String)
 		col1 := rec.Column(1).(*array.String)
 		for i := 0; i < col0.Len(); i++ {
@@ -105,7 +105,7 @@ func (s *DuckFlightSQLServer) DoGetCatalogs(ctx context.Context) (*arrow.Schema,
 	arr := bldr.NewArray()
 	defer arr.Release()
 
-	batch := array.NewRecord(schema_ref.Catalogs, []arrow.Array{arr}, int64(len(catalogs)))
+	batch := array.NewRecordBatch(schema_ref.Catalogs, []arrow.Array{arr}, int64(len(catalogs)))
 
 	ch := make(chan flight.StreamChunk, 1)
 	ch <- flight.StreamChunk{Data: batch}
@@ -151,7 +151,7 @@ func (s *DuckFlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 	schArr := schemaBldr.NewArray()
 	defer schArr.Release()
 
-	batch := array.NewRecord(schema_ref.DBSchemas, []arrow.Array{catArr, schArr}, int64(len(pairs)))
+	batch := array.NewRecordBatch(schema_ref.DBSchemas, []arrow.Array{catArr, schArr}, int64(len(pairs)))
 
 	ch := make(chan flight.StreamChunk, 1)
 	ch <- flight.StreamChunk{Data: batch}
@@ -215,7 +215,7 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 
 	var numRows int64
 	for rdr.Next() {
-		rec := rdr.Record()
+		rec := rdr.RecordBatch()
 		col0 := rec.Column(0).(*array.String)
 		col1 := rec.Column(1).(*array.String)
 		col2 := rec.Column(2).(*array.String)
@@ -273,7 +273,7 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 		cols = append(cols, schemaArr)
 	}
 
-	batch := array.NewRecord(outSchema, cols, numRows)
+	batch := array.NewRecordBatch(outSchema, cols, numRows)
 
 	ch := make(chan flight.StreamChunk, 1)
 	ch <- flight.StreamChunk{Data: batch}
@@ -299,7 +299,7 @@ func (s *DuckFlightSQLServer) DoGetTableTypes(_ context.Context) (*arrow.Schema,
 	arr := bldr.NewArray()
 	defer arr.Release()
 
-	batch := array.NewRecord(schema_ref.TableTypes, []arrow.Array{arr}, 3)
+	batch := array.NewRecordBatch(schema_ref.TableTypes, []arrow.Array{arr}, 3)
 
 	ch := make(chan flight.StreamChunk, 1)
 	ch <- flight.StreamChunk{Data: batch}

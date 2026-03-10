@@ -54,7 +54,7 @@ func NewArrowPool(connector *duckdb.Connector, size int) (*ArrowPool, error) {
 		}
 		ar, err := duckdb.NewArrowFromConn(conn)
 		if err != nil {
-			conn.Close()
+			_ = conn.Close()
 			p.Close()
 			return nil, err
 		}
@@ -63,7 +63,7 @@ func NewArrowPool(connector *duckdb.Connector, size int) (*ArrowPool, error) {
 	return p, nil
 }
 
-// Acquire blocks until an ArrowConn is available or ctx is cancelled.
+// Acquire blocks until an ArrowConn is available or ctx is canceled.
 func (p *ArrowPool) Acquire(ctx context.Context) (*ArrowConn, error) {
 	select {
 	case ac := <-p.pool:
@@ -83,7 +83,7 @@ func (p *ArrowPool) Close() {
 	for {
 		select {
 		case ac := <-p.pool:
-			ac.conn.Close()
+			_ = ac.conn.Close()
 		default:
 			return
 		}

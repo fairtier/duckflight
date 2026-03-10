@@ -113,7 +113,7 @@ func (e *Engine) ExecSQL(ctx context.Context, sql string) error {
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	execer, ok := conn.(driver.ExecerContext)
 	if !ok {

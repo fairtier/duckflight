@@ -21,7 +21,7 @@ func newTestEngine(t *testing.T) *Engine {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	t.Cleanup(func() { eng.Close() })
+	t.Cleanup(func() { _ = eng.Close() })
 	return eng
 }
 
@@ -94,7 +94,7 @@ func TestPoolAcquireTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	defer eng.Close()
+	defer func() { _ = eng.Close() }()
 
 	ctx := context.Background()
 	ac, err := eng.Pool.Acquire(ctx)
@@ -125,5 +125,5 @@ func TestPoolClose(t *testing.T) {
 		t.Fatalf("NewEngine: %v", err)
 	}
 	// Just verify Close doesn't panic
-	eng.Close()
+	_ = eng.Close()
 }
