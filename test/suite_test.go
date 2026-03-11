@@ -649,6 +649,184 @@ func (s *DuckFlightSQLSuite) TestCommandGetPrimaryKeys() {
 }
 
 // =========================================================================
+// M3+: Foreign keys
+// =========================================================================
+
+func (s *DuckFlightSQLSuite) setupForeignKeyTables() {
+	s.T().Helper()
+	s.seedSQL("DROP TABLE IF EXISTS fk_child_table")
+	s.seedSQL("DROP TABLE IF EXISTS fk_pk_table")
+	s.seedSQL("CREATE TABLE fk_pk_table (id INTEGER PRIMARY KEY, name VARCHAR)")
+	s.seedSQL("CREATE TABLE fk_child_table (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES fk_pk_table(id))")
+}
+
+func (s *DuckFlightSQLSuite) teardownForeignKeyTables() {
+	s.T().Helper()
+	s.seedSQL("DROP TABLE IF EXISTS fk_child_table")
+	s.seedSQL("DROP TABLE IF EXISTS fk_pk_table")
+}
+
+func (s *DuckFlightSQLSuite) TestCommandGetImportedKeys() {
+	ctx := context.Background()
+	s.setupForeignKeyTables()
+	defer s.teardownForeignKeyTables()
+
+	info, err := s.client.GetImportedKeys(ctx, flightsql.TableRef{Table: "fk_child_table"})
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	rec.Retain()
+	defer rec.Release()
+
+	s.EqualValues(1, rec.NumRows(), "expected exactly 1 imported key row")
+	s.Equal("fk_pk_table", rec.Column(2).(*array.String).Value(0))    // pk_table_name
+	s.Equal("id", rec.Column(3).(*array.String).Value(0))             // pk_column_name
+	s.Equal("fk_child_table", rec.Column(6).(*array.String).Value(0)) // fk_table_name
+	s.Equal("parent_id", rec.Column(7).(*array.String).Value(0))      // fk_column_name
+
+	s.False(rdr.Next())
+}
+
+func (s *DuckFlightSQLSuite) TestCommandGetExportedKeys() {
+	ctx := context.Background()
+	s.setupForeignKeyTables()
+	defer s.teardownForeignKeyTables()
+
+	info, err := s.client.GetExportedKeys(ctx, flightsql.TableRef{Table: "fk_pk_table"})
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	rec.Retain()
+	defer rec.Release()
+
+	s.EqualValues(1, rec.NumRows(), "expected exactly 1 exported key row")
+	s.Equal("fk_pk_table", rec.Column(2).(*array.String).Value(0))    // pk_table_name
+	s.Equal("id", rec.Column(3).(*array.String).Value(0))             // pk_column_name
+	s.Equal("fk_child_table", rec.Column(6).(*array.String).Value(0)) // fk_table_name
+	s.Equal("parent_id", rec.Column(7).(*array.String).Value(0))      // fk_column_name
+
+	s.False(rdr.Next())
+}
+
+func (s *DuckFlightSQLSuite) TestCommandGetCrossReference() {
+	ctx := context.Background()
+	s.setupForeignKeyTables()
+	defer s.teardownForeignKeyTables()
+
+	info, err := s.client.GetCrossReference(ctx,
+		flightsql.TableRef{Table: "fk_pk_table"},
+		flightsql.TableRef{Table: "fk_child_table"},
+	)
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	rec.Retain()
+	defer rec.Release()
+
+	s.EqualValues(1, rec.NumRows())
+	s.Equal("fk_pk_table", rec.Column(2).(*array.String).Value(0))
+	s.Equal("fk_child_table", rec.Column(6).(*array.String).Value(0))
+
+	s.False(rdr.Next())
+}
+
+func (s *DuckFlightSQLSuite) TestCommandGetImportedKeysEmpty() {
+	ctx := context.Background()
+	// intTable has no foreign keys
+	info, err := s.client.GetImportedKeys(ctx, flightsql.TableRef{Table: "intTable"})
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	var total int64
+	for rdr.Next() {
+		total += rdr.RecordBatch().NumRows()
+	}
+	s.Equal(int64(0), total, "intTable has no imported keys")
+}
+
+// =========================================================================
+// M3+: XdbcTypeInfo
+// =========================================================================
+
+func (s *DuckFlightSQLSuite) TestCommandGetXdbcTypeInfo() {
+	ctx := context.Background()
+	info, err := s.client.GetXdbcTypeInfo(ctx, nil)
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.True(schema_ref.XdbcTypeInfo.Equal(rdr.Schema()), "schema mismatch: %s", rdr.Schema())
+
+	var total int64
+	for rdr.Next() {
+		total += rdr.RecordBatch().NumRows()
+	}
+	s.NoError(rdr.Err())
+	s.Greater(total, int64(0), "expected at least one type info row")
+}
+
+func (s *DuckFlightSQLSuite) TestCommandGetXdbcTypeInfoFiltered() {
+	ctx := context.Background()
+	intType := int32(4) // xdbcInteger
+	info, err := s.client.GetXdbcTypeInfo(ctx, &intType)
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	var total int64
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		dataTypeCol := rec.Column(1).(*array.Int32)
+		for i := 0; i < dataTypeCol.Len(); i++ {
+			s.EqualValues(4, dataTypeCol.Value(i), "all rows should have data_type=4 (INTEGER)")
+		}
+		total += rec.NumRows()
+	}
+	s.NoError(rdr.Err())
+	s.Greater(total, int64(0), "expected at least one INTEGER type")
+}
+
+// =========================================================================
+// M3+: SqlInfo
+// =========================================================================
+
+func (s *DuckFlightSQLSuite) TestCommandGetSqlInfo() {
+	ctx := context.Background()
+	info, err := s.client.GetSqlInfo(ctx, []flightsql.SqlInfo{
+		flightsql.SqlInfoFlightSqlServerName,
+		flightsql.SqlInfoFlightSqlServerVersion,
+		flightsql.SqlInfoFlightSqlServerTransaction,
+	})
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	var total int64
+	for rdr.Next() {
+		total += rdr.RecordBatch().NumRows()
+	}
+	s.NoError(rdr.Err())
+	s.EqualValues(3, total, "expected 3 SqlInfo rows")
+}
+
+// =========================================================================
 // M7: Transactions (TDD — fail until implemented)
 // =========================================================================
 

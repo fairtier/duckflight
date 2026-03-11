@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/prochac/duckflight/internal/config"
@@ -86,10 +87,53 @@ func New(cfg Config) (*DuckFlightSQLServer, error) {
 		maxResultBytes: cfg.MaxResultBytes,
 	}
 	srv.Alloc = memory.DefaultAllocator
-	_ = srv.RegisterSqlInfo(flightsql.SqlInfoFlightSqlServerTransaction, int32(flightsql.SqlTransactionTransaction))
+	registerSqlInfo(srv)
 
 	globalEngine = eng
 	return srv, nil
+}
+
+func registerSqlInfo(srv *DuckFlightSQLServer) {
+	reg := func(id flightsql.SqlInfo, val interface{}) {
+		_ = srv.RegisterSqlInfo(id, val)
+	}
+
+	// Server identity
+	reg(flightsql.SqlInfoFlightSqlServerName, "DuckFlight")
+	reg(flightsql.SqlInfoFlightSqlServerVersion, "0.1.0")
+	reg(flightsql.SqlInfoFlightSqlServerArrowVersion, arrow.PkgVersion)
+	reg(flightsql.SqlInfoFlightSqlServerReadOnly, false)
+	reg(flightsql.SqlInfoFlightSqlServerSql, true)
+	reg(flightsql.SqlInfoFlightSqlServerSubstrait, false)
+
+	// Transaction support
+	reg(flightsql.SqlInfoFlightSqlServerTransaction, int32(flightsql.SqlTransactionTransaction))
+	reg(flightsql.SqlInfoTransactionsSupported, true)
+
+	// SQL capabilities
+	reg(flightsql.SqlInfoDDLCatalog, false)
+	reg(flightsql.SqlInfoDDLSchema, false)
+	reg(flightsql.SqlInfoDDLTable, true)
+	reg(flightsql.SqlInfoIdentifierCase, int64(flightsql.SqlCaseSensitivityCaseInsensitive))
+	reg(flightsql.SqlInfoIdentifierQuoteChar, `"`)
+	reg(flightsql.SqlInfoQuotedIdentifierCase, int64(flightsql.SqlCaseSensitivityCaseInsensitive))
+	reg(flightsql.SqlInfoAllTablesAreASelectable, true)
+	reg(flightsql.SqlInfoNullOrdering, int64(flightsql.SqlNullOrderingSortAtEnd))
+	reg(flightsql.SqlInfoSearchStringEscape, `\`)
+	reg(flightsql.SqlInfoExtraNameChars, "")
+	reg(flightsql.SqlInfoSupportsColumnAliasing, true)
+	reg(flightsql.SqlInfoNullPlusNullIsNull, true)
+	reg(flightsql.SqlInfoSupportsTableCorrelationNames, true)
+	reg(flightsql.SqlInfoSupportsExpressionsInOrderBy, true)
+	reg(flightsql.SqlInfoSupportsOrderByUnrelated, true)
+	reg(flightsql.SqlInfoSupportedGroupBy, int64(2)) // SQL_GROUP_BY_BEYOND_SELECT bitmask
+	reg(flightsql.SqlInfoSupportsLikeEscapeClause, true)
+
+	reg(flightsql.SqlInfoKeywords, []string{})
+	reg(flightsql.SqlInfoNumericFunctions, []string{})
+	reg(flightsql.SqlInfoStringFunctions, []string{})
+	reg(flightsql.SqlInfoSystemFunctions, []string{})
+	reg(flightsql.SqlInfoDateTimeFunctions, []string{})
 }
 
 // Engine returns the underlying engine for direct access.
