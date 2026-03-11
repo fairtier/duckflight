@@ -126,6 +126,26 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 	return schema, ch, nil
 }
 
+// DoPutPreparedStatementQuery accepts parameter bindings for a prepared query.
+// Parameters are drained but not applied (current model is string-based).
+func (s *DuckFlightSQLServer) DoPutPreparedStatementQuery(
+	_ context.Context,
+	cmd flightsql.PreparedStatementQuery,
+	rdr flight.MessageReader,
+	_ flight.MetadataWriter,
+) ([]byte, error) {
+	handle := cmd.GetPreparedStatementHandle()
+	if _, ok := s.preparedStmts.Load(string(handle)); !ok {
+		return nil, status.Error(codes.InvalidArgument, "prepared statement not found")
+	}
+
+	// Drain the reader — params accepted but not applied.
+	for rdr.Next() {
+	}
+
+	return handle, nil
+}
+
 // DoPutPreparedStatementUpdate executes a prepared update statement.
 func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 	ctx context.Context,

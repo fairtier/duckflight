@@ -89,12 +89,14 @@ func (s *ADBCSuite) TearDownSuite() {
 // ---------------------------------------------------------------------------
 
 func (s *ADBCSuite) TestGoSQL_GetRow() {
-	err := s.db.QueryRow("SELECT 1").Err()
+	ctx := context.Background()
+	err := s.db.QueryRowContext(ctx, "SELECT 1").Err()
 	s.NoError(err)
 }
 
 func (s *ADBCSuite) TestGoSQL_GetRows() {
-	rows, err := s.db.Query("SELECT 1")
+	ctx := context.Background()
+	rows, err := s.db.QueryContext(ctx, "SELECT 1")
 	s.Require().NoError(err)
 	defer func() { s.NoError(rows.Close()) }()
 	for rows.Next() {
@@ -106,10 +108,11 @@ func (s *ADBCSuite) TestGoSQL_GetRows() {
 }
 
 func (s *ADBCSuite) TestGoSQL_StatementRows() {
-	stmt, err := s.db.Prepare("SELECT 123")
+	ctx := context.Background()
+	stmt, err := s.db.PrepareContext(ctx, "SELECT 123")
 	s.Require().NoError(err)
 	defer func() { s.NoError(stmt.Close()) }()
-	rows, err := stmt.Query()
+	rows, err := stmt.QueryContext(ctx)
 	s.Require().NoError(err)
 	defer func() { s.NoError(rows.Close()) }()
 	for rows.Next() {
@@ -121,10 +124,11 @@ func (s *ADBCSuite) TestGoSQL_StatementRows() {
 }
 
 func (s *ADBCSuite) TestGoSQL_StatementRow() {
-	stmt, err := s.db.Prepare("SELECT 123")
+	ctx := context.Background()
+	stmt, err := s.db.PrepareContext(ctx, "SELECT 123")
 	s.Require().NoError(err)
 	defer func() { s.NoError(stmt.Close()) }()
-	s.NoError(stmt.QueryRow().Err())
+	s.NoError(stmt.QueryRowContext(ctx).Err())
 }
 
 // ---------------------------------------------------------------------------

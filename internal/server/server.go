@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/prochac/duckflight/internal/config"
@@ -129,11 +131,53 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	reg(flightsql.SqlInfoSupportedGroupBy, int64(2)) // SQL_GROUP_BY_BEYOND_SELECT bitmask
 	reg(flightsql.SqlInfoSupportsLikeEscapeClause, true)
 
-	reg(flightsql.SqlInfoKeywords, []string{})
+	reg(flightsql.SqlInfoKeywords, fetchKeywords(srv.engine))
 	reg(flightsql.SqlInfoNumericFunctions, []string{})
 	reg(flightsql.SqlInfoStringFunctions, []string{})
 	reg(flightsql.SqlInfoSystemFunctions, []string{})
 	reg(flightsql.SqlInfoDateTimeFunctions, []string{})
+
+	// Cancellation & timeout
+	reg(flightsql.SqlInfoFlightSqlServerCancel, false)
+	reg(flightsql.SqlInfoFlightSqlServerStatementTimeout, int32(0))
+	reg(flightsql.SqlInfoFlightSqlServerTransactionTimeout, int32(0))
+
+	// Bulk ingestion
+	reg(flightsql.SqlInfoFlightSqlServerBulkIngestion, false)
+	reg(flightsql.SqlInfoFlightSqlServerIngestTransactionsSupported, false)
+}
+
+// fetchKeywords queries DuckDB for its reserved keywords list.
+func fetchKeywords(eng *engine.Engine) []string {
+	ac, err := eng.Pool.Acquire(context.Background())
+	if err != nil {
+		return []string{}
+	}
+	defer eng.Pool.Release(ac)
+
+	rdr, err := ac.Arrow.QueryContext(context.Background(), "SELECT keyword_name FROM duckdb_keywords() ORDER BY keyword_name")
+	if err != nil {
+		return []string{}
+	}
+	defer rdr.Release()
+
+	var keywords []string
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		col := rec.Column(0).(*array.String)
+		for i := 0; i < col.Len(); i++ {
+			keywords = append(keywords, col.Value(i))
+		}
+	}
+	if rdr.Err() != nil {
+		return []string{}
+	}
+	return keywords
+}
+
+// CloseSession is called by clients on disconnect. No-op since we don't track sessions.
+func (s *DuckFlightSQLServer) CloseSession(_ context.Context, _ *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
+	return &flight.CloseSessionResult{Status: flight.CloseSessionResultClosed}, nil
 }
 
 // Engine returns the underlying engine for direct access.

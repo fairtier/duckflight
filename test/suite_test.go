@@ -178,8 +178,11 @@ func (s *DuckFlightSQLSuite) TestCommandStatementQueryEmpty() {
 
 func (s *DuckFlightSQLSuite) TestCommandStatementQuerySyntaxError() {
 	ctx := context.Background()
-	_, err := s.client.Execute(ctx, "SELECTTTT NOTHING")
-	s.Error(err)
+	info, err := s.client.Execute(ctx, "SELECTTTT NOTHING")
+	s.Require().NoError(err, "Execute should succeed (errors deferred to DoGet)")
+
+	_, err = s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Error(err, "DoGet should fail for invalid SQL")
 }
 
 func (s *DuckFlightSQLSuite) TestCommandStatementQueryMultipleBatches() {
@@ -824,6 +827,49 @@ func (s *DuckFlightSQLSuite) TestCommandGetSqlInfo() {
 	}
 	s.NoError(rdr.Err())
 	s.EqualValues(3, total, "expected 3 SqlInfo rows")
+}
+
+func (s *DuckFlightSQLSuite) TestCommandGetSqlInfoExtended() {
+	ctx := context.Background()
+	info, err := s.client.GetSqlInfo(ctx, []flightsql.SqlInfo{
+		flightsql.SqlInfoFlightSqlServerCancel,
+		flightsql.SqlInfoFlightSqlServerStatementTimeout,
+		flightsql.SqlInfoFlightSqlServerTransactionTimeout,
+		flightsql.SqlInfoFlightSqlServerBulkIngestion,
+		flightsql.SqlInfoFlightSqlServerIngestTransactionsSupported,
+	})
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	var total int64
+	for rdr.Next() {
+		total += rdr.RecordBatch().NumRows()
+	}
+	s.NoError(rdr.Err())
+	s.EqualValues(5, total, "expected 5 extended SqlInfo rows")
+}
+
+func (s *DuckFlightSQLSuite) TestCommandGetSqlInfoKeywords() {
+	ctx := context.Background()
+	info, err := s.client.GetSqlInfo(ctx, []flightsql.SqlInfo{
+		flightsql.SqlInfoKeywords,
+	})
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	s.EqualValues(1, rec.NumRows(), "expected 1 row for SqlInfoKeywords")
+
+	// The value column is a dense union; verify it's non-empty by checking
+	// the info_name matches SqlInfoKeywords.
+	infoNameCol := rec.Column(0).(*array.Uint32)
+	s.EqualValues(uint32(flightsql.SqlInfoKeywords), infoNameCol.Value(0))
+	s.False(rdr.Next())
 }
 
 // =========================================================================

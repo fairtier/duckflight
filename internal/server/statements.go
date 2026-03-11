@@ -62,28 +62,15 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (ac
 	return ac, true, nil
 }
 
-// GetFlightInfoStatement validates the query and stores it for
-// later execution by DoGetStatement.
+// GetFlightInfoStatement stores the query for later execution by DoGetStatement.
+// Errors (syntax, missing tables) surface at DoGet time.
 func (s *DuckFlightSQLServer) GetFlightInfoStatement(
-	ctx context.Context,
+	_ context.Context,
 	cmd flightsql.StatementQuery,
 	desc *flight.FlightDescriptor,
 ) (*flight.FlightInfo, error) {
 	query := cmd.GetQuery()
 	txnID := string(cmd.GetTransactionId())
-
-	// Validate the query by running EXPLAIN — catches syntax errors
-	// without actually executing the query.
-	ac, fromPool, err := s.acquireConn(ctx, txnID)
-	if err != nil {
-		return nil, err
-	}
-	if fromPool {
-		defer s.engine.Pool.Release(ac)
-	}
-	if _, err := ac.ExecContext(ctx, "EXPLAIN "+query); err != nil {
-		return nil, status.Errorf(duckDBToGRPCCode(err), "query error: %s", err)
-	}
 
 	handle := genHandle()
 	queryCache.Store(string(handle), cachedQuery{query: query, transactionID: txnID})
@@ -140,7 +127,7 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		if queryCtx.Err() == context.DeadlineExceeded {
 			return nil, nil, status.Error(codes.DeadlineExceeded, "query exceeded time limit")
 		}
-		return nil, nil, status.Errorf(codes.Internal, "query execution error: %s", err)
+		return nil, nil, status.Errorf(duckDBToGRPCCode(err), "query execution error: %s", err)
 	}
 
 	metered := newMeteredReader(rdr, s.maxResultBytes)

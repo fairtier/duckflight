@@ -29,7 +29,6 @@ type fkRow struct {
 	fkColumn   string
 	keySeq     int32
 	fkKeyName  string
-	pkKeyName  *string // always nil — DuckDB doesn't expose PK constraint name via FK metadata
 	updateRule uint8
 	deleteRule uint8
 }
