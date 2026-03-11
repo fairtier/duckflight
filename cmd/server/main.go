@@ -3,8 +3,7 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -20,6 +19,14 @@ import (
 )
 
 func main() {
+	var level slog.LevelVar
+	if lvl := os.Getenv("LOG_LEVEL"); lvl != "" {
+		if err := level.UnmarshalText([]byte(lvl)); err != nil {
+			slog.Error("invalid LOG_LEVEL, using INFO", slog.String("value", lvl), slog.String("error", err.Error()))
+		}
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &level})))
+
 	cfg := duckserver.Config{
 		MemoryLimit:         envOr("MEMORY_LIMIT", "1GB"),
 		MaxThreads:          envInt("MAX_THREADS", 4),
@@ -40,7 +47,8 @@ func main() {
 
 	srv, err := duckserver.New(cfg)
 	if err != nil {
-		log.Fatalf("failed to create server: %v", err)
+		slog.Error("failed to create server", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	// Auth middleware — set AUTH_TOKENS env var (comma-separated) to enable.
@@ -55,12 +63,13 @@ func main() {
 	}
 	middleware := auth.BearerTokenMiddleware(authTokens)
 
-	server := flight.NewServerWithMiddleware(nil, middleware...)
-	server.RegisterFlightService(flightsql.NewFlightServer(srv))
+	server := flight.NewServerWithMiddleware([]flight.ServerMiddleware{duckserver.GRPCLoggingMiddleware()}, middleware...)
+	server.RegisterFlightService(flightsql.NewFlightServer(duckserver.NewLoggingServer(srv)))
 
 	addr := envOr("LISTEN_ADDR", "0.0.0.0:31337")
 	if err := server.Init(addr); err != nil {
-		log.Fatalf("failed to init server: %v", err)
+		slog.Error("failed to init server", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 
 	// Metrics endpoint
@@ -68,17 +77,17 @@ func main() {
 	go func() {
 		mux := http.NewServeMux()
 		mux.Handle("/metrics", promhttp.Handler())
-		log.Printf("Metrics server listening on %s\n", metricAddr)
+		slog.Info("metrics server listening", slog.String("addr", metricAddr))
 		if err := http.ListenAndServe(metricAddr, mux); err != nil {
-			log.Printf("metrics server error: %v", err)
+			slog.Error("metrics server error", slog.String("error", err.Error()))
 		}
 	}()
 
-	fmt.Printf("DuckFlight SQL server listening on %s\n", addr)
+	slog.Info("DuckFlight SQL server listening", slog.String("addr", addr))
 
 	go func() {
 		if err := server.Serve(); err != nil {
-			log.Printf("server error: %v", err)
+			slog.Error("server error", slog.String("error", err.Error()))
 		}
 	}()
 
@@ -86,7 +95,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 
-	fmt.Println("\nShutting down...")
+	slog.Info("shutting down")
 	server.Shutdown()
 }
 
