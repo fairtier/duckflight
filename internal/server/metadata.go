@@ -13,6 +13,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -256,8 +257,10 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 		nameStrings := nameArr.(*array.String)
 
 		for i := 0; i < int(numRows); i++ {
-			tableFQN := fmt.Sprintf("%s.%s.%s",
-				catStrings.Value(i), schStrings.Value(i), nameStrings.Value(i))
+			catalog := catStrings.Value(i)
+			dbSchema := schStrings.Value(i)
+			tableName := nameStrings.Value(i)
+			tableFQN := fmt.Sprintf("%s.%s.%s", catalog, dbSchema, tableName)
 			tblRdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableFQN))
 			if err != nil {
 				binaryBldr.AppendNull()
@@ -265,7 +268,11 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			}
 			tblSchema := tblRdr.Schema()
 			tblRdr.Release()
-			binaryBldr.Append(flight.SerializeSchema(tblSchema, s.Alloc))
+
+			// Enrich the Arrow schema with FlightSQL column metadata (TYPE_NAME)
+			// by looking up DuckDB's native type names from information_schema.columns.
+			enriched := s.enrichSchemaWithTypeNames(ctx, ac, tblSchema, catalog, dbSchema, tableName)
+			binaryBldr.Append(flight.SerializeSchema(enriched, s.Alloc))
 		}
 
 		schemaArr := binaryBldr.NewArray()
@@ -280,6 +287,67 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	close(ch)
 
 	return outSchema, ch, nil
+}
+
+// enrichSchemaWithTypeNames adds ARROW:FLIGHT:SQL:TYPE_NAME metadata to each
+// field in the schema by querying information_schema.columns for the DuckDB
+// native type names. If the query fails, the original schema is returned.
+func (s *DuckFlightSQLServer) enrichSchemaWithTypeNames(
+	ctx context.Context, ac *engine.ArrowConn, schema *arrow.Schema,
+	catalog, dbSchema, tableName string,
+) *arrow.Schema {
+	query := fmt.Sprintf(
+		"SELECT column_name, data_type FROM information_schema.columns "+
+			"WHERE table_catalog = '%s' AND table_schema = '%s' AND table_name = '%s' "+
+			"ORDER BY ordinal_position",
+		escapeSQLString(catalog), escapeSQLString(dbSchema), escapeSQLString(tableName),
+	)
+
+	rdr, err := ac.Arrow.QueryContext(ctx, query)
+	if err != nil {
+		return schema
+	}
+	defer rdr.Release()
+
+	typeByName := make(map[string]string)
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		col0 := rec.Column(0).(*array.String)
+		col1 := rec.Column(1).(*array.String)
+		for i := 0; i < col0.Len(); i++ {
+			typeByName[strings.Clone(col0.Value(i))] = strings.Clone(col1.Value(i))
+		}
+	}
+	if rdr.Err() != nil {
+		return schema
+	}
+
+	fields := make([]arrow.Field, len(schema.Fields()))
+	for i, f := range schema.Fields() {
+		typeName, ok := typeByName[f.Name]
+		if !ok {
+			fields[i] = f
+			continue
+		}
+
+		mdBuilder := flightsql.NewColumnMetadataBuilder()
+		mdBuilder.TypeName(typeName)
+		md := mdBuilder.Metadata()
+
+		// Merge with any existing metadata on the field.
+		if f.HasMetadata() {
+			existing := f.Metadata.ToMap()
+			for k, v := range md.ToMap() {
+				existing[k] = v
+			}
+			md = arrow.MetadataFrom(existing)
+		}
+		f.Metadata = md
+		fields[i] = f
+	}
+
+	schemaMd := schema.Metadata()
+	return arrow.NewSchema(fields, &schemaMd)
 }
 
 // --- GetTableTypes ---

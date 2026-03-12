@@ -457,10 +457,10 @@ func (s *DuckFlightSQLSuite) TestCommandGetTablesWithIncludedSchemas() {
 	tabletype := s.fromJSON(arrow.BinaryTypes.String, `["BASE TABLE"]`)
 
 	tableSchema := arrow.NewSchema([]arrow.Field{
-		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
-		{Name: "keyName", Type: arrow.BinaryTypes.String, Nullable: true},
-		{Name: "value", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
-		{Name: "foreignId", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true, Metadata: arrow.MetadataFrom(map[string]string{flightsql.TypeNameKey: "INTEGER"})},
+		{Name: "keyName", Type: arrow.BinaryTypes.String, Nullable: true, Metadata: arrow.MetadataFrom(map[string]string{flightsql.TypeNameKey: "VARCHAR"})},
+		{Name: "value", Type: arrow.PrimitiveTypes.Int64, Nullable: true, Metadata: arrow.MetadataFrom(map[string]string{flightsql.TypeNameKey: "BIGINT"})},
+		{Name: "foreignId", Type: arrow.PrimitiveTypes.Int64, Nullable: true, Metadata: arrow.MetadataFrom(map[string]string{flightsql.TypeNameKey: "BIGINT"})},
 	}, nil)
 	schemaBuf := flight.SerializeSchema(tableSchema, s.mem)
 	binaryBldr := array.NewBinaryBuilder(s.mem, arrow.BinaryTypes.Binary)

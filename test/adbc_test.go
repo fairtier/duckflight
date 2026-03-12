@@ -277,8 +277,510 @@ func (s *ADBCSuite) TestADBC_404Table() {
 }
 
 // ---------------------------------------------------------------------------
+// GetObjects helper structs and parser
+// ---------------------------------------------------------------------------
+
+type constraintInfo struct {
+	Name        string
+	Type        string
+	ColumnNames []string
+}
+
+type columnInfo struct {
+	Name            string
+	OrdinalPosition int32
+	XdbcDataType    int16
+	XdbcTypeName    string
+}
+
+type tableInfo struct {
+	Name        string
+	TableType   string
+	Columns     []columnInfo
+	Constraints []constraintInfo
+}
+
+type schemaInfo struct {
+	Name   string
+	Tables []tableInfo
+}
+
+type catalogInfo struct {
+	Name    string
+	Schemas []schemaInfo
+}
+
+// parseGetObjects traverses the nested Arrow struct/list columns returned by
+// GetObjects and returns a slice of catalogInfo for assertion.
+func parseGetObjects(rdr array.RecordReader) []catalogInfo {
+	var result []catalogInfo
+	for rdr.Next() {
+		rec := rdr.Record()
+		catalogs := rec.Column(0).(*array.String)
+		catalogDbSchemasList := rec.Column(1).(*array.List)
+		catalogDbSchemas := catalogDbSchemasList.ListValues().(*array.Struct)
+
+		dbSchemaNames := catalogDbSchemas.Field(0).(*array.String)
+		dbSchemaTablesList := catalogDbSchemas.Field(1).(*array.List)
+		dbSchemaTables := dbSchemaTablesList.ListValues().(*array.Struct)
+
+		tableNames := dbSchemaTables.Field(0).(*array.String)
+		tableTypes := dbSchemaTables.Field(1).(*array.String)
+		tableColumnsList := dbSchemaTables.Field(2).(*array.List)
+		tableConstraintsList := dbSchemaTables.Field(3).(*array.List)
+
+		tableColumns := tableColumnsList.ListValues().(*array.Struct)
+		colNames := tableColumns.Field(0).(*array.String)
+		colPositions := tableColumns.Field(1).(*array.Int32)
+		colXdbcDataType := tableColumns.Field(3).(*array.Int16)
+		colXdbcTypeName := tableColumns.Field(4).(*array.String)
+
+		tableConstraints := tableConstraintsList.ListValues().(*array.Struct)
+		constraintNames := tableConstraints.Field(0).(*array.String)
+		constraintTypes := tableConstraints.Field(1).(*array.String)
+		constraintColNamesList := tableConstraints.Field(2).(*array.List)
+		constraintColNames := constraintColNamesList.ListValues().(*array.String)
+
+		for row := 0; row < int(rec.NumRows()); row++ {
+			cat := catalogInfo{Name: catalogs.Value(row)}
+
+			if catalogDbSchemasList.IsNull(row) {
+				result = append(result, cat)
+				continue
+			}
+
+			schStart, schEnd := catalogDbSchemasList.ValueOffsets(row)
+			for si := schStart; si < schEnd; si++ {
+				sch := schemaInfo{Name: dbSchemaNames.Value(int(si))}
+
+				if dbSchemaTablesList.IsNull(int(si)) {
+					cat.Schemas = append(cat.Schemas, sch)
+					continue
+				}
+
+				tblStart, tblEnd := dbSchemaTablesList.ValueOffsets(int(si))
+				for ti := tblStart; ti < tblEnd; ti++ {
+					tbl := tableInfo{
+						Name:      tableNames.Value(int(ti)),
+						TableType: tableTypes.Value(int(ti)),
+					}
+
+					if !tableColumnsList.IsNull(int(ti)) {
+						colStart, colEnd := tableColumnsList.ValueOffsets(int(ti))
+						for ci := colStart; ci < colEnd; ci++ {
+							col := columnInfo{
+								Name:            colNames.Value(int(ci)),
+								OrdinalPosition: colPositions.Value(int(ci)),
+							}
+							if !colXdbcDataType.IsNull(int(ci)) {
+								col.XdbcDataType = colXdbcDataType.Value(int(ci))
+							}
+							if !colXdbcTypeName.IsNull(int(ci)) {
+								col.XdbcTypeName = colXdbcTypeName.Value(int(ci))
+							}
+							tbl.Columns = append(tbl.Columns, col)
+						}
+					}
+
+					if !tableConstraintsList.IsNull(int(ti)) {
+						conStart, conEnd := tableConstraintsList.ValueOffsets(int(ti))
+						for ki := conStart; ki < conEnd; ki++ {
+							con := constraintInfo{
+								Type: constraintTypes.Value(int(ki)),
+							}
+							if !constraintNames.IsNull(int(ki)) {
+								con.Name = constraintNames.Value(int(ki))
+							}
+							cnStart, cnEnd := constraintColNamesList.ValueOffsets(int(ki))
+							for cni := cnStart; cni < cnEnd; cni++ {
+								con.ColumnNames = append(con.ColumnNames, constraintColNames.Value(int(cni)))
+							}
+							tbl.Constraints = append(tbl.Constraints, con)
+						}
+					}
+
+					sch.Tables = append(sch.Tables, tbl)
+				}
+				cat.Schemas = append(cat.Schemas, sch)
+			}
+			result = append(result, cat)
+		}
+	}
+	return result
+}
+
+func findCatalog(cats []catalogInfo, name string) *catalogInfo {
+	for i := range cats {
+		if cats[i].Name == name {
+			return &cats[i]
+		}
+	}
+	return nil
+}
+
+func findSchema(cat *catalogInfo, name string) *schemaInfo {
+	if cat == nil {
+		return nil
+	}
+	for i := range cat.Schemas {
+		if cat.Schemas[i].Name == name {
+			return &cat.Schemas[i]
+		}
+	}
+	return nil
+}
+
+func findTable(sch *schemaInfo, name string) *tableInfo {
+	if sch == nil {
+		return nil
+	}
+	for i := range sch.Tables {
+		if sch.Tables[i].Name == name {
+			return &sch.Tables[i]
+		}
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// GetObjects tests
+// ---------------------------------------------------------------------------
+
+func (s *ADBCSuite) TestADBC_GetObjectsSchema() {
+	ctx := context.Background()
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.True(rdr.Schema().Equal(adbc.GetObjectsSchema),
+		"GetObjects schema mismatch:\ngot:  %s\nwant: %s", rdr.Schema(), adbc.GetObjectsSchema)
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsDepthCatalogs() {
+	ctx := context.Background()
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthCatalogs, nil, nil, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	s.Require().NotEmpty(cats)
+
+	// At catalog depth, catalog_db_schemas should be nil (no schemas populated).
+	for _, cat := range cats {
+		s.Nil(cat.Schemas, "catalog %q should have nil schemas at ObjectDepthCatalogs", cat.Name)
+	}
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsDepthDBSchemas() {
+	ctx := context.Background()
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthDBSchemas, nil, nil, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem, "expected 'memory' catalog")
+	s.Require().NotEmpty(mem.Schemas)
+
+	// At schema depth, db_schema_tables should be nil.
+	for _, sch := range mem.Schemas {
+		s.Nil(sch.Tables, "schema %q should have nil tables at ObjectDepthDBSchemas", sch.Name)
+	}
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsDepthTables() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_depth_tbl (x INTEGER)")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_depth_tbl")
+
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthTables, nil, nil, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	tbl := findTable(sch, "go_test_depth_tbl")
+	s.Require().NotNil(tbl, "expected table go_test_depth_tbl at ObjectDepthTables")
+
+	// At table depth, columns and constraints should be nil.
+	s.Nil(tbl.Columns, "columns should be nil at ObjectDepthTables")
+	s.Nil(tbl.Constraints, "constraints should be nil at ObjectDepthTables")
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsDepthAll() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_all (id INTEGER PRIMARY KEY, name VARCHAR, value BIGINT)")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_all")
+
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	tbl := findTable(sch, "go_test_all")
+	s.Require().NotNil(tbl, "expected table go_test_all at ObjectDepthAll")
+
+	s.Require().NotNil(tbl.Columns, "columns should be populated at ObjectDepthAll")
+	s.Len(tbl.Columns, 3)
+	s.Equal("id", tbl.Columns[0].Name)
+	s.Equal("name", tbl.Columns[1].Name)
+	s.Equal("value", tbl.Columns[2].Name)
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsCatalogFilter() {
+	ctx := context.Background()
+
+	// Filter for existing catalog
+	cat := strPtr("memory")
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthCatalogs, cat, nil, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	s.Require().Len(cats, 1)
+	s.Equal("memory", cats[0].Name)
+
+	// Filter for non-existent catalog
+	cat2 := strPtr("nonexistent_catalog")
+	rdr2, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthCatalogs, cat2, nil, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr2.Release()
+
+	cats2 := parseGetObjects(rdr2)
+	s.Empty(cats2)
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsSchemaFilter() {
+	ctx := context.Background()
+
+	schPat := strPtr("main")
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthDBSchemas, nil, schPat, nil, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	s.Require().Len(mem.Schemas, 1)
+	s.Equal("main", mem.Schemas[0].Name)
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsTableFilter() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_filter_a (x INTEGER)")
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_filter_b (y INTEGER)")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_filter_a")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_filter_b")
+
+	tblPat := strPtr("go_test_filter_a")
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthTables, nil, nil, tblPat, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	s.Require().Len(sch.Tables, 1)
+	s.Equal("go_test_filter_a", sch.Tables[0].Name)
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsTableTypeFilter() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_ttype (x INTEGER)")
+	s.execDDL("CREATE OR REPLACE VIEW go_test_ttype_v AS SELECT 1 AS x")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_ttype")
+	defer s.execDDL("DROP VIEW IF EXISTS go_test_ttype_v")
+
+	// Filter for BASE TABLE only
+	tableTypes := []string{"BASE TABLE"}
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthTables, nil, nil, nil, nil, tableTypes)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	for _, tbl := range sch.Tables {
+		s.Equal("BASE TABLE", tbl.TableType, "expected only BASE TABLE, got %q for %q", tbl.TableType, tbl.Name)
+	}
+
+	// Filter for VIEW only
+	tableTypes2 := []string{"VIEW"}
+	rdr2, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthTables, nil, nil, nil, nil, tableTypes2)
+	s.Require().NoError(err)
+	defer rdr2.Release()
+
+	cats2 := parseGetObjects(rdr2)
+	mem2 := findCatalog(cats2, "memory")
+	s.Require().NotNil(mem2)
+	sch2 := findSchema(mem2, "main")
+	s.Require().NotNil(sch2)
+	found := findTable(sch2, "go_test_ttype_v")
+	s.NotNil(found, "expected view go_test_ttype_v in VIEW filter results")
+	for _, tbl := range sch2.Tables {
+		s.Equal("VIEW", tbl.TableType, "expected only VIEW, got %q for %q", tbl.TableType, tbl.Name)
+	}
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsColumnFilter() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_colfilt (alpha INTEGER, beta VARCHAR, gamma BIGINT)")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_colfilt")
+
+	colPat := strPtr("beta")
+	tblPat := strPtr("go_test_colfilt")
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, colPat, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	tbl := findTable(sch, "go_test_colfilt")
+	s.Require().NotNil(tbl)
+	s.Require().Len(tbl.Columns, 1)
+	s.Equal("beta", tbl.Columns[0].Name)
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsColumnDetails() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_coldetail (id INTEGER PRIMARY KEY, name VARCHAR, value BIGINT)")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_coldetail")
+
+	tblPat := strPtr("go_test_coldetail")
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	tbl := findTable(sch, "go_test_coldetail")
+	s.Require().NotNil(tbl)
+	s.Require().Len(tbl.Columns, 3)
+
+	// Verify ordinal positions are 1-based and sequential
+	for i, col := range tbl.Columns {
+		s.Equal(int32(i+1), col.OrdinalPosition,
+			"column %q ordinal_position mismatch", col.Name)
+	}
+
+	s.Equal("id", tbl.Columns[0].Name)
+	s.Equal("name", tbl.Columns[1].Name)
+	s.Equal("value", tbl.Columns[2].Name)
+
+	// Verify xdbc_type_name is populated via ARROW:FLIGHT:SQL:TYPE_NAME metadata.
+	s.Equal("INTEGER", tbl.Columns[0].XdbcTypeName, "id column should have type name INTEGER")
+	s.Equal("VARCHAR", tbl.Columns[1].XdbcTypeName, "name column should have type name VARCHAR")
+	s.Equal("BIGINT", tbl.Columns[2].XdbcTypeName, "value column should have type name BIGINT")
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsConstraints() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_con_pk (id INTEGER PRIMARY KEY, name VARCHAR)")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_con_pk")
+
+	tblPat := strPtr("go_test_con_pk")
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	tbl := findTable(sch, "go_test_con_pk")
+	s.Require().NotNil(tbl)
+
+	// NOTE: The ADBC FlightSQL driver does NOT call GetPrimaryKeys/GetImportedKeys
+	// when building GetObjects — the ConstraintLookup map is left empty.
+	// At ObjectDepthAll, table_constraints will be an empty list (nil slice in our
+	// parsed representation). This is a known limitation and may be the root cause
+	// of issues in tools like Harlequin that expect constraint data from GetObjects.
+	s.Empty(tbl.Constraints, "ADBC FlightSQL driver does not populate constraints in GetObjects")
+}
+
+func (s *ADBCSuite) TestADBC_GetObjectsWithView() {
+	ctx := context.Background()
+	s.execDDL("CREATE OR REPLACE VIEW go_test_view_obj AS SELECT 1 AS x, 'hello' AS y")
+	defer s.execDDL("DROP VIEW IF EXISTS go_test_view_obj")
+
+	tblPat := strPtr("go_test_view_obj")
+	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, nil, nil)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	cats := parseGetObjects(rdr)
+	mem := findCatalog(cats, "memory")
+	s.Require().NotNil(mem)
+	sch := findSchema(mem, "main")
+	s.Require().NotNil(sch)
+	tbl := findTable(sch, "go_test_view_obj")
+	s.Require().NotNil(tbl, "view go_test_view_obj should appear in GetObjects")
+	s.Equal("VIEW", tbl.TableType)
+	s.Require().NotNil(tbl.Columns)
+	s.Len(tbl.Columns, 2)
+	s.Equal("x", tbl.Columns[0].Name)
+	s.Equal("y", tbl.Columns[1].Name)
+}
+
+// ---------------------------------------------------------------------------
+// GetTableSchema tests
+// ---------------------------------------------------------------------------
+
+func (s *ADBCSuite) TestADBC_GetTableSchemaFound() {
+	ctx := context.Background()
+	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_gts (id INTEGER, name VARCHAR, value DOUBLE)")
+	defer s.execDDL("DROP TABLE IF EXISTS go_test_gts")
+
+	schema, err := s.cnxn.GetTableSchema(ctx, nil, nil, "go_test_gts")
+	s.Require().NoError(err)
+	s.Require().Equal(3, schema.NumFields())
+	s.Equal("id", schema.Field(0).Name)
+	s.Equal("name", schema.Field(1).Name)
+	s.Equal("value", schema.Field(2).Name)
+
+	// Verify ARROW:FLIGHT:SQL:TYPE_NAME metadata is set on each field.
+	for _, f := range schema.Fields() {
+		s.True(f.HasMetadata(), "field %q should have metadata", f.Name)
+		idx := f.Metadata.FindKey("ARROW:FLIGHT:SQL:TYPE_NAME")
+		s.GreaterOrEqual(idx, 0, "field %q should have TYPE_NAME metadata key", f.Name)
+	}
+	s.Equal("INTEGER", schema.Field(0).Metadata.Values()[schema.Field(0).Metadata.FindKey("ARROW:FLIGHT:SQL:TYPE_NAME")])
+	s.Equal("VARCHAR", schema.Field(1).Metadata.Values()[schema.Field(1).Metadata.FindKey("ARROW:FLIGHT:SQL:TYPE_NAME")])
+	s.Equal("DOUBLE", schema.Field(2).Metadata.Values()[schema.Field(2).Metadata.FindKey("ARROW:FLIGHT:SQL:TYPE_NAME")])
+}
+
+func (s *ADBCSuite) TestADBC_GetTableSchemaNotFound() {
+	ctx := context.Background()
+	_, err := s.cnxn.GetTableSchema(ctx, nil, nil, "go_test_nonexistent_table_xyz")
+	s.Require().Error(err)
+	var aErr adbc.Error
+	s.Require().ErrorAs(err, &aErr)
+	s.Equal(adbc.StatusNotFound, aErr.Code)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+func strPtr(s string) *string { return &s }
 
 func (s *ADBCSuite) execDDL(query string) {
 	s.T().Helper()
