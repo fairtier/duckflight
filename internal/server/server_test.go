@@ -1,6 +1,6 @@
 //go:build duckdb_arrow
 
-package duckflight_test
+package server_test
 
 import (
 	"context"
@@ -14,7 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	duckserver "github.com/prochac/duckflight/internal/server"
+	"github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -35,7 +35,7 @@ type DuckFlightSQLSuite struct {
 }
 
 func (s *DuckFlightSQLSuite) SetupSuite() {
-	srv, err := duckserver.New(duckserver.Config{
+	srv, err := server.New(server.Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",
@@ -91,7 +91,7 @@ func (s *DuckFlightSQLSuite) TearDownTest() {
 
 func (s *DuckFlightSQLSuite) seedSQL(sql string) {
 	s.T().Helper()
-	err := duckserver.SeedSQL(context.Background(), sql)
+	err := server.SeedSQL(context.Background(), sql)
 	s.Require().NoError(err, "seedSQL failed: %s", sql)
 }
 

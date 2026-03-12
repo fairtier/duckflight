@@ -1,6 +1,6 @@
 //go:build duckdb_arrow
 
-package duckflight_test
+package auth_test
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/prochac/duckflight/internal/auth"
-	duckserver "github.com/prochac/duckflight/internal/server"
+	"github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -44,7 +44,7 @@ type AuthSuite struct {
 }
 
 func (s *AuthSuite) SetupSuite() {
-	srv, err := duckserver.New(duckserver.Config{
+	srv, err := server.New(server.Config{
 		MemoryLimit:  "256MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",

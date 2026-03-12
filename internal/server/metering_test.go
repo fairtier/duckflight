@@ -1,6 +1,6 @@
 //go:build duckdb_arrow
 
-package duckflight_test
+package server_test
 
 import (
 	"context"
@@ -9,7 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	duckserver "github.com/prochac/duckflight/internal/server"
+	"github.com/prochac/duckflight/internal/server"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/suite"
@@ -78,7 +78,7 @@ type MeteringSuite struct {
 }
 
 func (s *MeteringSuite) SetupSuite() {
-	srv, err := duckserver.New(duckserver.Config{
+	srv, err := server.New(server.Config{
 		MemoryLimit:    "256MB",
 		MaxThreads:     2,
 		QueryTimeout:   "30s",
