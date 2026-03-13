@@ -113,8 +113,8 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	reg(flightsql.SqlInfoTransactionsSupported, true)
 
 	// SQL capabilities
-	reg(flightsql.SqlInfoDDLCatalog, false)
-	reg(flightsql.SqlInfoDDLSchema, false)
+	reg(flightsql.SqlInfoDDLCatalog, true)
+	reg(flightsql.SqlInfoDDLSchema, true)
 	reg(flightsql.SqlInfoDDLTable, true)
 	reg(flightsql.SqlInfoIdentifierCase, int64(flightsql.SqlCaseSensitivityCaseInsensitive))
 	reg(flightsql.SqlInfoIdentifierQuoteChar, `"`)
@@ -123,6 +123,9 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	reg(flightsql.SqlInfoNullOrdering, int64(flightsql.SqlNullOrderingSortAtEnd))
 	reg(flightsql.SqlInfoSearchStringEscape, `\`)
 	reg(flightsql.SqlInfoExtraNameChars, "")
+	reg(flightsql.SqlInfoCatalogTerm, "database")
+	reg(flightsql.SqlInfoSchemaTerm, "schema")
+	reg(flightsql.SqlInfoCatalogAtStart, true)
 	reg(flightsql.SqlInfoSupportsColumnAliasing, true)
 	reg(flightsql.SqlInfoNullPlusNullIsNull, true)
 	reg(flightsql.SqlInfoSupportsTableCorrelationNames, true)
