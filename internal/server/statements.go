@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -18,15 +17,6 @@ import (
 	"github.com/prochac/duckflight/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-)
-
-type cachedQuery struct {
-	query         string
-	transactionID string
-}
-
-var (
-	queryCache sync.Map // handle string -> cachedQuery
 )
 
 // duckDBToGRPCCode maps DuckDB error types to appropriate gRPC status codes.
@@ -73,11 +63,11 @@ func (s *DuckFlightSQLServer) GetFlightInfoStatement(
 	txnID := string(cmd.GetTransactionId())
 
 	handle := genHandle()
-	queryCache.Store(string(handle), cachedQuery{query: query, transactionID: txnID})
+	s.tracker.Register(string(handle), query, txnID)
 
 	tkt, err := flightsql.CreateStatementQueryTicket(handle)
 	if err != nil {
-		queryCache.Delete(string(handle))
+		s.tracker.Remove(string(handle))
 		return nil, status.Errorf(codes.Internal, "failed to encode ticket: %s", err)
 	}
 
@@ -99,32 +89,38 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	handle := string(cmd.GetStatementHandle())
 
-	val, ok := queryCache.LoadAndDelete(handle)
+	query, txnID, ok := s.tracker.Load(handle)
 	if !ok {
 		return nil, nil, status.Error(codes.NotFound, fmt.Sprintf("statement handle not found: %q", handle))
 	}
-	cq := val.(cachedQuery)
 
-	ac, fromPool, err := s.acquireConn(ctx, cq.transactionID)
+	ac, fromPool, err := s.acquireConn(ctx, txnID)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	queryCtx := ctx
-	var queryCancel context.CancelFunc
+	queryCtx, queryCancel := context.WithCancel(ctx)
 	if s.queryTimeout > 0 {
 		queryCtx, queryCancel = context.WithTimeout(ctx, s.queryTimeout)
 	}
+	s.tracker.SetCancel(handle, queryCancel)
 
-	rdr, err := ac.Arrow.QueryContext(queryCtx, cq.query)
+	rdr, err := ac.Arrow.QueryContext(queryCtx, query)
 	if err != nil {
-		if queryCancel != nil {
-			queryCancel()
-		}
+		// Check context state before canceling, so we can distinguish
+		// external cancellation from our own cleanup cancel.
+		ctxErr := queryCtx.Err()
+		queryCancel()
 		if fromPool {
 			s.engine.Pool.Release(ac)
 		}
-		if queryCtx.Err() == context.DeadlineExceeded {
+		s.tracker.Complete(handle)
+		switch ctxErr {
+		case context.Canceled:
+			queryCount.WithLabelValues("canceled").Inc()
+			return nil, nil, status.Error(codes.Canceled, "query canceled")
+		case context.DeadlineExceeded:
+			queryCount.WithLabelValues("timeout").Inc()
 			return nil, nil, status.Error(codes.DeadlineExceeded, "query exceeded time limit")
 		}
 		return nil, nil, status.Errorf(duckDBToGRPCCode(err), "query execution error: %s", err)
@@ -140,13 +136,12 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	go func() {
 		defer close(ch)
 		defer metered.Release()
-		if queryCancel != nil {
-			defer queryCancel()
-		}
+		defer queryCancel()
 		if fromPool {
 			defer s.engine.Pool.Release(ac)
 		}
 		defer func() {
+			s.tracker.Complete(handle)
 			activeQueries.Dec()
 			queryDuration.WithLabelValues().Observe(time.Since(start).Seconds())
 		}()
@@ -157,7 +152,11 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 			select {
 			case ch <- flight.StreamChunk{Data: rec}:
 			case <-queryCtx.Done():
-				queryCount.WithLabelValues("timeout").Inc()
+				if queryCtx.Err() == context.Canceled {
+					queryCount.WithLabelValues("canceled").Inc()
+				} else {
+					queryCount.WithLabelValues("timeout").Inc()
+				}
 				return
 			}
 		}
@@ -221,5 +220,68 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 	schema := rdr.Schema()
 	return &flight.SchemaResult{
 		Schema: flight.SerializeSchema(schema, s.Alloc),
+	}, nil
+}
+
+// CancelFlightInfo cancels a running or pending query.
+func (s *DuckFlightSQLServer) CancelFlightInfo(
+	_ context.Context,
+	req *flight.CancelFlightInfoRequest,
+) (flight.CancelFlightInfoResult, error) {
+	handle, err := extractStatementHandle(req)
+	if err != nil {
+		return flight.CancelFlightInfoResult{Status: flight.CancelStatusUnspecified}, err
+	}
+
+	cs := s.tracker.Cancel(handle)
+	return flight.CancelFlightInfoResult{Status: cs}, nil
+}
+
+// extractStatementHandle unmarshals the ticket from a CancelFlightInfoRequest
+// to recover the statement handle string.
+func extractStatementHandle(req *flight.CancelFlightInfoRequest) (string, error) {
+	if req.Info == nil || len(req.Info.Endpoint) == 0 || req.Info.Endpoint[0].Ticket == nil {
+		return "", status.Error(codes.InvalidArgument, "missing ticket in cancel request")
+	}
+
+	tkt, err := flightsql.GetStatementQueryTicket(req.Info.Endpoint[0].Ticket)
+	if err != nil {
+		return "", status.Errorf(codes.InvalidArgument, "failed to decode statement handle: %s", err)
+	}
+
+	return string(tkt.GetStatementHandle()), nil
+}
+
+// PollFlightInfoStatement registers the query and returns a ready-to-consume PollInfo.
+// Since DuckFlight uses synchronous execution, the query is immediately ready for DoGet.
+func (s *DuckFlightSQLServer) PollFlightInfoStatement(
+	_ context.Context,
+	cmd flightsql.StatementQuery,
+	desc *flight.FlightDescriptor,
+) (*flight.PollInfo, error) {
+	query := cmd.GetQuery()
+	txnID := string(cmd.GetTransactionId())
+
+	handle := genHandle()
+	s.tracker.Register(string(handle), query, txnID)
+
+	tkt, err := flightsql.CreateStatementQueryTicket(handle)
+	if err != nil {
+		s.tracker.Remove(string(handle))
+		return nil, status.Errorf(codes.Internal, "failed to encode ticket: %s", err)
+	}
+
+	info := &flight.FlightInfo{
+		Endpoint: []*flight.FlightEndpoint{{
+			Ticket: &flight.Ticket{Ticket: tkt},
+		}},
+		FlightDescriptor: desc,
+		TotalRecords:     -1,
+		TotalBytes:       -1,
+	}
+
+	return &flight.PollInfo{
+		Info:             info,
+		FlightDescriptor: nil, // nil means query is complete / ready for DoGet
 	}, nil
 }

@@ -49,6 +49,8 @@ type DuckFlightSQLServer struct {
 	openTransactions sync.Map // handle string -> *engine.ArrowConn
 	queryTimeout     time.Duration
 	maxResultBytes   int64
+	tracker          *queryTracker
+	stopCleanup      context.CancelFunc
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
@@ -84,12 +86,22 @@ func New(cfg Config) (*DuckFlightSQLServer, error) {
 		}
 	}
 
+	trackerTTL := 30 * time.Minute
+	if timeout > 0 {
+		trackerTTL = 2 * timeout
+	}
+
+	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
+
 	srv := &DuckFlightSQLServer{
 		engine:         eng,
 		queryTimeout:   timeout,
 		maxResultBytes: cfg.MaxResultBytes,
+		tracker:        &queryTracker{ttl: trackerTTL},
+		stopCleanup:    stopCleanup,
 	}
 	srv.Alloc = memory.DefaultAllocator
+	srv.tracker.StartCleanup(cleanupCtx)
 	registerSqlInfo(srv)
 
 	globalEngine = eng
@@ -144,7 +156,7 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	reg(flightsql.SqlInfoDateTimeFunctions, []string{})
 
 	// Cancellation & timeout
-	reg(flightsql.SqlInfoFlightSqlServerCancel, false)
+	reg(flightsql.SqlInfoFlightSqlServerCancel, true)
 	reg(flightsql.SqlInfoFlightSqlServerStatementTimeout, int32(0))
 	reg(flightsql.SqlInfoFlightSqlServerTransactionTimeout, int32(0))
 

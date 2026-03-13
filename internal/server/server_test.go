@@ -1196,6 +1196,168 @@ func (s *DuckFlightSQLSuite) TestPreparedStatementMultipleParamRows() {
 }
 
 // =========================================================================
+// Query cancellation
+// =========================================================================
+
+func (s *DuckFlightSQLSuite) TestCancelFlightInfoRunningQuery() {
+	ctx := context.Background()
+
+	canceledBefore := getMetricValue("flightsql_queries_total", map[string]string{"status": "canceled"})
+
+	// Start a slow cross-join query.
+	info, err := s.client.Execute(ctx, "SELECT count(*) FROM range(100000000) t1, range(100000000) t2")
+	s.Require().NoError(err)
+
+	// Start consuming in a goroutine.
+	doGetErr := make(chan error, 1)
+	go func() {
+		rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+		if err != nil {
+			doGetErr <- err
+			return
+		}
+		defer rdr.Release()
+		for rdr.Next() {
+		}
+		doGetErr <- rdr.Err()
+	}()
+
+	// Give DoGet a moment to start execution.
+	time.Sleep(200 * time.Millisecond)
+
+	// Cancel the query.
+	result, err := s.client.CancelFlightInfo(ctx, &flight.CancelFlightInfoRequest{Info: info})
+	s.Require().NoError(err)
+	s.Equal(flight.CancelStatusCancelling, result.Status)
+
+	// DoGet should error.
+	err = <-doGetErr
+	s.Error(err)
+
+	// Wait briefly for async metric update.
+	time.Sleep(100 * time.Millisecond)
+
+	canceledAfter := getMetricValue("flightsql_queries_total", map[string]string{"status": "canceled"})
+	s.Greater(canceledAfter, canceledBefore, "flightsql_queries_total{status=canceled} should increment")
+}
+
+func (s *DuckFlightSQLSuite) TestCancelFlightInfoPendingQuery() {
+	ctx := context.Background()
+
+	// Execute to get FlightInfo but don't DoGet.
+	info, err := s.client.Execute(ctx, "SELECT 1")
+	s.Require().NoError(err)
+
+	// Cancel before DoGet.
+	result, err := s.client.CancelFlightInfo(ctx, &flight.CancelFlightInfoRequest{Info: info})
+	s.Require().NoError(err)
+	s.Equal(flight.CancelStatusCancelled, result.Status)
+
+	// DoGet should now fail with NotFound.
+	_, err = s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().Error(err)
+	st, ok := status.FromError(err)
+	s.Require().True(ok)
+	s.Equal(codes.NotFound, st.Code())
+}
+
+func (s *DuckFlightSQLSuite) TestCancelFlightInfoCompletedQuery() {
+	ctx := context.Background()
+
+	// Execute a fast query and consume all results.
+	info, err := s.client.Execute(ctx, "SELECT 1")
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	for rdr.Next() {
+	}
+	s.NoError(rdr.Err())
+	rdr.Release()
+
+	// Wait for completion to propagate.
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel after completion.
+	result, err := s.client.CancelFlightInfo(ctx, &flight.CancelFlightInfoRequest{Info: info})
+	s.Require().NoError(err)
+	s.Equal(flight.CancelStatusNotCancellable, result.Status)
+}
+
+func (s *DuckFlightSQLSuite) TestCancelFlightInfoUnknownHandle() {
+	ctx := context.Background()
+
+	// Create a bogus FlightInfo with a valid-looking but unknown ticket.
+	handle := []byte("bogus-handle-that-does-not-exist")
+	tkt, err := flightsql.CreateStatementQueryTicket(handle)
+	s.Require().NoError(err)
+
+	bogusInfo := &flight.FlightInfo{
+		Endpoint: []*flight.FlightEndpoint{{
+			Ticket: &flight.Ticket{Ticket: tkt},
+		}},
+	}
+
+	result, err := s.client.CancelFlightInfo(ctx, &flight.CancelFlightInfoRequest{Info: bogusInfo})
+	s.Require().NoError(err)
+	s.Equal(flight.CancelStatusNotCancellable, result.Status)
+}
+
+// =========================================================================
+// Polling
+// =========================================================================
+
+func (s *DuckFlightSQLSuite) TestPollFlightInfoStatement() {
+	ctx := context.Background()
+
+	pollInfo, err := s.client.ExecutePoll(ctx, "SELECT * FROM intTable", nil)
+	s.Require().NoError(err)
+	s.Require().NotNil(pollInfo)
+	s.Require().NotNil(pollInfo.Info)
+	s.Nil(pollInfo.FlightDescriptor, "nil descriptor means ready for DoGet")
+	s.Require().NotEmpty(pollInfo.Info.Endpoint)
+
+	// Consume results via DoGet.
+	rdr, err := s.client.DoGet(ctx, pollInfo.Info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	var total int64
+	for rdr.Next() {
+		total += rdr.RecordBatch().NumRows()
+	}
+	s.NoError(rdr.Err())
+	s.Equal(int64(4), total)
+}
+
+func (s *DuckFlightSQLSuite) TestSqlInfoFlightSqlServerCancel() {
+	ctx := context.Background()
+	info, err := s.client.GetSqlInfo(ctx, []flightsql.SqlInfo{
+		flightsql.SqlInfoFlightSqlServerCancel,
+	})
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	s.True(rdr.Next())
+	rec := rdr.RecordBatch()
+	s.EqualValues(1, rec.NumRows())
+
+	// info_name should be SqlInfoFlightSqlServerCancel.
+	infoNameCol := rec.Column(0).(*array.Uint32)
+	s.EqualValues(uint32(flightsql.SqlInfoFlightSqlServerCancel), infoNameCol.Value(0))
+
+	// The value is a dense union; extract the bool value.
+	valueCol := rec.Column(1).(*array.DenseUnion)
+	// Type code 1 = bool_value in the SqlInfo union schema.
+	boolChild := valueCol.Field(1).(*array.Boolean)
+	childIdx := valueCol.ValueOffset(0)
+	s.True(boolChild.Value(int(childIdx)), "SqlInfoFlightSqlServerCancel should be true")
+
+	s.False(rdr.Next())
+}
+
+// =========================================================================
 // Run
 // =========================================================================
 

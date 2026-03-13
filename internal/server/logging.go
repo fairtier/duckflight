@@ -486,7 +486,9 @@ func (l *loggingServer) CloseSession(ctx context.Context, req *flight.CloseSessi
 
 func (l *loggingServer) CancelFlightInfo(ctx context.Context, req *flight.CancelFlightInfoRequest) (result flight.CancelFlightInfoResult, err error) {
 	start := time.Now()
-	defer func() { logCall("CancelFlightInfo", start, err) }()
+	defer func() {
+		logCall("CancelFlightInfo", start, err, slog.String("cancel_status", result.Status.String()))
+	}()
 	result, err = l.DuckFlightSQLServer.CancelFlightInfo(ctx, req)
 	return
 }
@@ -510,7 +512,7 @@ func (l *loggingServer) PollFlightInfo(ctx context.Context, desc *flight.FlightD
 func (l *loggingServer) PollFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
 	start := time.Now()
 	info, err := l.DuckFlightSQLServer.PollFlightInfoStatement(ctx, cmd, desc)
-	logCall("PollFlightInfoStatement", start, err)
+	logCall("PollFlightInfoStatement", start, err, slog.String("query", cmd.GetQuery()))
 	return info, err
 }
 

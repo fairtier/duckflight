@@ -36,22 +36,14 @@ See `docs/plan-zero-copy-metadata.md` for the full design.
 
 ---
 
-## 3. Flight SQL Cancellation
+## ~~3. Flight SQL Cancellation & Polling~~ (Done)
 
-`SqlInfoFlightSqlServerCancel` is currently `false`. Clients cannot cancel in-flight queries.
-
-### What's needed
-
-- Implement `CancelFlightInfo` on the server.
-- Track active query contexts in a map (handle -> cancel func).
-- On cancel request, call the context cancel function.
-- DuckDB respects context cancellation via `QueryContext`, so the query should abort.
-- Set `SqlInfoFlightSqlServerCancel` to `true` once implemented.
-
-### Why it matters
-
-Long-running analytical queries against large Iceberg tables need a cancel mechanism.
-Without it, the only recourse is waiting for `statement_timeout` or killing the connection.
+Implemented. `queryTracker` replaces the old `queryCache` and tracks active queries with
+cancel functions and completion state. `CancelFlightInfo` cancels running queries (returns
+`Cancelling`) or removes pending ones (returns `Cancelled`). `PollFlightInfoStatement`
+registers the query and returns a ready-to-consume `PollInfo` (synchronous model).
+`SqlInfoFlightSqlServerCancel` is now `true`. New `"canceled"` metric label on
+`flightsql_queries_total`. TTL-based cleanup reaps abandoned entries.
 
 ---
 
@@ -127,20 +119,11 @@ Low. Most Flight SQL clients do not use savepoints. Implement on demand.
 
 ---
 
-## 8. Polling for Long-Running Queries
+## ~~8. Polling for Long-Running Queries~~ (Done)
 
-`PollFlightInfo` methods exist in the Flight SQL spec but are not implemented.
-
-### What's needed
-
-- For long-running queries, `GetFlightInfoStatement` could return a "not ready" FlightInfo.
-- `PollFlightInfoStatement` would check if results are ready and return updated FlightInfo.
-- Requires decoupling query submission from execution (async execution model).
-
-### Priority
-
-Low. Current synchronous model works for most workloads. Consider if query timeouts
-become a problem for legitimate long queries that clients want to poll.
+Implemented as part of cancellation (#3). `PollFlightInfoStatement` returns an immediately
+ready `PollInfo` (synchronous model). If async execution is needed in the future, this can
+be extended to return a retry descriptor and track query progress.
 
 ---
 
@@ -230,7 +213,7 @@ No load testing has been performed.
 |----|------------------------------------------|------------------------|------------|----------|
 | 1  | ~~Prepared statement parameter binding~~ | ~~High (correctness)~~ | ~~Medium~~ | Done     |
 | 2  | Zero-copy metadata streaming             | Medium (performance)   | Medium     | P1       |
-| 3  | Cancellation                             | Medium (usability)     | Low        | P1       |
+| 3  | ~~Cancellation & polling~~               | ~~Medium (usability)~~ | ~~Low~~    | Done     |
 | 4  | Bulk ingestion                           | Medium (completeness)  | Medium     | P2       |
 | 5  | Distributed tracing                      | Medium (operability)   | Low        | P2       |
 | 6  | Rate limiting                            | Low (defense)          | Low        | P2       |
@@ -238,4 +221,4 @@ No load testing has been performed.
 | 8  | Load testing                             | Medium (confidence)    | Medium     | P2       |
 | 9  | Static extension build                   | Medium (cold start)    | Medium     | P2       |
 | 10 | Savepoints                               | Low (niche)            | Low        | P3       |
-| 11 | Polling                                  | Low (niche)            | Medium     | P3       |
+| 11 | ~~Polling~~                              | ~~Low (niche)~~        | ~~Medium~~ | Done     |
