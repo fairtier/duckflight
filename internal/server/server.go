@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"time"
 
@@ -134,6 +135,8 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	reg(flightsql.SqlInfoSupportedGroupBy, int64(2)) // SQL_GROUP_BY_BEYOND_SELECT bitmask
 	reg(flightsql.SqlInfoSupportsLikeEscapeClause, true)
 
+	reg(flightsql.SqlInfoSupportsConvert, buildConvertMap())
+
 	reg(flightsql.SqlInfoKeywords, fetchKeywords(srv.engine))
 	reg(flightsql.SqlInfoNumericFunctions, []string{})
 	reg(flightsql.SqlInfoStringFunctions, []string{})
@@ -148,6 +151,70 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	// Bulk ingestion
 	reg(flightsql.SqlInfoFlightSqlServerBulkIngestion, false)
 	reg(flightsql.SqlInfoFlightSqlServerIngestTransactionsSupported, false)
+}
+
+// buildConvertMap returns a SqlInfoSupportsConvert map describing which SQL
+// type casts DuckDB supports. Keys are "convert from" types, values list the
+// types each can be cast to.
+func buildConvertMap() map[int32][]int32 {
+	c := func(ids ...flightsql.SqlSupportsConvert) []int32 {
+		out := make([]int32, len(ids))
+		for i, id := range ids {
+			out[i] = int32(id)
+		}
+		return out
+	}
+
+	numeric := c(
+		flightsql.SqlConvertBigInt,
+		flightsql.SqlConvertInteger,
+		flightsql.SqlConvertSmallInt,
+		flightsql.SqlConvertTinyInt,
+		flightsql.SqlConvertFloat,
+		flightsql.SqlConvertReal,
+		flightsql.SqlConvertDecimal,
+		flightsql.SqlConvertNumeric,
+	)
+	str := c(
+		flightsql.SqlConvertChar,
+		flightsql.SqlConvertVarchar,
+		flightsql.SqlConvertLongVarchar,
+	)
+	bin := c(
+		flightsql.SqlConvertBinary,
+		flightsql.SqlConvertVarbinary,
+		flightsql.SqlConvertLongVarbinary,
+	)
+	bit := c(flightsql.SqlConvertBit)
+
+	// DuckDB numeric types → other numerics, strings, boolean
+	numericTargets := slices.Concat(numeric, str, bit)
+	// DuckDB varchar → nearly everything
+	stringTargets := slices.Concat(numeric, str, bin, bit,
+		c(flightsql.SqlConvertDate, flightsql.SqlConvertTime, flightsql.SqlConvertTimestamp,
+			flightsql.SqlConvertIntervalDayTime, flightsql.SqlConvertIntervalYearMonth))
+
+	m := make(map[int32][]int32, 20)
+
+	for _, n := range numeric {
+		m[n] = numericTargets
+	}
+	for _, s := range str {
+		m[s] = stringTargets
+	}
+	for _, b := range bin {
+		m[b] = slices.Concat(bin, str)
+	}
+	m[int32(flightsql.SqlConvertBit)] = slices.Concat(numeric, str)
+	m[int32(flightsql.SqlConvertDate)] = slices.Concat(str,
+		c(flightsql.SqlConvertTimestamp))
+	m[int32(flightsql.SqlConvertTime)] = str
+	m[int32(flightsql.SqlConvertTimestamp)] = slices.Concat(str,
+		c(flightsql.SqlConvertDate, flightsql.SqlConvertTime))
+	m[int32(flightsql.SqlConvertIntervalDayTime)] = str
+	m[int32(flightsql.SqlConvertIntervalYearMonth)] = str
+
+	return m
 }
 
 // fetchKeywords queries DuckDB for its reserved keywords list.
