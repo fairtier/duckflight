@@ -16,12 +16,16 @@ type ArrowConn struct {
 }
 
 // ExecContext executes a SQL statement that does not return rows.
-func (ac *ArrowConn) ExecContext(ctx context.Context, query string) (int64, error) {
+func (ac *ArrowConn) ExecContext(ctx context.Context, query string, args ...any) (int64, error) {
 	execer, ok := ac.conn.(driver.ExecerContext)
 	if !ok {
 		return 0, context.Canceled
 	}
-	result, err := execer.ExecContext(ctx, query, nil)
+	var named []driver.NamedValue
+	for i, a := range args {
+		named = append(named, driver.NamedValue{Ordinal: i + 1, Value: a})
+	}
+	result, err := execer.ExecContext(ctx, query, named)
 	if err != nil {
 		return 0, err
 	}

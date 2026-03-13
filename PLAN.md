@@ -5,24 +5,11 @@ See CLAUDE.md for architecture and current implementation details.
 
 ---
 
-## 1. Prepared Statement Parameter Binding
+## ~~1. Prepared Statement Parameter Binding~~ (Done)
 
-`DoPutPreparedStatementQuery` accepts parameter batches but does not apply them.
-The query runs as-is regardless of bound parameters.
-
-### What's needed
-
-- Extract parameter values from the Arrow record batch sent by the client.
-- Rewrite the prepared query to inject parameters via DuckDB's `$1`, `$2` positional syntax,
-  or use `duckdb.Arrow.QueryContext` with `args ...any`.
-- Verify behavior with JDBC and ADBC clients that rely on parameterized queries.
-
-### Why it matters
-
-Parameterized queries are required for:
-- SQL injection safety when clients build queries dynamically.
-- Query plan caching (DuckDB can reuse plans for parameterized queries).
-- JDBC driver compatibility — many BI tools use prepared statements exclusively.
+Implemented. Parameters are extracted from Arrow record batches via `scalar.GetScalar`,
+converted to Go values, and passed to `QueryContext`/`ExecContext` as positional args.
+Supports single-row and multi-row (batch) parameter binding. Tested with `flightsql.Client`.
 
 ---
 
@@ -239,16 +226,16 @@ No load testing has been performed.
 
 ## Priority Order
 
-| #  | Feature                              | Impact                 | Effort | Priority |
-|----|--------------------------------------|------------------------|--------|----------|
-| 1  | Prepared statement parameter binding | High (correctness)     | Medium | P0       |
-| 2  | Zero-copy metadata streaming         | Medium (performance)   | Medium | P1       |
-| 3  | Cancellation                         | Medium (usability)     | Low    | P1       |
-| 4  | Bulk ingestion                       | Medium (completeness)  | Medium | P2       |
-| 5  | Distributed tracing                  | Medium (operability)   | Low    | P2       |
-| 6  | Rate limiting                        | Low (defense)          | Low    | P2       |
-| 7  | TLS                                  | Low (deploy-dependent) | Low    | P2       |
-| 8  | Load testing                         | Medium (confidence)    | Medium | P2       |
-| 9  | Static extension build               | Medium (cold start)    | Medium | P2       |
-| 10 | Savepoints                           | Low (niche)            | Low    | P3       |
-| 11 | Polling                              | Low (niche)            | Medium | P3       |
+| #  | Feature                                  | Impact                 | Effort     | Priority |
+|----|------------------------------------------|------------------------|------------|----------|
+| 1  | ~~Prepared statement parameter binding~~ | ~~High (correctness)~~ | ~~Medium~~ | Done     |
+| 2  | Zero-copy metadata streaming             | Medium (performance)   | Medium     | P1       |
+| 3  | Cancellation                             | Medium (usability)     | Low        | P1       |
+| 4  | Bulk ingestion                           | Medium (completeness)  | Medium     | P2       |
+| 5  | Distributed tracing                      | Medium (operability)   | Low        | P2       |
+| 6  | Rate limiting                            | Low (defense)          | Low        | P2       |
+| 7  | TLS                                      | Low (deploy-dependent) | Low        | P2       |
+| 8  | Load testing                             | Medium (confidence)    | Medium     | P2       |
+| 9  | Static extension build                   | Medium (cold start)    | Medium     | P2       |
+| 10 | Savepoints                               | Low (niche)            | Low        | P3       |
+| 11 | Polling                                  | Low (niche)            | Medium     | P3       |

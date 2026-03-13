@@ -109,3 +109,9 @@ Test helper: `server.SeedSQL(ctx, sql)` executes setup SQL on the global engine.
 - **docker-compose.yml**: full local stack (PostgreSQL, MinIO, Lakekeeper, DuckFlight)
 - **helm/duckflight/**: Helm chart with Deployment, Service, HPA, GRPCRoute, BackendTrafficPolicy
 - **CI**: `.github/workflows/ci.yml` (lint + test), `release.yml` (Docker to GHCR), `release-helm.yml`
+
+## Reference implementation:
+
+- https://github.com/gizmodata/gizmosql
+- https://github.com/voltrondata/sqlflite
+- https://github.com/apache/arrow-go/tree/main/arrow/flight/flightsql/example

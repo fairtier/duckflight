@@ -1055,6 +1055,147 @@ func (s *DuckFlightSQLSuite) TestGetExecuteSchema() {
 }
 
 // =========================================================================
+// Prepared statements with parameters
+// =========================================================================
+
+func (s *DuckFlightSQLSuite) TestPreparedStatementQueryWithParams() {
+	ctx := context.Background()
+
+	prep, err := s.client.Prepare(ctx, "SELECT * FROM intTable WHERE id = $1")
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(prep.Close(ctx)) }()
+
+	// Build a single-row record batch with id=1.
+	paramSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "1", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+	}, nil)
+	bldr := array.NewInt32Builder(s.mem)
+	defer bldr.Release()
+	bldr.Append(1)
+	col := bldr.NewArray()
+	defer col.Release()
+	paramBatch := array.NewRecordBatch(paramSchema, []arrow.Array{col}, 1)
+	defer paramBatch.Release()
+
+	prep.SetParameters(paramBatch)
+	info, err := prep.Execute(ctx)
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	var rows int64
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		rows += rec.NumRows()
+		// Verify we got the correct row.
+		ids := rec.Column(0).(*array.Int32)
+		for i := 0; i < ids.Len(); i++ {
+			s.Equal(int32(1), ids.Value(i))
+		}
+	}
+	s.NoError(rdr.Err())
+	s.Equal(int64(1), rows)
+}
+
+func (s *DuckFlightSQLSuite) TestPreparedStatementUpdateWithParams() {
+	ctx := context.Background()
+
+	prep, err := s.client.Prepare(ctx, "INSERT INTO intTable (keyName, value) VALUES ($1, $2)")
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(prep.Close(ctx)) }()
+
+	paramSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "1", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "2", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+	}, nil)
+	keyBldr := array.NewStringBuilder(s.mem)
+	defer keyBldr.Release()
+	keyBldr.Append("inserted")
+	valBldr := array.NewInt64Builder(s.mem)
+	defer valBldr.Release()
+	valBldr.Append(42)
+
+	keyCol := keyBldr.NewArray()
+	defer keyCol.Release()
+	valCol := valBldr.NewArray()
+	defer valCol.Release()
+
+	paramBatch := array.NewRecordBatch(paramSchema, []arrow.Array{keyCol, valCol}, 1)
+	defer paramBatch.Release()
+
+	prep.SetParameters(paramBatch)
+	n, err := prep.ExecuteUpdate(ctx)
+	s.Require().NoError(err)
+	s.Equal(int64(1), n)
+
+	// Verify row was inserted.
+	count := s.execCountQuery()
+	s.Equal(int64(5), count) // 4 seeded + 1 inserted
+}
+
+func (s *DuckFlightSQLSuite) TestPreparedStatementQueryNoParams() {
+	ctx := context.Background()
+
+	prep, err := s.client.Prepare(ctx, "SELECT * FROM intTable ORDER BY id")
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(prep.Close(ctx)) }()
+
+	info, err := prep.Execute(ctx)
+	s.Require().NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	var rows int64
+	for rdr.Next() {
+		rows += rdr.RecordBatch().NumRows()
+	}
+	s.NoError(rdr.Err())
+	s.Equal(int64(4), rows) // 4 seeded rows
+}
+
+func (s *DuckFlightSQLSuite) TestPreparedStatementMultipleParamRows() {
+	ctx := context.Background()
+
+	prep, err := s.client.Prepare(ctx, "INSERT INTO intTable (keyName, value) VALUES ($1, $2)")
+	s.Require().NoError(err)
+	defer func() { s.Require().NoError(prep.Close(ctx)) }()
+
+	paramSchema := arrow.NewSchema([]arrow.Field{
+		{Name: "1", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "2", Type: arrow.PrimitiveTypes.Int64, Nullable: true},
+	}, nil)
+	keyBldr := array.NewStringBuilder(s.mem)
+	defer keyBldr.Release()
+	keyBldr.Append("batch1")
+	keyBldr.Append("batch2")
+	keyBldr.Append("batch3")
+	valBldr := array.NewInt64Builder(s.mem)
+	defer valBldr.Release()
+	valBldr.Append(10)
+	valBldr.Append(20)
+	valBldr.Append(30)
+
+	keyCol := keyBldr.NewArray()
+	defer keyCol.Release()
+	valCol := valBldr.NewArray()
+	defer valCol.Release()
+
+	paramBatch := array.NewRecordBatch(paramSchema, []arrow.Array{keyCol, valCol}, 3)
+	defer paramBatch.Release()
+
+	prep.SetParameters(paramBatch)
+	n, err := prep.ExecuteUpdate(ctx)
+	s.Require().NoError(err)
+	s.Equal(int64(3), n)
+
+	// Verify all rows were inserted.
+	count := s.execCountQuery()
+	s.Equal(int64(7), count) // 4 seeded + 3 inserted
+}
+
+// =========================================================================
 // Run
 // =========================================================================
 
