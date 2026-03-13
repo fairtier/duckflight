@@ -126,6 +126,8 @@ func (s *DuckFlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 
 	if catalog := cmd.GetCatalog(); catalog != nil {
 		query += fmt.Sprintf(" AND catalog_name = '%s'", escapeSQLString(*catalog))
+	} else {
+		query += " AND catalog_name = current_database()"
 	}
 	if schemaFilter := cmd.GetDBSchemaFilterPattern(); schemaFilter != nil {
 		query += fmt.Sprintf(" AND schema_name LIKE '%s'", escapeSQLString(*schemaFilter))
@@ -176,6 +178,8 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 
 	if catalog := cmd.GetCatalog(); catalog != nil {
 		query += fmt.Sprintf(" AND table_catalog = '%s'", escapeSQLString(*catalog))
+	} else {
+		query += " AND table_catalog = current_database()"
 	}
 	if schemaFilter := cmd.GetDBSchemaFilterPattern(); schemaFilter != nil {
 		query += fmt.Sprintf(" AND table_schema LIKE '%s'", escapeSQLString(*schemaFilter))

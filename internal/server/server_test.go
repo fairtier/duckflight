@@ -278,11 +278,11 @@ func (s *DuckFlightSQLSuite) TestCommandGetDbSchemas() {
 
 	s.True(rdr.Schema().Equal(schema_ref.DBSchemas), rdr.Schema().String())
 
-	catalog := s.fromJSON(arrow.BinaryTypes.String, `["memory", "system", "system", "system", "temp"]`)
+	catalog := s.fromJSON(arrow.BinaryTypes.String, `["memory"]`)
 	defer catalog.Release()
-	schema := s.fromJSON(arrow.BinaryTypes.String, `["main", "information_schema", "main", "pg_catalog", "main"]`)
+	schema := s.fromJSON(arrow.BinaryTypes.String, `["main"]`)
 	defer schema.Release()
-	expected := array.NewRecordBatch(schema_ref.DBSchemas, []arrow.Array{catalog, schema}, 5)
+	expected := array.NewRecordBatch(schema_ref.DBSchemas, []arrow.Array{catalog, schema}, 1)
 	defer expected.Release()
 
 	s.True(rdr.Next())

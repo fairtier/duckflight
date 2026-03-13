@@ -40,9 +40,13 @@ func (s *DuckFlightSQLServer) DoGetPrimaryKeys(
 
 	if cmd.Catalog != nil {
 		query += fmt.Sprintf(" AND database_name = '%s'", escapeSQLString(*cmd.Catalog))
+	} else {
+		query += " AND database_name = current_database()"
 	}
 	if cmd.DBSchema != nil {
 		query += fmt.Sprintf(" AND schema_name = '%s'", escapeSQLString(*cmd.DBSchema))
+	} else {
+		query += " AND schema_name = current_schema()"
 	}
 	query += fmt.Sprintf(" AND table_name = '%s'", escapeSQLString(cmd.Table))
 	query += " ORDER BY catalog_name, db_schema_name, table_name, key_sequence"

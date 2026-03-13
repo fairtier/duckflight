@@ -161,12 +161,9 @@ func (s *DuckFlightSQLServer) GetFlightInfoImportedKeys(
 func (s *DuckFlightSQLServer) DoGetImportedKeys(
 	ctx context.Context, cmd flightsql.TableRef,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	query := fkBaseQuery + fmt.Sprintf(
-		" WHERE fk_catalog = '%s' AND fk_schema = '%s' AND fk_table = '%s' ORDER BY pk_table, key_seq",
-		escapeSQLString(defaultCatalog(cmd.Catalog)),
-		escapeSQLString(defaultSchema(cmd.DBSchema)),
-		escapeSQLString(cmd.Table),
-	)
+	query := fkBaseQuery + " WHERE " + catalogFilter("fk_catalog", cmd.Catalog) +
+		" AND " + schemaFilter("fk_schema", cmd.DBSchema) +
+		fmt.Sprintf(" AND fk_table = '%s' ORDER BY pk_table, key_seq", escapeSQLString(cmd.Table))
 	rows, err := s.queryForeignKeys(ctx, query)
 	if err != nil {
 		return nil, nil, err
@@ -185,12 +182,9 @@ func (s *DuckFlightSQLServer) GetFlightInfoExportedKeys(
 func (s *DuckFlightSQLServer) DoGetExportedKeys(
 	ctx context.Context, cmd flightsql.TableRef,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	query := fkBaseQuery + fmt.Sprintf(
-		" WHERE fk_catalog = '%s' AND fk_schema = '%s' AND pk_table = '%s' ORDER BY fk_table, key_seq",
-		escapeSQLString(defaultCatalog(cmd.Catalog)),
-		escapeSQLString(defaultSchema(cmd.DBSchema)),
-		escapeSQLString(cmd.Table),
-	)
+	query := fkBaseQuery + " WHERE " + catalogFilter("fk_catalog", cmd.Catalog) +
+		" AND " + schemaFilter("fk_schema", cmd.DBSchema) +
+		fmt.Sprintf(" AND pk_table = '%s' ORDER BY fk_table, key_seq", escapeSQLString(cmd.Table))
 	rows, err := s.queryForeignKeys(ctx, query)
 	if err != nil {
 		return nil, nil, err
@@ -211,13 +205,10 @@ func (s *DuckFlightSQLServer) DoGetCrossReference(
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	pk := cmd.PKRef
 	fk := cmd.FKRef
-	query := fkBaseQuery + fmt.Sprintf(
-		" WHERE fk_catalog = '%s' AND fk_schema = '%s' AND pk_table = '%s' AND fk_table = '%s' ORDER BY key_seq",
-		escapeSQLString(defaultCatalog(pk.Catalog)),
-		escapeSQLString(defaultSchema(pk.DBSchema)),
-		escapeSQLString(pk.Table),
-		escapeSQLString(fk.Table),
-	)
+	query := fkBaseQuery + " WHERE " + catalogFilter("fk_catalog", pk.Catalog) +
+		" AND " + schemaFilter("fk_schema", pk.DBSchema) +
+		fmt.Sprintf(" AND pk_table = '%s' AND fk_table = '%s' ORDER BY key_seq",
+			escapeSQLString(pk.Table), escapeSQLString(fk.Table))
 	rows, err := s.queryForeignKeys(ctx, query)
 	if err != nil {
 		return nil, nil, err
@@ -225,16 +216,16 @@ func (s *DuckFlightSQLServer) DoGetCrossReference(
 	return streamKeysBatch(rows)
 }
 
-func defaultCatalog(c *string) string {
+func catalogFilter(col string, c *string) string {
 	if c != nil {
-		return *c
+		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*c))
 	}
-	return "memory"
+	return col + " = current_database()"
 }
 
-func defaultSchema(s *string) string {
+func schemaFilter(col string, s *string) string {
 	if s != nil {
-		return *s
+		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*s))
 	}
-	return "main"
+	return col + " = current_schema()"
 }
