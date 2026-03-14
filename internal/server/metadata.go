@@ -252,7 +252,6 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	if cmd.GetIncludeSchema() {
 		outSchema = schema_ref.TablesWithIncludedSchema
 
-		// For each table, get its Arrow schema by querying with LIMIT 0.
 		binaryBldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
 		defer binaryBldr.Release()
 
@@ -264,19 +263,13 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			catalog := catStrings.Value(i)
 			dbSchema := schStrings.Value(i)
 			tableName := nameStrings.Value(i)
-			tableFQN := fmt.Sprintf("%s.%s.%s", catalog, dbSchema, tableName)
-			tblRdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM %s LIMIT 0", tableFQN))
+
+			tblSchema, err := s.buildTableSchema(ctx, ac, catalog, dbSchema, tableName)
 			if err != nil {
 				binaryBldr.AppendNull()
 				continue
 			}
-			tblSchema := tblRdr.Schema()
-			tblRdr.Release()
-
-			// Enrich the Arrow schema with FlightSQL column metadata (TYPE_NAME)
-			// by looking up DuckDB's native type names from information_schema.columns.
-			enriched := s.enrichSchemaWithTypeNames(ctx, ac, tblSchema, catalog, dbSchema, tableName)
-			binaryBldr.Append(flight.SerializeSchema(enriched, s.Alloc))
+			binaryBldr.Append(flight.SerializeSchema(tblSchema, s.Alloc))
 		}
 
 		schemaArr := binaryBldr.NewArray()
@@ -293,15 +286,16 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	return outSchema, ch, nil
 }
 
-// enrichSchemaWithTypeNames adds ARROW:FLIGHT:SQL:TYPE_NAME metadata to each
-// field in the schema by querying information_schema.columns for the DuckDB
-// native type names. If the query fails, the original schema is returned.
-func (s *DuckFlightSQLServer) enrichSchemaWithTypeNames(
-	ctx context.Context, ac *engine.ArrowConn, schema *arrow.Schema,
+// buildTableSchema constructs an Arrow schema for a table entirely from
+// information_schema.columns. This avoids querying the table directly, which
+// can trigger a SIGSEGV in duckdb-go for tables created via Arrow.RegisterView.
+func (s *DuckFlightSQLServer) buildTableSchema(
+	ctx context.Context, ac *engine.ArrowConn,
 	catalog, dbSchema, tableName string,
-) *arrow.Schema {
+) (*arrow.Schema, error) {
 	query := fmt.Sprintf(
-		"SELECT column_name, data_type FROM information_schema.columns "+
+		"SELECT column_name, data_type, numeric_precision, numeric_scale "+
+			"FROM information_schema.columns "+
 			"WHERE table_catalog = '%s' AND table_schema = '%s' AND table_name = '%s' "+
 			"ORDER BY ordinal_position",
 		escapeSQLString(catalog), escapeSQLString(dbSchema), escapeSQLString(tableName),
@@ -309,49 +303,97 @@ func (s *DuckFlightSQLServer) enrichSchemaWithTypeNames(
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
 	if err != nil {
-		return schema
+		return nil, fmt.Errorf("query columns: %w", err)
 	}
 	defer rdr.Release()
 
-	typeByName := make(map[string]string)
+	var fields []arrow.Field
 	for rdr.Next() {
 		rec := rdr.RecordBatch()
-		col0 := rec.Column(0).(*array.String)
-		col1 := rec.Column(1).(*array.String)
-		for i := 0; i < col0.Len(); i++ {
-			typeByName[strings.Clone(col0.Value(i))] = strings.Clone(col1.Value(i))
-		}
-	}
-	if rdr.Err() != nil {
-		return schema
-	}
+		colNames := rec.Column(0).(*array.String)
+		colTypes := rec.Column(1).(*array.String)
+		colPrec := rec.Column(2).(*array.Int32)
+		colScale := rec.Column(3).(*array.Int32)
 
-	fields := make([]arrow.Field, len(schema.Fields()))
-	for i, f := range schema.Fields() {
-		typeName, ok := typeByName[f.Name]
-		if !ok {
-			fields[i] = f
-			continue
-		}
+		for i := 0; i < colNames.Len(); i++ {
+			name := strings.Clone(colNames.Value(i))
+			dataType := strings.Clone(colTypes.Value(i))
 
-		mdBuilder := flightsql.NewColumnMetadataBuilder()
-		mdBuilder.TypeName(typeName)
-		md := mdBuilder.Metadata()
-
-		// Merge with any existing metadata on the field.
-		if f.HasMetadata() {
-			existing := f.Metadata.ToMap()
-			for k, v := range md.ToMap() {
-				existing[k] = v
+			var precision, scale int32
+			if !colPrec.IsNull(i) {
+				precision = colPrec.Value(i)
 			}
-			md = arrow.MetadataFrom(existing)
+			if !colScale.IsNull(i) {
+				scale = colScale.Value(i)
+			}
+
+			mdBuilder := flightsql.NewColumnMetadataBuilder()
+			mdBuilder.TypeName(dataType)
+
+			fields = append(fields, arrow.Field{
+				Name:     name,
+				Type:     duckDBDataTypeToArrow(dataType, precision, scale),
+				Nullable: true,
+				Metadata: mdBuilder.Metadata(),
+			})
 		}
-		f.Metadata = md
-		fields[i] = f
+	}
+	if err := rdr.Err(); err != nil {
+		return nil, fmt.Errorf("read columns: %w", err)
 	}
 
-	schemaMd := schema.Metadata()
-	return arrow.NewSchema(fields, &schemaMd)
+	return arrow.NewSchema(fields, nil), nil
+}
+
+// duckDBDataTypeToArrow maps a DuckDB data_type string to an arrow.DataType.
+func duckDBDataTypeToArrow(dataType string, precision, scale int32) arrow.DataType {
+	switch dataType {
+	case "BOOLEAN":
+		return arrow.FixedWidthTypes.Boolean
+	case "TINYINT":
+		return arrow.PrimitiveTypes.Int8
+	case "SMALLINT":
+		return arrow.PrimitiveTypes.Int16
+	case "INTEGER":
+		return arrow.PrimitiveTypes.Int32
+	case "BIGINT":
+		return arrow.PrimitiveTypes.Int64
+	case "UTINYINT":
+		return arrow.PrimitiveTypes.Uint8
+	case "USMALLINT":
+		return arrow.PrimitiveTypes.Uint16
+	case "UINTEGER":
+		return arrow.PrimitiveTypes.Uint32
+	case "UBIGINT":
+		return arrow.PrimitiveTypes.Uint64
+	case "FLOAT":
+		return arrow.PrimitiveTypes.Float32
+	case "DOUBLE":
+		return arrow.PrimitiveTypes.Float64
+	case "VARCHAR":
+		return arrow.BinaryTypes.String
+	case "BLOB":
+		return arrow.BinaryTypes.Binary
+	case "DATE":
+		return arrow.FixedWidthTypes.Date32
+	case "TIME":
+		return arrow.FixedWidthTypes.Time64us
+	case "TIMESTAMP":
+		return &arrow.TimestampType{Unit: arrow.Microsecond}
+	case "TIMESTAMP WITH TIME ZONE":
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+	case "DECIMAL":
+		if precision == 0 {
+			precision = 18
+		}
+		return &arrow.Decimal128Type{Precision: precision, Scale: scale}
+	case "HUGEINT", "UHUGEINT":
+		return &arrow.Decimal128Type{Precision: 38, Scale: 0}
+	case "INTERVAL":
+		return arrow.FixedWidthTypes.MonthDayNanoInterval
+	default:
+		return arrow.BinaryTypes.String
+	}
 }
 
 // --- GetTableTypes ---
