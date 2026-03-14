@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	duckdb "github.com/duckdb/duckdb-go/v2"
@@ -284,4 +286,139 @@ func (s *DuckFlightSQLServer) PollFlightInfoStatement(
 		Info:             info,
 		FlightDescriptor: nil, // nil means query is complete / ready for DoGet
 	}, nil
+}
+
+// qualifiedTableName builds a fully-qualified, quoted table name from optional
+// catalog/schema and required table parts.
+func qualifiedTableName(catalog, schema, table string) string {
+	var parts []string
+	if catalog != "" {
+		parts = append(parts, `"`+strings.ReplaceAll(catalog, `"`, `""`)+`"`)
+	}
+	if schema != "" {
+		parts = append(parts, `"`+strings.ReplaceAll(schema, `"`, `""`)+`"`)
+	}
+	parts = append(parts, `"`+strings.ReplaceAll(table, `"`, `""`)+`"`)
+	return strings.Join(parts, ".")
+}
+
+// ingestBatch registers a single Arrow record batch as a DuckDB view and
+// executes the given SQL against it. Returns the number of affected rows.
+func ingestBatch(ctx context.Context, ac *engine.ArrowConn, rec arrow.RecordBatch, query string) (int64, error) {
+	recReader, err := array.NewRecordReader(rec.Schema(), []arrow.RecordBatch{rec})
+	if err != nil {
+		return 0, status.Errorf(codes.Internal, "create record reader: %s", err)
+	}
+	release, err := ac.Arrow.RegisterView(recReader, "__ingest_view")
+	if err != nil {
+		return 0, status.Errorf(codes.Internal, "register arrow view: %s", err)
+	}
+	defer release()
+
+	n, err := ac.ExecContext(ctx, query)
+	if err != nil {
+		return 0, status.Errorf(duckDBToGRPCCode(err), "ingest error: %s", err)
+	}
+	return n, nil
+}
+
+// DoPutCommandStatementIngest handles bulk ingestion of Arrow record batches
+// into a target table via DuckDB's Arrow view registration.
+func (s *DuckFlightSQLServer) DoPutCommandStatementIngest(
+	ctx context.Context,
+	cmd flightsql.StatementIngest,
+	rdr flight.MessageReader,
+) (int64, error) {
+	table := cmd.GetTable()
+	if table == "" {
+		return 0, status.Error(codes.InvalidArgument, "table name is required for ingestion")
+	}
+
+	opts := cmd.GetTableDefinitionOptions()
+	if opts == nil {
+		return 0, status.Error(codes.InvalidArgument, "table definition options are required")
+	}
+
+	ac, fromPool, err := s.acquireConn(ctx, string(cmd.GetTransactionId()))
+	if err != nil {
+		return 0, err
+	}
+	if fromPool {
+		defer s.engine.Pool.Release(ac)
+	}
+
+	target := qualifiedTableName(cmd.GetCatalog(), cmd.GetSchema(), table)
+	insertSQL := fmt.Sprintf("INSERT INTO %s SELECT * FROM __ingest_view", target)
+
+	ifNotExist := opts.GetIfNotExist()
+	ifExists := opts.GetIfExists()
+
+	// Handle REPLACE: drop the existing table so it gets re-created from the stream schema.
+	if ifExists == flightsql.TableDefinitionOptionsTableExistsOptionReplace {
+		if _, err := ac.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s", target)); err != nil {
+			return 0, status.Errorf(codes.Internal, "drop table for replace: %s", err)
+		}
+	}
+
+	// For CREATE modes, peek at the first batch and create the table from its schema.
+	if ifNotExist == flightsql.TableDefinitionOptionsTableNotExistOptionCreate {
+		if !rdr.Next() {
+			if err := rdr.Err(); err != nil {
+				return 0, status.Errorf(codes.Internal, "reading ingest stream: %s", err)
+			}
+			return 0, nil // empty stream
+		}
+		firstRec := rdr.RecordBatch()
+		firstRec.Retain()
+		defer firstRec.Release()
+
+		// Create the table structure (empty) from the batch schema.
+		createSQL := fmt.Sprintf(
+			"CREATE TABLE IF NOT EXISTS %s AS SELECT * FROM __ingest_view WHERE false", target)
+		if _, err := ingestBatch(ctx, ac, firstRec, createSQL); err != nil {
+			return 0, err
+		}
+
+		// Insert the first batch's data.
+		n, err := ingestBatch(ctx, ac, firstRec, insertSQL)
+		if err != nil {
+			return 0, err
+		}
+
+		var totalRows int64
+		totalRows += n
+
+		// Insert remaining batches.
+		for rdr.Next() {
+			rec := rdr.RecordBatch()
+			rec.Retain()
+			n, err := ingestBatch(ctx, ac, rec, insertSQL)
+			rec.Release()
+			if err != nil {
+				return totalRows, err
+			}
+			totalRows += n
+		}
+		if err := rdr.Err(); err != nil {
+			return totalRows, status.Errorf(codes.Internal, "reading ingest stream: %s", err)
+		}
+		return totalRows, nil
+	}
+
+	// Non-CREATE mode: just INSERT INTO (table must already exist).
+	var totalRows int64
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		rec.Retain()
+		n, err := ingestBatch(ctx, ac, rec, insertSQL)
+		rec.Release()
+		if err != nil {
+			return totalRows, err
+		}
+		totalRows += n
+	}
+	if err := rdr.Err(); err != nil {
+		return totalRows, status.Errorf(codes.Internal, "reading ingest stream: %s", err)
+	}
+	return totalRows, nil
 }

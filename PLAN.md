@@ -13,6 +13,63 @@ Supports single-row and multi-row (batch) parameter binding. Tested with `flight
 
 ---
 
+## BUG: SIGSEGV in `DoGetTables` (duckdb-go CGO crash)
+
+`DoGetTables` and `TestCommandGetTablesWithIncludedSchemasNoFilter` trigger a segmentation
+violation inside `duckdb_prepare_extracted_statement` during CGO execution. The crash
+occurs in `duckdb-go-bindings@v0.3.3` → `PrepareExtractedStatement` → `duckdb-go/v2@v2.5.5`
+→ `(*Conn).prepareStmts` → `(*Arrow).QueryContext`, called from `metadata.go:268`.
+
+### Stack trace (abbreviated)
+
+```
+SIGSEGV: segmentation violation
+PC=... m=4 sigcode=128 addr=0x0
+signal arrived during cgo execution
+
+github.com/duckdb/duckdb-go-bindings.PrepareExtractedStatement(...)
+  bindings.go:1689
+github.com/duckdb/duckdb-go/v2.(*Conn).prepareExtractedStmt(...)
+  connection.go:206
+github.com/duckdb/duckdb-go/v2.(*Conn).prepareStmts(...)
+  connection.go:255
+github.com/duckdb/duckdb-go/v2.(*Arrow).QueryContext(...)
+  arrow.go:103
+github.com/prochac/duckflight/internal/server.(*DuckFlightSQLServer).DoGetTables(...)
+  metadata.go:268
+```
+
+### Reproducer
+
+```bash
+go test -tags=duckdb_arrow -race -count=1 \
+  -run "TestCommandGetTablesWithIncludedSchemasNoFilter" ./internal/server/...
+```
+
+### Likely causes
+
+- Race condition on the DuckDB connection — the `-race` flag is present and the query
+  in `metadata.go:268` builds a long SQL string that goes through `prepareStmts`.
+- Possible duckdb-go bug with extracted statement preparation on connections that have
+  concurrent Arrow view registrations or active transactions.
+- Null pointer dereference (`addr=0x0`) in the C layer suggests a freed or uninitialized
+  connection/statement handle.
+
+### Investigation steps
+
+1. Check if the crash reproduces without `-race` — distinguish Go race detector overhead
+   from an actual data race.
+2. Check if it reproduces with a single-connection pool (`PoolSize: 1`) — isolate
+   concurrent connection reuse.
+3. Check duckdb-go issue tracker for known `PrepareExtractedStatement` crashes.
+4. Try upgrading `duckdb-go/v2` and `duckdb-go-bindings` to latest patch versions.
+
+### Priority
+
+**P0** — a segfault in production crashes the entire process with no recovery possible.
+
+---
+
 ## 2. Zero-Copy Metadata Streaming
 
 Metadata endpoints currently iterate rows, clone strings, and rebuild Arrow batches manually.
@@ -47,22 +104,13 @@ registers the query and returns a ready-to-consume `PollInfo` (synchronous model
 
 ---
 
-## 4. Bulk Ingestion (`DoPutCommandStatementIngest`)
+## ~~4. Bulk Ingestion (`DoPutCommandStatementIngest`)~~ (Done)
 
-Currently not implemented. Clients cannot stream Arrow batches for INSERT.
-
-### What's needed
-
-- Implement `DoPutCommandStatementIngest` to accept Arrow record batches from clients.
-- Use `duckdb.Arrow.RegisterView` to register the incoming batch as a virtual table,
-  then `INSERT INTO <target> SELECT * FROM <view>`.
-- Handle schema validation (incoming schema must match target table).
-- Enforce write serialization if needed.
-
-### Why it matters
-
-Bulk ingestion is the standard Flight SQL mechanism for loading data. BI tools and ETL
-pipelines use it to push data without constructing INSERT statements.
+Implemented. Each incoming Arrow record batch is registered as a DuckDB view via
+`Arrow.RegisterView`, then inserted with `INSERT INTO <target> SELECT * FROM <view>`.
+Supports `TableDefinitionOptions` (CREATE/FAIL × APPEND/REPLACE/FAIL), transactions,
+and multi-batch streams. `SqlInfoFlightSqlServerBulkIngestion` and
+`SqlInfoFlightSqlServerIngestTransactionsSupported` are now `true`.
 
 ---
 
@@ -209,16 +257,17 @@ No load testing has been performed.
 
 ## Priority Order
 
-| #  | Feature                                  | Impact                 | Effort     | Priority |
-|----|------------------------------------------|------------------------|------------|----------|
-| 1  | ~~Prepared statement parameter binding~~ | ~~High (correctness)~~ | ~~Medium~~ | Done     |
-| 2  | Zero-copy metadata streaming             | Medium (performance)   | Medium     | P1       |
-| 3  | ~~Cancellation & polling~~               | ~~Medium (usability)~~ | ~~Low~~    | Done     |
-| 4  | Bulk ingestion                           | Medium (completeness)  | Medium     | P2       |
-| 5  | Distributed tracing                      | Medium (operability)   | Low        | P2       |
-| 6  | Rate limiting                            | Low (defense)          | Low        | P2       |
-| 7  | TLS                                      | Low (deploy-dependent) | Low        | P2       |
-| 8  | Load testing                             | Medium (confidence)    | Medium     | P2       |
-| 9  | Static extension build                   | Medium (cold start)    | Medium     | P2       |
-| 10 | Savepoints                               | Low (niche)            | Low        | P3       |
-| 11 | ~~Polling~~                              | ~~Low (niche)~~        | ~~Medium~~ | Done     |
+| #   | Feature                                  | Impact                     | Effort     | Priority |
+|-----|------------------------------------------|----------------------------|------------|----------|
+| BUG | SIGSEGV in DoGetTables                   | Critical (process crash)   | Unknown    | **P0**   |
+| 1   | ~~Prepared statement parameter binding~~ | ~~High (correctness)~~     | ~~Medium~~ | Done     |
+| 2   | Zero-copy metadata streaming             | Medium (performance)       | Medium     | P1       |
+| 3   | ~~Cancellation & polling~~               | ~~Medium (usability)~~     | ~~Low~~    | Done     |
+| 4   | ~~Bulk ingestion~~                       | ~~Medium (completeness)~~  | ~~Medium~~ | Done     |
+| 5   | Distributed tracing                      | Medium (operability)       | Low        | P2       |
+| 6   | Rate limiting                            | Low (defense)              | Low        | P2       |
+| 7   | TLS                                      | Low (deploy-dependent)     | Low        | P2       |
+| 8   | Load testing                             | Medium (confidence)        | Medium     | P2       |
+| 9   | Static extension build                   | Medium (cold start)        | Medium     | P2       |
+| 10  | Savepoints                               | Low (niche)                | Low        | P3       |
+| 11  | ~~Polling~~                              | ~~Low (niche)~~            | ~~Medium~~ | Done     |

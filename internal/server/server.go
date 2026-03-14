@@ -161,8 +161,8 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	reg(flightsql.SqlInfoFlightSqlServerTransactionTimeout, int32(0))
 
 	// Bulk ingestion
-	reg(flightsql.SqlInfoFlightSqlServerBulkIngestion, false)
-	reg(flightsql.SqlInfoFlightSqlServerIngestTransactionsSupported, false)
+	reg(flightsql.SqlInfoFlightSqlServerBulkIngestion, true)
+	reg(flightsql.SqlInfoFlightSqlServerIngestTransactionsSupported, true)
 }
 
 // buildConvertMap returns a SqlInfoSupportsConvert map describing which SQL

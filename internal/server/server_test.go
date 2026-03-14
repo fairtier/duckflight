@@ -4,6 +4,7 @@ package server_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -1355,6 +1356,229 @@ func (s *DuckFlightSQLSuite) TestSqlInfoFlightSqlServerCancel() {
 	s.True(boolChild.Value(int(childIdx)), "SqlInfoFlightSqlServerCancel should be true")
 
 	s.False(rdr.Next())
+}
+
+// =========================================================================
+// Bulk ingestion
+// =========================================================================
+
+// buildIngestRecords creates a record batch with columns (id INT32, name VARCHAR)
+// containing n rows.
+func buildIngestRecords(mem memory.Allocator, n int) arrow.RecordBatch {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int32, Nullable: true},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+	}, nil)
+	idBldr := array.NewInt32Builder(mem)
+	defer idBldr.Release()
+	nameBldr := array.NewStringBuilder(mem)
+	defer nameBldr.Release()
+	for i := 0; i < n; i++ {
+		idBldr.Append(int32(i + 1))
+		nameBldr.Append(fmt.Sprintf("row_%d", i+1))
+	}
+	idCol := idBldr.NewArray()
+	defer idCol.Release()
+	nameCol := nameBldr.NewArray()
+	defer nameCol.Release()
+	rec := array.NewRecordBatch(schema, []arrow.Array{idCol, nameCol}, int64(n))
+	return rec
+}
+
+func (s *DuckFlightSQLSuite) TestBulkIngestCreateAndAppend() {
+	ctx := context.Background()
+
+	rec := buildIngestRecords(s.mem, 3)
+	defer rec.Release()
+
+	rdr, err := array.NewRecordReader(rec.Schema(), []arrow.RecordBatch{rec})
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	n, err := s.client.ExecuteIngest(ctx, rdr, &flightsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionCreate,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionAppend,
+		},
+		Table: "ingest_create_append",
+	})
+	s.Require().NoError(err)
+	s.Equal(int64(3), n)
+
+	// Verify rows.
+	info, err := s.client.Execute(ctx, "SELECT count(*) FROM ingest_create_append")
+	s.Require().NoError(err)
+	reader, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer reader.Release()
+	s.True(reader.Next())
+	s.Equal(int64(3), reader.RecordBatch().Column(0).(*array.Int64).Value(0))
+
+	// Append more rows.
+	rec2 := buildIngestRecords(s.mem, 2)
+	defer rec2.Release()
+	rdr2, err := array.NewRecordReader(rec2.Schema(), []arrow.RecordBatch{rec2})
+	s.Require().NoError(err)
+	defer rdr2.Release()
+
+	n, err = s.client.ExecuteIngest(ctx, rdr2, &flightsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionCreate,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionAppend,
+		},
+		Table: "ingest_create_append",
+	})
+	s.Require().NoError(err)
+	s.Equal(int64(2), n)
+
+	// Verify total rows.
+	info, err = s.client.Execute(ctx, "SELECT count(*) FROM ingest_create_append")
+	s.Require().NoError(err)
+	reader2, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer reader2.Release()
+	s.True(reader2.Next())
+	s.Equal(int64(5), reader2.RecordBatch().Column(0).(*array.Int64).Value(0))
+}
+
+func (s *DuckFlightSQLSuite) TestBulkIngestReplace() {
+	ctx := context.Background()
+
+	// Create initial table with 3 rows.
+	rec := buildIngestRecords(s.mem, 3)
+	defer rec.Release()
+	rdr, err := array.NewRecordReader(rec.Schema(), []arrow.RecordBatch{rec})
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	_, err = s.client.ExecuteIngest(ctx, rdr, &flightsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionCreate,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionAppend,
+		},
+		Table: "ingest_replace",
+	})
+	s.Require().NoError(err)
+
+	// Replace with 2 rows.
+	rec2 := buildIngestRecords(s.mem, 2)
+	defer rec2.Release()
+	rdr2, err := array.NewRecordReader(rec2.Schema(), []arrow.RecordBatch{rec2})
+	s.Require().NoError(err)
+	defer rdr2.Release()
+
+	n, err := s.client.ExecuteIngest(ctx, rdr2, &flightsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionCreate,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionReplace,
+		},
+		Table: "ingest_replace",
+	})
+	s.Require().NoError(err)
+	s.Equal(int64(2), n)
+
+	// Verify only 2 rows remain.
+	info, err := s.client.Execute(ctx, "SELECT count(*) FROM ingest_replace")
+	s.Require().NoError(err)
+	reader, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer reader.Release()
+	s.True(reader.Next())
+	s.Equal(int64(2), reader.RecordBatch().Column(0).(*array.Int64).Value(0))
+}
+
+func (s *DuckFlightSQLSuite) TestBulkIngestFailNoTable() {
+	ctx := context.Background()
+
+	rec := buildIngestRecords(s.mem, 1)
+	defer rec.Release()
+	rdr, err := array.NewRecordReader(rec.Schema(), []arrow.RecordBatch{rec})
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	_, err = s.client.ExecuteIngest(ctx, rdr, &flightsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionFail,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionAppend,
+		},
+		Table: "nonexistent_ingest_table",
+	})
+	s.Require().Error(err)
+	st, ok := status.FromError(err)
+	s.Require().True(ok)
+	s.Equal(codes.NotFound, st.Code())
+}
+
+func (s *DuckFlightSQLSuite) TestBulkIngestTransaction() {
+	ctx := context.Background()
+
+	// Create the table first.
+	err := server.SeedSQL(ctx, "CREATE TABLE ingest_txn (id INTEGER, name VARCHAR)")
+	s.Require().NoError(err)
+
+	tx, err := s.client.BeginTransaction(ctx)
+	s.Require().NoError(err)
+
+	rec := buildIngestRecords(s.mem, 3)
+	defer rec.Release()
+	rdr, err := array.NewRecordReader(rec.Schema(), []arrow.RecordBatch{rec})
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	n, err := s.client.ExecuteIngest(ctx, rdr, &flightsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionFail,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionAppend,
+		},
+		Table:         "ingest_txn",
+		TransactionId: tx.ID(),
+	})
+	s.Require().NoError(err)
+	s.Equal(int64(3), n)
+
+	// Rollback the transaction.
+	s.Require().NoError(tx.Rollback(ctx))
+
+	// Verify no rows remain.
+	info, err := s.client.Execute(ctx, "SELECT count(*) FROM ingest_txn")
+	s.Require().NoError(err)
+	reader, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer reader.Release()
+	s.True(reader.Next())
+	s.Equal(int64(0), reader.RecordBatch().Column(0).(*array.Int64).Value(0))
+}
+
+func (s *DuckFlightSQLSuite) TestBulkIngestMultipleBatches() {
+	ctx := context.Background()
+
+	rec1 := buildIngestRecords(s.mem, 3)
+	defer rec1.Release()
+	rec2 := buildIngestRecords(s.mem, 4)
+	defer rec2.Release()
+
+	rdr, err := array.NewRecordReader(rec1.Schema(), []arrow.RecordBatch{rec1, rec2})
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	n, err := s.client.ExecuteIngest(ctx, rdr, &flightsql.ExecuteIngestOpts{
+		TableDefinitionOptions: &flightsql.TableDefinitionOptions{
+			IfNotExist: flightsql.TableDefinitionOptionsTableNotExistOptionCreate,
+			IfExists:   flightsql.TableDefinitionOptionsTableExistsOptionAppend,
+		},
+		Table: "ingest_multi_batch",
+	})
+	s.Require().NoError(err)
+	s.Equal(int64(7), n)
+
+	// Verify all rows arrived.
+	info, err := s.client.Execute(ctx, "SELECT count(*) FROM ingest_multi_batch")
+	s.Require().NoError(err)
+	reader, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer reader.Release()
+	s.True(reader.Next())
+	s.Equal(int64(7), reader.RecordBatch().Column(0).(*array.Int64).Value(0))
 }
 
 // =========================================================================
