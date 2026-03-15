@@ -27,61 +27,43 @@ func (s *DuckFlightSQLServer) flightInfoForCommand(desc *flight.FlightDescriptor
 	}
 }
 
-// queryStrings executes a query that returns a single string column and collects the results.
-func (s *DuckFlightSQLServer) queryStrings(ctx context.Context, query string) ([]string, error) {
+// streamMetadata executes a query and streams the resulting Arrow batches with
+// the given schema stamped on. The SQL must produce columns whose types match
+// the target schema exactly — only schema-level metadata (field names,
+// nullability) is overwritten. No data is copied.
+func (s *DuckFlightSQLServer) streamMetadata(
+	ctx context.Context, query string, schema *arrow.Schema,
+) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	ac, err := s.engine.Pool.Acquire(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
 	}
-	defer s.engine.Pool.Release(ac)
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "query error: %s", err)
+		s.engine.Pool.Release(ac)
+		return nil, nil, status.Errorf(codes.Internal, "query error: %s", err)
 	}
-	defer rdr.Release()
 
-	var results []string
-	for rdr.Next() {
-		rec := rdr.RecordBatch()
-		col := rec.Column(0).(*array.String)
-		for i := 0; i < col.Len(); i++ {
-			results = append(results, strings.Clone(col.Value(i)))
+	ch := make(chan flight.StreamChunk)
+	go func() {
+		defer close(ch)
+		defer rdr.Release()
+		defer s.engine.Pool.Release(ac)
+		for rdr.Next() {
+			rec := rdr.RecordBatch()
+			cols := make([]arrow.Array, rec.NumCols())
+			for i := range cols {
+				cols[i] = rec.Column(i)
+			}
+			out := array.NewRecordBatch(schema, cols, rec.NumRows())
+			ch <- flight.StreamChunk{Data: out}
 		}
-	}
-	if err := rdr.Err(); err != nil {
-		return nil, status.Errorf(codes.Internal, "reader error: %s", err)
-	}
-	return results, nil
-}
-
-// queryStringPairs executes a query that returns two string columns and collects the results.
-func (s *DuckFlightSQLServer) queryStringPairs(ctx context.Context, query string) ([][2]string, error) {
-	ac, err := s.engine.Pool.Acquire(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
-	}
-	defer s.engine.Pool.Release(ac)
-
-	rdr, err := ac.Arrow.QueryContext(ctx, query)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "query error: %s", err)
-	}
-	defer rdr.Release()
-
-	var results [][2]string
-	for rdr.Next() {
-		rec := rdr.RecordBatch()
-		col0 := rec.Column(0).(*array.String)
-		col1 := rec.Column(1).(*array.String)
-		for i := 0; i < col0.Len(); i++ {
-			results = append(results, [2]string{strings.Clone(col0.Value(i)), strings.Clone(col1.Value(i))})
+		if err := rdr.Err(); err != nil {
+			ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}
 		}
-	}
-	if err := rdr.Err(); err != nil {
-		return nil, status.Errorf(codes.Internal, "reader error: %s", err)
-	}
-	return results, nil
+	}()
+	return schema, ch, nil
 }
 
 // --- GetCatalogs ---
@@ -91,27 +73,9 @@ func (s *DuckFlightSQLServer) GetFlightInfoCatalogs(_ context.Context, desc *fli
 }
 
 func (s *DuckFlightSQLServer) DoGetCatalogs(ctx context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	catalogs, err := s.queryStrings(ctx, "SELECT DISTINCT catalog_name FROM information_schema.schemata ORDER BY catalog_name")
-	if err != nil {
-		return nil, nil, err
-	}
-
-	bldr := array.NewStringBuilder(s.Alloc)
-	defer bldr.Release()
-	for _, c := range catalogs {
-		bldr.Append(c)
-	}
-
-	arr := bldr.NewArray()
-	defer arr.Release()
-
-	batch := array.NewRecordBatch(schema_ref.Catalogs, []arrow.Array{arr}, int64(len(catalogs)))
-
-	ch := make(chan flight.StreamChunk, 1)
-	ch <- flight.StreamChunk{Data: batch}
-	close(ch)
-
-	return schema_ref.Catalogs, ch, nil
+	return s.streamMetadata(ctx,
+		"SELECT DISTINCT catalog_name FROM information_schema.schemata ORDER BY catalog_name",
+		schema_ref.Catalogs)
 }
 
 // --- GetDBSchemas ---
@@ -121,7 +85,7 @@ func (s *DuckFlightSQLServer) GetFlightInfoSchemas(_ context.Context, _ flightsq
 }
 
 func (s *DuckFlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.GetDBSchemas) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	query := "SELECT catalog_name, schema_name FROM information_schema.schemata WHERE 1=1"
+	query := "SELECT catalog_name, schema_name AS db_schema_name FROM information_schema.schemata WHERE 1=1"
 
 	if catalog := cmd.GetCatalog(); catalog != nil {
 		query += fmt.Sprintf(" AND catalog_name = '%s'", escapeSQLString(*catalog))
@@ -131,35 +95,9 @@ func (s *DuckFlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 	if schemaFilter := cmd.GetDBSchemaFilterPattern(); schemaFilter != nil {
 		query += fmt.Sprintf(" AND schema_name LIKE '%s'", escapeSQLString(*schemaFilter))
 	}
-	query += " ORDER BY catalog_name, schema_name"
+	query += " ORDER BY catalog_name, db_schema_name"
 
-	pairs, err := s.queryStringPairs(ctx, query)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	catalogBldr := array.NewStringBuilder(s.Alloc)
-	defer catalogBldr.Release()
-	schemaBldr := array.NewStringBuilder(s.Alloc)
-	defer schemaBldr.Release()
-
-	for _, p := range pairs {
-		catalogBldr.Append(p[0])
-		schemaBldr.Append(p[1])
-	}
-
-	catArr := catalogBldr.NewArray()
-	defer catArr.Release()
-	schArr := schemaBldr.NewArray()
-	defer schArr.Release()
-
-	batch := array.NewRecordBatch(schema_ref.DBSchemas, []arrow.Array{catArr, schArr}, int64(len(pairs)))
-
-	ch := make(chan flight.StreamChunk, 1)
-	ch <- flight.StreamChunk{Data: batch}
-	close(ch)
-
-	return schema_ref.DBSchemas, ch, nil
+	return s.streamMetadata(ctx, query, schema_ref.DBSchemas)
 }
 
 // --- GetTables ---
@@ -172,8 +110,8 @@ func (s *DuckFlightSQLServer) GetFlightInfoTables(_ context.Context, cmd flights
 	return s.flightInfoForCommand(desc, schema), nil
 }
 
-func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	query := "SELECT table_catalog, table_schema, table_name, table_type FROM information_schema.tables WHERE 1=1"
+func (s *DuckFlightSQLServer) doGetTablesQuery(cmd flightsql.GetTables) string {
+	query := "SELECT table_catalog AS catalog_name, table_schema AS db_schema_name, table_name, table_type FROM information_schema.tables WHERE 1=1"
 
 	if catalog := cmd.GetCatalog(); catalog != nil {
 		query += fmt.Sprintf(" AND table_catalog = '%s'", escapeSQLString(*catalog))
@@ -194,95 +132,72 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 		query += fmt.Sprintf(" AND table_type IN (%s)", strings.Join(quoted, ", "))
 	}
 	query += " ORDER BY table_catalog, table_schema, table_name"
+	return query
+}
 
+func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.GetTables) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	query := s.doGetTablesQuery(cmd)
+
+	if !cmd.GetIncludeSchema() {
+		return s.streamMetadata(ctx, query, schema_ref.Tables)
+	}
+
+	// With include_schema we need to append a binary column per batch.
 	ac, err := s.engine.Pool.Acquire(ctx)
 	if err != nil {
 		return nil, nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
 	}
-	defer s.engine.Pool.Release(ac)
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
 	if err != nil {
+		s.engine.Pool.Release(ac)
 		return nil, nil, status.Errorf(codes.Internal, "query error: %s", err)
 	}
-	defer rdr.Release()
 
-	// Collect results
-	catalogBldr := array.NewStringBuilder(s.Alloc)
-	defer catalogBldr.Release()
-	schemaBldr := array.NewStringBuilder(s.Alloc)
-	defer schemaBldr.Release()
-	nameBldr := array.NewStringBuilder(s.Alloc)
-	defer nameBldr.Release()
-	typeBldr := array.NewStringBuilder(s.Alloc)
-	defer typeBldr.Release()
+	ch := make(chan flight.StreamChunk)
+	go func() {
+		defer close(ch)
+		defer rdr.Release()
+		defer s.engine.Pool.Release(ac)
+		for rdr.Next() {
+			rec := rdr.RecordBatch()
+			nrows := rec.NumRows()
 
-	var numRows int64
-	for rdr.Next() {
-		rec := rdr.RecordBatch()
-		col0 := rec.Column(0).(*array.String)
-		col1 := rec.Column(1).(*array.String)
-		col2 := rec.Column(2).(*array.String)
-		col3 := rec.Column(3).(*array.String)
-		for i := 0; i < col0.Len(); i++ {
-			catalogBldr.Append(col0.Value(i))
-			schemaBldr.Append(col1.Value(i))
-			nameBldr.Append(col2.Value(i))
-			typeBldr.Append(col3.Value(i))
-			numRows++
-		}
-	}
-	if err := rdr.Err(); err != nil {
-		return nil, nil, status.Errorf(codes.Internal, "reader error: %s", err)
-	}
+			// Build the binary schema column for each row.
+			binaryBldr := array.NewBinaryBuilder(s.Alloc, arrow.BinaryTypes.Binary)
+			catCol := rec.Column(0).(*array.String)
+			schCol := rec.Column(1).(*array.String)
+			nameCol := rec.Column(2).(*array.String)
 
-	catArr := catalogBldr.NewArray()
-	defer catArr.Release()
-	schArr := schemaBldr.NewArray()
-	defer schArr.Release()
-	nameArr := nameBldr.NewArray()
-	defer nameArr.Release()
-	typeArr := typeBldr.NewArray()
-	defer typeArr.Release()
-
-	outSchema := schema_ref.Tables
-	cols := []arrow.Array{catArr, schArr, nameArr, typeArr}
-
-	if cmd.GetIncludeSchema() {
-		outSchema = schema_ref.TablesWithIncludedSchema
-
-		binaryBldr := array.NewBinaryBuilder(s.Alloc, arrow.BinaryTypes.Binary)
-		defer binaryBldr.Release()
-
-		catStrings := catArr.(*array.String)
-		schStrings := schArr.(*array.String)
-		nameStrings := nameArr.(*array.String)
-
-		for i := 0; i < int(numRows); i++ {
-			catalog := catStrings.Value(i)
-			dbSchema := schStrings.Value(i)
-			tableName := nameStrings.Value(i)
-
-			tblSchema, err := s.buildTableSchema(ctx, ac, catalog, dbSchema, tableName)
-			if err != nil {
-				binaryBldr.AppendNull()
-				continue
+			for i := 0; i < int(nrows); i++ {
+				tblSchema, err := s.buildTableSchema(ctx, ac, catCol.Value(i), schCol.Value(i), nameCol.Value(i))
+				if err != nil {
+					binaryBldr.AppendNull()
+					continue
+				}
+				binaryBldr.Append(flight.SerializeSchema(tblSchema, s.Alloc))
 			}
-			binaryBldr.Append(flight.SerializeSchema(tblSchema, s.Alloc))
+
+			schemaArr := binaryBldr.NewArray()
+			binaryBldr.Release()
+
+			cols := make([]arrow.Array, 5)
+			for i := 0; i < 4; i++ {
+				cols[i] = rec.Column(i)
+			}
+			cols[4] = schemaArr
+
+			out := array.NewRecordBatch(schema_ref.TablesWithIncludedSchema, cols, nrows)
+			schemaArr.Release()
+
+			ch <- flight.StreamChunk{Data: out}
 		}
+		if err := rdr.Err(); err != nil {
+			ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}
+		}
+	}()
 
-		schemaArr := binaryBldr.NewArray()
-		defer schemaArr.Release()
-		cols = append(cols, schemaArr)
-	}
-
-	batch := array.NewRecordBatch(outSchema, cols, numRows)
-
-	ch := make(chan flight.StreamChunk, 1)
-	ch <- flight.StreamChunk{Data: batch}
-	close(ch)
-
-	return outSchema, ch, nil
+	return schema_ref.TablesWithIncludedSchema, ch, nil
 }
 
 // buildTableSchema constructs an Arrow schema for a table entirely from
