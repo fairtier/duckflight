@@ -77,6 +77,17 @@ func (s *DuckFlightSQLSuite) SetupTest() {
 	s.client.Alloc = s.mem
 	s.srv.Alloc = s.mem
 
+	// Clean up tables/views that other tests may have created.
+	s.seedSQL(`DROP VIEW IF EXISTS __ingest_view`)
+	s.seedSQL(`DROP TABLE IF EXISTS ingest_create_append`)
+	s.seedSQL(`DROP TABLE IF EXISTS ingest_multi_batch`)
+	s.seedSQL(`DROP TABLE IF EXISTS ingest_replace`)
+	s.seedSQL(`DROP TABLE IF EXISTS ingest_txn`)
+	s.seedSQL(`DROP TABLE IF EXISTS test_ddl_via_update`)
+	s.seedSQL(`DROP TABLE IF EXISTS fk_child_table`)
+	s.seedSQL(`DROP TABLE IF EXISTS fk_pk_table`)
+	s.seedSQL(`DROP TABLE IF EXISTS emptyTable`)
+
 	// Seed canonical test tables fresh for each test.
 	s.seedSQL(`CREATE OR REPLACE TABLE foreignTable (id INTEGER PRIMARY KEY, foreignName VARCHAR, value BIGINT)`)
 	s.seedSQL(`INSERT INTO foreignTable VALUES (1, 'one', 1)`)
