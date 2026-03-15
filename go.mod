@@ -5,7 +5,7 @@ go 1.26.1
 require (
 	github.com/apache/arrow-adbc/go/adbc v1.10.0
 	github.com/apache/arrow-go/v18 v18.5.2
-	github.com/duckdb/duckdb-go/v2 v2.5.5
+	github.com/duckdb/duckdb-go/v2 v2.10500.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
 	github.com/stretchr/testify v1.11.1
@@ -49,12 +49,12 @@ require (
 	github.com/docker/docker v28.5.2+incompatible // indirect
 	github.com/docker/go-connections v0.6.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
-	github.com/duckdb/duckdb-go-bindings v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.3.3 // indirect
-	github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.3.3 // indirect
+	github.com/duckdb/duckdb-go-bindings v0.10500.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/darwin-amd64 v0.10500.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/darwin-arm64 v0.10500.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/linux-amd64 v0.10500.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/linux-arm64 v0.10500.0 // indirect
+	github.com/duckdb/duckdb-go-bindings/lib/windows-amd64 v0.10500.0 // indirect
 	github.com/ebitengine/purego v0.8.4 // indirect
 	github.com/felixge/httpsnoop v1.0.4 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect

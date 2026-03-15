@@ -25,17 +25,19 @@ type Engine struct {
 func NewEngine(cfg *config.Config) (*Engine, error) {
 	connector, err := duckdb.NewConnector("", func(execer driver.ExecerContext) error {
 		bootSQL := []string{
-			"SET autoinstall_known_extensions = true",
+			fmt.Sprintf("SET autoinstall_known_extensions = %t", !staticExtensions),
 			"SET autoload_known_extensions = true",
 			fmt.Sprintf("SET memory_limit = '%s'", cfg.MemoryLimit),
 			fmt.Sprintf("SET threads = %d", cfg.MaxThreads),
 		}
 
 		if cfg.IcebergEndpoint != "" {
-			bootSQL = append(bootSQL,
-				"INSTALL iceberg",
-				"LOAD iceberg",
-			)
+			if !staticExtensions {
+				bootSQL = append(bootSQL,
+					"INSTALL iceberg",
+					"LOAD iceberg",
+				)
+			}
 
 			// Catalog auth (OAuth2) — optional
 			if cfg.IcebergClientID != "" {

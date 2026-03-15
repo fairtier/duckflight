@@ -135,49 +135,13 @@ be extended to return a retry descriptor and track query progress.
 
 ---
 
-## 9. Static Extension Build
+## ~~9. Static Extension Build~~ (Done)
 
-Extensions (Iceberg, httpfs) are currently downloaded at runtime on first boot.
-This adds cold-start latency and requires network access.
-
-### What's needed
-
-Build a custom `libduckdb_bundle.a` with extensions statically linked, then compile
-duckflight with the `duckdb_use_static_lib` build tag.
-
-**Build DuckDB with extensions:**
-```bash
-git clone https://github.com/duckdb/duckdb.git && cd duckdb
-git checkout <version matching duckdb-go-bindings>
-make bundle-library \
-  EXTENSION_CONFIGS='.github/config/extensions/iceberg.cmake' \
-  BUILD_EXTENSIONS='icu;json;parquet;autocomplete'
-```
-
-**Build Go binary:**
-```bash
-CGO_ENABLED=1 \
-  CGO_LDFLAGS="-lduckdb_bundle -lstdc++ -lm -ldl -L/path/to/build/release" \
-  go build -tags="duckdb_arrow duckdb_use_static_lib" -o duckflight ./cmd/server
-```
-
-**Update boot SQL:** remove `INSTALL iceberg; LOAD iceberg` and disable auto-install
-(`SET autoinstall_known_extensions = false`) since extensions are already embedded.
-
-Adding more extensions in the future means adding their cmake config to
-`EXTENSION_CONFIGS` (semicolon-separated) and rebuilding.
-
-### What changes
-
-- **Dockerfile**: multi-stage build gains a DuckDB compile stage.
-- **CI**: needs to build `libduckdb_bundle.a` (cache between runs).
-- **Version pinning**: DuckDB source version must match `duckdb-go-bindings` version exactly.
-
-### Why it matters
-
-- Zero cold-start latency — no extension downloads on pod startup.
-- Air-gapped deployments work without network access.
-- Deterministic builds — extension versions are pinned at compile time.
+Implemented. Dockerfile is now a 3-stage build: DuckDB compilation with extensions
+(`libduckdb_bundle.a`), Go build with `duckdb_use_static_lib` tag, and slim runtime.
+Boot SQL conditionally skips `INSTALL`/`LOAD` and disables `autoinstall_known_extensions`
+when statically linked. Local dev unchanged (pre-built bindings, dynamic extension loading).
+GitHub Actions release workflow uses BuildKit with GHA cache to avoid rebuilding DuckDB.
 
 ---
 
@@ -253,7 +217,7 @@ for C-side leak detection remains a future option.
 | 6   | Rate limiting                            | Low (defense)                | Low        | P2       |
 | 7   | TLS                                      | Low (deploy-dependent)       | Low        | P2       |
 | 8   | Load testing                             | Medium (confidence)          | Medium     | P2       |
-| 9   | Static extension build                   | Medium (cold start)          | Medium     | P2       |
+| 9   | ~~Static extension build~~               | ~~Medium (cold start)~~      | ~~Medium~~ | Done     |
 | 10  | Savepoints                               | Low (niche)                  | Low        | P3       |
 | 11  | ~~Polling~~                              | ~~Low (niche)~~              | ~~Medium~~ | Done     |
 | 12  | ~~CGO memory leak testing~~              | ~~High (reliability)~~       | ~~Medium~~ | Done     |

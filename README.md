@@ -43,6 +43,14 @@ go build -tags=duckdb_arrow -o duckflight ./cmd/server
 
 The `duckdb_arrow` build tag is required to enable the Arrow interface in go-duckdb.
 
+### Docker build
+
+```bash
+docker build -t duckflight .
+```
+
+The Docker image compiles DuckDB from source with extensions (Iceberg, httpfs, JSON, Parquet) statically linked. No extension downloads happen at runtime — the image works in air-gapped environments. The DuckDB version is derived automatically from the `duckdb-go` module in `go.mod`.
+
 ### Run locally with Iceberg
 
 The included `docker-compose.yml` starts a full local stack: PostgreSQL, MinIO (S3-compatible storage), [Lakekeeper](https://github.com/lakekeeper/lakekeeper) (Iceberg REST Catalog), and DuckFlight.
