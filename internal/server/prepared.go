@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
@@ -15,8 +16,9 @@ import (
 )
 
 type preparedStatement struct {
-	query  string
-	params [][]any
+	query     string
+	params    [][]any
+	createdAt time.Time
 }
 
 // scalarToIFace converts an Arrow scalar to a Go interface value.
@@ -106,7 +108,7 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	query := req.GetQuery()
 
 	handle := genHandle()
-	s.preparedStmts.Store(string(handle), preparedStatement{query: query})
+	s.preparedStmts.Store(string(handle), preparedStatement{query: query, createdAt: time.Now()})
 
 	// Get schema via LIMIT 0 query.
 	ac, err := s.engine.Pool.Acquire(ctx)

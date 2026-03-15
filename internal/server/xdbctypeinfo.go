@@ -10,7 +10,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 )
 
 // XDBC/SQL type constants (java.sql.Types values).
@@ -93,7 +92,7 @@ func (s *DuckFlightSQLServer) DoGetXdbcTypeInfo(
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	filterType := cmd.GetDataType()
 
-	bldr := array.NewRecordBuilder(memory.DefaultAllocator, schema_ref.XdbcTypeInfo)
+	bldr := array.NewRecordBuilder(s.Alloc, schema_ref.XdbcTypeInfo)
 	defer bldr.Release()
 
 	typeNameBldr := bldr.Field(0).(*array.StringBuilder)      // type_name

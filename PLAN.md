@@ -37,6 +37,20 @@ See `docs/plan-zero-copy-metadata.md` for the full design.
   `DoGetPrimaryKeys`, and foreign key endpoints.
 - Benchmark with 100, 1000, 5000 tables to validate the gain is worth the complexity.
 
+### Baseline benchmarks (done)
+
+`internal/server/bench_test.go` — full round-trip (`GetFlightInfo` → `DoGet` → drain) benchmarks
+for all metadata endpoints. Seeds 3 schemas (`bench_100`, `bench_1000`, `bench_5000`) with
+plain tables (PK) and FK parent/child pairs. Run baseline before optimization, compare with
+`benchstat` afterward:
+
+```bash
+go test -tags=duckdb_arrow -run='^$' -bench=Benchmark -benchmem -count=6 -timeout=30m ./internal/server/ | tee bench_baseline.txt
+# ... implement zero-copy ...
+go test -tags=duckdb_arrow -run='^$' -bench=Benchmark -benchmem -count=6 -timeout=30m ./internal/server/ | tee bench_zerocopy.txt
+benchstat bench_baseline.txt bench_zerocopy.txt
+```
+
 ### Affected files
 
 - `internal/server/metadata.go`
@@ -200,27 +214,28 @@ No load testing has been performed.
 
 ---
 
-## 12. CGO Memory Leak Testing
+## ~~12. CGO Memory Leak Testing~~ (Done)
 
-The duckdb-go Arrow integration crosses the CGO boundary heavily — every query allocates
-Arrow buffers in C that must be freed on the Go side. Leaks are easy to introduce and
-hard to detect without dedicated tooling.
+Implemented. Server-side `memory.DefaultAllocator` replaced with injectable `s.Alloc` in all
+12 call sites (metadata, primary keys, foreign keys, xdbc type info). `CheckedAllocator` now
+tracks both client-side and server-side Arrow allocations in all three test suites.
 
-### What's needed
+**Leak detection infrastructure:**
+- `ArrowPool.Len()`/`Cap()` for pool connection leak detection.
+- `OpenTransactionCount()`, `PreparedStatementCount()`, `ActiveQueryCount()` diagnostics.
+- All test suites assert zero leaked resources in `TearDownTest`.
 
-- Use `memory.CheckedAllocator` in tests to assert zero leaked bytes after each operation.
-- Cover key paths: query execution, prepared statements, bulk ingest, metadata endpoints,
-  transaction lifecycle (BEGIN → query → COMMIT/ROLLBACK).
-- Add a long-running soak test that executes queries in a loop and asserts stable RSS
-  (e.g. via `/proc/self/status` or `runtime.MemStats`).
-- Consider running tests under Valgrind or AddressSanitizer for C-side leak detection.
+**Soak tests** (`soak_test.go`): 4 standalone tests exercising query execution (500 iterations),
+metadata endpoints (200), prepared statements (200), and transactions (200) with per-iteration
+resource assertions and post-warmup heap/RSS growth checks.
 
-### Why it matters
+**Server-side resource reaper:** Background goroutine reaps stale prepared statements and
+abandoned transactions after `resourceTTL` (2× query timeout, default 30min). Rolled-back
+transactions release their pool connections.
 
-A slow CGO memory leak in production is invisible to Go's runtime and pprof — RSS grows
-while `runtime.MemStats` stays flat. The process eventually OOMs with no actionable signal.
-The Arrow C Data Interface makes this especially risky because ownership transfer between
-C and Go is implicit and easy to get wrong.
+**Findings:** No CGO memory leaks detected. ADBC FlightSQL driver does not call
+`ClosePreparedStatement` through `database/sql` — mitigated by the TTL reaper. Valgrind/ASAN
+for C-side leak detection remains a future option.
 
 ---
 
@@ -240,4 +255,4 @@ C and Go is implicit and easy to get wrong.
 | 9   | Static extension build                   | Medium (cold start)          | Medium     | P2       |
 | 10  | Savepoints                               | Low (niche)                  | Low        | P3       |
 | 11  | ~~Polling~~                              | ~~Low (niche)~~              | ~~Medium~~ | Done     |
-| 12  | CGO memory leak testing                  | High (reliability)           | Medium     | P1       |
+| 12  | ~~CGO memory leak testing~~              | ~~High (reliability)~~       | ~~Medium~~ | Done     |

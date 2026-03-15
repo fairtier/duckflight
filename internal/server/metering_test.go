@@ -72,6 +72,7 @@ type MeteringSuite struct {
 	suite.Suite
 
 	server flight.Server
+	srv    *server.DuckFlightSQLServer
 	client *flightsql.Client
 	mem    *memory.CheckedAllocator
 }
@@ -87,6 +88,7 @@ func (s *MeteringSuite) SetupSuite() {
 		MaxResultBytes: 500_000,
 	})
 	s.Require().NoError(err)
+	s.srv = srv
 
 	s.server = flight.NewServerWithMiddleware(nil)
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
@@ -115,9 +117,17 @@ func (s *MeteringSuite) TearDownSuite() {
 func (s *MeteringSuite) SetupTest() {
 	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
 	s.client.Alloc = s.mem
+	s.srv.Alloc = s.mem
 }
 
 func (s *MeteringSuite) TearDownTest() {
+	s.Assert().Equal(0, s.srv.OpenTransactionCount(), "leaked transactions")
+	s.Assert().Equal(0, s.srv.PreparedStatementCount(), "leaked prepared statements")
+	s.Assert().Equal(0, s.srv.ActiveQueryCount(), "leaked active queries")
+	pool := s.srv.Engine().Pool
+	s.Assert().Equal(pool.Cap(), pool.Len(), "pool connections not returned")
+
+	s.srv.Alloc = memory.DefaultAllocator
 	s.mem.AssertSize(s.T(), 0)
 }
 

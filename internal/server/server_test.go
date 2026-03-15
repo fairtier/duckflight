@@ -31,6 +31,7 @@ type DuckFlightSQLSuite struct {
 	suite.Suite
 
 	server flight.Server
+	srv    *server.DuckFlightSQLServer
 	client *flightsql.Client
 	mem    *memory.CheckedAllocator
 }
@@ -45,6 +46,7 @@ func (s *DuckFlightSQLSuite) SetupSuite() {
 		PoolSize:     4,
 	})
 	s.Require().NoError(err, "failed to create duckflight server")
+	s.srv = srv
 
 	s.server = flight.NewServerWithMiddleware(nil)
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
@@ -73,6 +75,7 @@ func (s *DuckFlightSQLSuite) TearDownSuite() {
 func (s *DuckFlightSQLSuite) SetupTest() {
 	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
 	s.client.Alloc = s.mem
+	s.srv.Alloc = s.mem
 
 	// Seed canonical test tables fresh for each test.
 	s.seedSQL(`CREATE OR REPLACE TABLE foreignTable (id INTEGER PRIMARY KEY, foreignName VARCHAR, value BIGINT)`)
@@ -85,6 +88,13 @@ func (s *DuckFlightSQLSuite) SetupTest() {
 }
 
 func (s *DuckFlightSQLSuite) TearDownTest() {
+	s.Assert().Equal(0, s.srv.OpenTransactionCount(), "leaked transactions")
+	s.Assert().Equal(0, s.srv.PreparedStatementCount(), "leaked prepared statements")
+	s.Assert().Equal(0, s.srv.ActiveQueryCount(), "leaked active queries")
+	pool := s.srv.Engine().Pool
+	s.Assert().Equal(pool.Cap(), pool.Len(), "pool connections not returned")
+
+	s.srv.Alloc = memory.DefaultAllocator
 	s.mem.AssertSize(s.T(), 0)
 }
 

@@ -105,8 +105,8 @@ func (s *DuckFlightSQLServer) queryForeignKeys(ctx context.Context, query string
 	return rows, nil
 }
 
-func buildKeysRecordBatch(rows []fkRow) arrow.RecordBatch {
-	bldr := array.NewRecordBuilder(memory.DefaultAllocator, schema_ref.ImportedExportedKeysAndCrossReference)
+func buildKeysRecordBatch(alloc memory.Allocator, rows []fkRow) arrow.RecordBatch {
+	bldr := array.NewRecordBuilder(alloc, schema_ref.ImportedExportedKeysAndCrossReference)
 	defer bldr.Release()
 
 	pkCatBldr := bldr.Field(0).(*array.StringBuilder)
@@ -142,8 +142,8 @@ func buildKeysRecordBatch(rows []fkRow) arrow.RecordBatch {
 	return bldr.NewRecordBatch()
 }
 
-func streamKeysBatch(rows []fkRow) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	batch := buildKeysRecordBatch(rows)
+func streamKeysBatch(alloc memory.Allocator, rows []fkRow) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	batch := buildKeysRecordBatch(alloc, rows)
 	ch := make(chan flight.StreamChunk, 1)
 	ch <- flight.StreamChunk{Data: batch}
 	close(ch)
@@ -168,7 +168,7 @@ func (s *DuckFlightSQLServer) DoGetImportedKeys(
 	if err != nil {
 		return nil, nil, err
 	}
-	return streamKeysBatch(rows)
+	return streamKeysBatch(s.Alloc, rows)
 }
 
 // --- Exported Keys (PK table → which FK tables reference it?) ---
@@ -189,7 +189,7 @@ func (s *DuckFlightSQLServer) DoGetExportedKeys(
 	if err != nil {
 		return nil, nil, err
 	}
-	return streamKeysBatch(rows)
+	return streamKeysBatch(s.Alloc, rows)
 }
 
 // --- Cross Reference (specific PK table + FK table pair) ---
@@ -213,7 +213,7 @@ func (s *DuckFlightSQLServer) DoGetCrossReference(
 	if err != nil {
 		return nil, nil, err
 	}
-	return streamKeysBatch(rows)
+	return streamKeysBatch(s.Alloc, rows)
 }
 
 func catalogFilter(col string, c *string) string {

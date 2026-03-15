@@ -12,7 +12,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/prochac/duckflight/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -97,7 +96,7 @@ func (s *DuckFlightSQLServer) DoGetCatalogs(ctx context.Context) (*arrow.Schema,
 		return nil, nil, err
 	}
 
-	bldr := array.NewStringBuilder(memory.DefaultAllocator)
+	bldr := array.NewStringBuilder(s.Alloc)
 	defer bldr.Release()
 	for _, c := range catalogs {
 		bldr.Append(c)
@@ -139,9 +138,9 @@ func (s *DuckFlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 		return nil, nil, err
 	}
 
-	catalogBldr := array.NewStringBuilder(memory.DefaultAllocator)
+	catalogBldr := array.NewStringBuilder(s.Alloc)
 	defer catalogBldr.Release()
-	schemaBldr := array.NewStringBuilder(memory.DefaultAllocator)
+	schemaBldr := array.NewStringBuilder(s.Alloc)
 	defer schemaBldr.Release()
 
 	for _, p := range pairs {
@@ -209,13 +208,13 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	defer rdr.Release()
 
 	// Collect results
-	catalogBldr := array.NewStringBuilder(memory.DefaultAllocator)
+	catalogBldr := array.NewStringBuilder(s.Alloc)
 	defer catalogBldr.Release()
-	schemaBldr := array.NewStringBuilder(memory.DefaultAllocator)
+	schemaBldr := array.NewStringBuilder(s.Alloc)
 	defer schemaBldr.Release()
-	nameBldr := array.NewStringBuilder(memory.DefaultAllocator)
+	nameBldr := array.NewStringBuilder(s.Alloc)
 	defer nameBldr.Release()
-	typeBldr := array.NewStringBuilder(memory.DefaultAllocator)
+	typeBldr := array.NewStringBuilder(s.Alloc)
 	defer typeBldr.Release()
 
 	var numRows int64
@@ -252,7 +251,7 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	if cmd.GetIncludeSchema() {
 		outSchema = schema_ref.TablesWithIncludedSchema
 
-		binaryBldr := array.NewBinaryBuilder(memory.DefaultAllocator, arrow.BinaryTypes.Binary)
+		binaryBldr := array.NewBinaryBuilder(s.Alloc, arrow.BinaryTypes.Binary)
 		defer binaryBldr.Release()
 
 		catStrings := catArr.(*array.String)
@@ -403,7 +402,7 @@ func (s *DuckFlightSQLServer) GetFlightInfoTableTypes(_ context.Context, desc *f
 }
 
 func (s *DuckFlightSQLServer) DoGetTableTypes(_ context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	bldr := array.NewStringBuilder(memory.DefaultAllocator)
+	bldr := array.NewStringBuilder(s.Alloc)
 	defer bldr.Release()
 
 	bldr.Append("BASE TABLE")

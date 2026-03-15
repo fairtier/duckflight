@@ -5,6 +5,7 @@ package server
 import (
 	"context"
 	"database/sql/driver"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/prochac/duckflight/internal/engine"
@@ -15,8 +16,9 @@ import (
 )
 
 type txnState struct {
-	conn *engine.ArrowConn
-	tx   driver.Tx
+	conn      *engine.ArrowConn
+	tx        driver.Tx
+	createdAt time.Time
 }
 
 // BeginTransaction acquires a connection from the pool and starts a transaction.
@@ -53,7 +55,7 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	rdr.Release()
 
 	handle := genHandle()
-	s.openTransactions.Store(string(handle), &txnState{conn: ac, tx: tx})
+	s.openTransactions.Store(string(handle), &txnState{conn: ac, tx: tx, createdAt: time.Now()})
 	return handle, nil
 }
 

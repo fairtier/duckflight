@@ -4,6 +4,7 @@ package server
 
 import (
 	"context"
+	"log/slog"
 	"slices"
 	"sync"
 	"time"
@@ -48,10 +49,11 @@ type DuckFlightSQLServer struct {
 
 	engine           *engine.Engine
 	preparedStmts    sync.Map // handle string -> preparedStatement
-	openTransactions sync.Map // handle string -> *engine.ArrowConn
+	openTransactions sync.Map // handle string -> *txnState
 	queryTimeout     time.Duration
 	maxResultBytes   int64
 	tracker          *queryTracker
+	resourceTTL      time.Duration
 	stopCleanup      context.CancelFunc
 	tracer           trace.Tracer
 }
@@ -96,16 +98,23 @@ func New(cfg Config) (*DuckFlightSQLServer, error) {
 
 	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
 
+	resourceTTL := 30 * time.Minute
+	if timeout > 0 {
+		resourceTTL = 2 * timeout
+	}
+
 	srv := &DuckFlightSQLServer{
 		engine:         eng,
 		queryTimeout:   timeout,
 		maxResultBytes: cfg.MaxResultBytes,
 		tracker:        &queryTracker{ttl: trackerTTL},
+		resourceTTL:    resourceTTL,
 		stopCleanup:    stopCleanup,
 		tracer:         otel.Tracer("duckflight"),
 	}
 	srv.Alloc = memory.DefaultAllocator
 	srv.tracker.StartCleanup(cleanupCtx)
+	srv.startResourceCleanup(cleanupCtx)
 	registerSqlInfo(srv)
 
 	globalEngine = eng
@@ -266,9 +275,82 @@ func (s *DuckFlightSQLServer) CloseSession(_ context.Context, _ *flight.CloseSes
 	return &flight.CloseSessionResult{Status: flight.CloseSessionResultClosed}, nil
 }
 
+// startResourceCleanup runs a background goroutine that reaps stale prepared
+// statements and abandoned transactions that clients failed to close.
+func (s *DuckFlightSQLServer) startResourceCleanup(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				s.preparedStmts.Range(func(key, value any) bool {
+					ps := value.(preparedStatement)
+					if now.Sub(ps.createdAt) > s.resourceTTL {
+						s.preparedStmts.Delete(key)
+						slog.Warn("reaped stale prepared statement",
+							"handle", key, "age", now.Sub(ps.createdAt))
+					}
+					return true
+				})
+				s.openTransactions.Range(func(key, value any) bool {
+					ts := value.(*txnState)
+					if now.Sub(ts.createdAt) > s.resourceTTL {
+						s.openTransactions.Delete(key)
+						_ = ts.tx.Rollback()
+						s.engine.Pool.Release(ts.conn)
+						slog.Warn("reaped stale transaction",
+							"handle", key, "age", now.Sub(ts.createdAt))
+					}
+					return true
+				})
+			}
+		}
+	}()
+}
+
 // Engine returns the underlying engine for direct access.
 func (s *DuckFlightSQLServer) Engine() *engine.Engine {
 	return s.engine
+}
+
+// OpenTransactionCount returns the number of currently open transactions.
+func (s *DuckFlightSQLServer) OpenTransactionCount() int {
+	n := 0
+	s.openTransactions.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+// PreparedStatementCount returns the number of currently open prepared statements.
+func (s *DuckFlightSQLServer) PreparedStatementCount() int {
+	n := 0
+	s.preparedStmts.Range(func(_, _ any) bool { n++; return true })
+	return n
+}
+
+// ActiveQueryCount returns the number of queries currently being executed
+// (i.e. picked up by DoGet and not yet completed).
+func (s *DuckFlightSQLServer) ActiveQueryCount() int {
+	n := 0
+	s.tracker.queries.Range(func(_, val any) bool {
+		qs := val.(*queryState)
+		qs.mu.Lock()
+		running := qs.cancel != nil
+		qs.mu.Unlock()
+		if !running {
+			return true
+		}
+		select {
+		case <-qs.done:
+		default:
+			n++
+		}
+		return true
+	})
+	return n
 }
 
 // SeedSQL executes arbitrary SQL on the global engine for test setup.

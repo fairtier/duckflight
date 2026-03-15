@@ -11,7 +11,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
-	"github.com/apache/arrow-go/v18/arrow/memory"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -63,7 +62,7 @@ func (s *DuckFlightSQLServer) DoGetPrimaryKeys(
 	}
 	defer rdr.Release()
 
-	bldr := array.NewRecordBuilder(memory.DefaultAllocator, schema_ref.PrimaryKeys)
+	bldr := array.NewRecordBuilder(s.Alloc, schema_ref.PrimaryKeys)
 	defer bldr.Release()
 
 	catalogBldr := bldr.Field(0).(*array.StringBuilder)

@@ -82,6 +82,12 @@ func (p *ArrowPool) Release(ac *ArrowConn) {
 	p.pool <- ac
 }
 
+// Len returns the number of currently available connections in the pool.
+func (p *ArrowPool) Len() int { return len(p.pool) }
+
+// Cap returns the total capacity of the pool.
+func (p *ArrowPool) Cap() int { return cap(p.pool) }
+
 // Close drains and closes all connections in the pool.
 func (p *ArrowPool) Close() {
 	for {

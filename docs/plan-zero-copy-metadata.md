@@ -118,12 +118,23 @@ Affected endpoints:
 
 ## Validation plan
 
-1. Add benchmarks for `DoGetTables` (with and without `include_schema`)
-   using a database seeded with 100, 1000, and 5000 tables.
+1. ~~Add benchmarks for `DoGetTables` (with and without `include_schema`)
+   using a database seeded with 100, 1000, and 5000 tables.~~ **Done.**
+   `internal/server/bench_test.go` covers all metadata endpoints (`DoGetCatalogs`,
+   `DoGetDBSchemas`, `DoGetTableTypes`, `DoGetTables` ± `include_schema`,
+   `DoGetPrimaryKeys`, `DoGetImportedKeys`, `DoGetExportedKeys`,
+   `DoGetCrossReference`) across 3 tiers (100, 1000, 5000 tables).
 2. Compare current (manual build) vs streaming approach on:
    - Wall time
    - Allocations (`-benchmem`)
    - Memory high-water mark
+   Use `benchstat` for comparison:
+   ```bash
+   go test -tags=duckdb_arrow -run='^$' -bench=Benchmark -benchmem -count=6 -timeout=30m ./internal/server/ | tee bench_baseline.txt
+   # ... implement zero-copy ...
+   go test -tags=duckdb_arrow -run='^$' -bench=Benchmark -benchmem -count=6 -timeout=30m ./internal/server/ | tee bench_zerocopy.txt
+   benchstat bench_baseline.txt bench_zerocopy.txt
+   ```
 3. Run existing test suite — all `TestCommandGet*` and `TestADBC_*` tests
    must pass unchanged.
 4. Verify with a real JDBC client (DataGrip) that metadata responses are

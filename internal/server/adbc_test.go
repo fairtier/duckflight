@@ -32,9 +32,11 @@ type ADBCSuite struct {
 	suite.Suite
 
 	server flight.Server
+	srv    *server.DuckFlightSQLServer
 	db     *sql.DB
 	cnxn   adbc.Connection
 	adbcDB adbc.Database
+	mem    *memory.CheckedAllocator
 }
 
 func (s *ADBCSuite) SetupSuite() {
@@ -45,6 +47,7 @@ func (s *ADBCSuite) SetupSuite() {
 		PoolSize:     4,
 	})
 	s.Require().NoError(err, "failed to create duckflight server")
+	s.srv = srv
 
 	s.server = flight.NewServerWithMiddleware(nil)
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
@@ -82,6 +85,24 @@ func (s *ADBCSuite) TearDownSuite() {
 	if s.server != nil {
 		s.server.Shutdown()
 	}
+}
+
+func (s *ADBCSuite) SetupTest() {
+	s.mem = memory.NewCheckedAllocator(memory.DefaultAllocator)
+	s.srv.Alloc = s.mem
+}
+
+func (s *ADBCSuite) TearDownTest() {
+	s.Assert().Equal(0, s.srv.OpenTransactionCount(), "leaked transactions")
+	// Note: PreparedStatementCount is not checked here because the ADBC
+	// FlightSQL driver does not always call ClosePreparedStatement when
+	// closing statements through the database/sql layer.
+	s.Assert().Equal(0, s.srv.ActiveQueryCount(), "leaked active queries")
+	pool := s.srv.Engine().Pool
+	s.Assert().Equal(pool.Cap(), pool.Len(), "pool connections not returned")
+
+	s.srv.Alloc = memory.DefaultAllocator
+	s.mem.AssertSize(s.T(), 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +336,7 @@ type catalogInfo struct {
 func parseGetObjects(rdr array.RecordReader) []catalogInfo {
 	var result []catalogInfo
 	for rdr.Next() {
-		rec := rdr.Record()
+		rec := rdr.RecordBatch()
 		catalogs := rec.Column(0).(*array.String)
 		catalogDbSchemasList := rec.Column(1).(*array.List)
 		catalogDbSchemas := catalogDbSchemasList.ListValues().(*array.Struct)
@@ -409,7 +430,7 @@ func parseGetObjects(rdr array.RecordReader) []catalogInfo {
 	return result
 }
 
-func findCatalog(cats []catalogInfo, name string) *catalogInfo {
+func findCatalog(cats []catalogInfo, name string) *catalogInfo { //nolint:unparam
 	for i := range cats {
 		if cats[i].Name == name {
 			return &cats[i]
@@ -418,7 +439,7 @@ func findCatalog(cats []catalogInfo, name string) *catalogInfo {
 	return nil
 }
 
-func findSchema(cat *catalogInfo, name string) *schemaInfo {
+func findSchema(cat *catalogInfo, name string) *schemaInfo { //nolint:unparam
 	if cat == nil {
 		return nil
 	}
