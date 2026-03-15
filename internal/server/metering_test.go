@@ -10,7 +10,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/prochac/duckflight/internal/server"
-	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
@@ -21,10 +20,10 @@ import (
 // Prometheus helpers
 // ---------------------------------------------------------------------------
 
-// getMetricValue reads a metric value from the default gatherer by name and
+// getMetricValue reads a metric value from the test gatherer by name and
 // optional label matching. Returns 0 if the metric is not found.
 func getMetricValue(name string, labels map[string]string) float64 {
-	families, err := prometheus.DefaultGatherer.Gather()
+	families, err := testGatherer.Gather()
 	if err != nil {
 		return 0
 	}
@@ -78,6 +77,8 @@ type MeteringSuite struct {
 }
 
 func (s *MeteringSuite) SetupSuite() {
+	ensureTestMetrics()
+
 	srv, err := server.New(server.Config{
 		MemoryLimit:    "256MB",
 		MaxThreads:     2,

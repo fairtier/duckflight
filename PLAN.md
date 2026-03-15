@@ -66,22 +66,15 @@ and multi-batch streams. `SqlInfoFlightSqlServerBulkIngestion` and
 
 ---
 
-## 5. Distributed Tracing (OpenTelemetry)
+## ~~5. Distributed Tracing (OpenTelemetry)~~ (Done)
 
-Only Prometheus metrics are implemented. No request-level tracing.
-
-### What's needed
-
-- Add OpenTelemetry gRPC interceptors (unary + stream).
-- Propagate trace context through DuckDB query execution.
-- Export spans to OTLP collector.
-- Key spans: gRPC method, query execution, pool acquire/release, transaction lifecycle.
-
-### Why it matters
-
-In a multi-service deployment (LB -> DuckFlight -> Iceberg catalog -> S3), tracing
-is essential for diagnosing latency. Without it, operators cannot distinguish between
-slow queries, slow catalog lookups, and slow object storage reads.
+Implemented full three-signal OTel: tracing, metrics, and logging. Added `internal/telemetry`
+package with `TracerProvider`, `MeterProvider`, and `LoggerProvider`. gRPC interceptors
+(`otelgrpc.NewServerHandler`) propagate trace context. Prometheus metrics now go through
+OTel SDK (`otel/exporters/prometheus`). Logging uses `otelslog` bridge for automatic
+trace↔log correlation, replacing the custom `TraceHandler`. All `slog` calls pass `ctx`
+for correlation. OTLP export is configured via `OTEL_EXPORTER_OTLP_ENDPOINT`; without it,
+stdout exporters are used.
 
 ---
 
@@ -240,7 +233,7 @@ C and Go is implicit and easy to get wrong.
 | 2   | Zero-copy metadata streaming             | Medium (performance)         | Medium     | P1       |
 | 3   | ~~Cancellation & polling~~               | ~~Medium (usability)~~       | ~~Low~~    | Done     |
 | 4   | ~~Bulk ingestion~~                       | ~~Medium (completeness)~~    | ~~Medium~~ | Done     |
-| 5   | Distributed tracing                      | Medium (operability)         | Low        | P2       |
+| 5   | ~~Distributed tracing~~                  | ~~Medium (operability)~~     | ~~Low~~    | Done     |
 | 6   | Rate limiting                            | Low (defense)                | Low        | P2       |
 | 7   | TLS                                      | Low (deploy-dependent)       | Low        | P2       |
 | 8   | Load testing                             | Medium (confidence)          | Medium     | P2       |

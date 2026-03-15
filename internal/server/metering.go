@@ -3,56 +3,84 @@
 package server
 
 import (
+	"context"
+
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/metric/noop"
 )
 
 var (
-	queryCount = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "flightsql_queries_total",
-			Help: "Total number of queries executed.",
-		},
-		[]string{"status"},
-	)
-	queryDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "flightsql_query_duration_seconds",
-			Help:    "Duration of query execution in seconds.",
-			Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120},
-		},
-		[]string{},
-	)
-	queryBytesStreamed = prometheus.NewCounter(
-		prometheus.CounterOpts{
-			Name: "flightsql_bytes_streamed_total",
-			Help: "Total bytes streamed to clients.",
-		},
-	)
-	activeQueries = prometheus.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "flightsql_active_queries",
-			Help: "Number of currently active queries.",
-		},
-	)
+	queryCount    metric.Int64Counter
+	queryDuration metric.Float64Histogram
+	bytesStreamed metric.Int64Counter
+	activeQueries metric.Int64UpDownCounter
 )
 
 func init() {
-	prometheus.MustRegister(queryCount, queryDuration, queryBytesStreamed, activeQueries)
+	// Initialize with noop meter so instruments are never nil.
+	initMetrics(noop.Meter{})
+}
+
+// InitMetrics re-initializes metric instruments with the given meter.
+func InitMetrics(meter metric.Meter) {
+	initMetrics(meter)
+}
+
+func initMetrics(meter metric.Meter) {
+	var err error
+
+	queryCount, err = meter.Int64Counter("flightsql.queries",
+		metric.WithDescription("Total number of queries executed."),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	queryDuration, err = meter.Float64Histogram("flightsql.query.duration",
+		metric.WithDescription("Duration of query execution in seconds."),
+		metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60, 120),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	bytesStreamed, err = meter.Int64Counter("flightsql.bytes.streamed",
+		metric.WithDescription("Total bytes streamed to clients."),
+		metric.WithUnit("By"),
+	)
+	if err != nil {
+		panic(err)
+	}
+
+	activeQueries, err = meter.Int64UpDownCounter("flightsql.active.queries",
+		metric.WithDescription("Number of currently active queries."),
+	)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func queryCountAdd(ctx context.Context, status string) {
+	queryCount.Add(ctx, 1, metric.WithAttributes(attribute.String("status", status)))
 }
 
 // meteredReader wraps an array.RecordReader, counting bytes as they stream.
 type meteredReader struct {
 	array.RecordReader
+	ctx      context.Context
 	bytes    int64
 	maxBytes int64
 	closed   bool
 }
 
-func newMeteredReader(rdr array.RecordReader, maxBytes int64) *meteredReader {
+func newMeteredReader(ctx context.Context, rdr array.RecordReader, maxBytes int64) *meteredReader {
 	return &meteredReader{
 		RecordReader: rdr,
+		ctx:          ctx,
 		maxBytes:     maxBytes,
 	}
 }
@@ -86,7 +114,7 @@ func (r *meteredReader) arrayBytes(a arrow.Array) int64 {
 func (r *meteredReader) finish() {
 	if !r.closed {
 		r.closed = true
-		queryBytesStreamed.Add(float64(r.bytes))
+		bytesStreamed.Add(r.ctx, r.bytes)
 	}
 }
 

@@ -15,6 +15,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/engine"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // Config mirrors the test's expected configuration surface.
@@ -51,6 +53,7 @@ type DuckFlightSQLServer struct {
 	maxResultBytes   int64
 	tracker          *queryTracker
 	stopCleanup      context.CancelFunc
+	tracer           trace.Tracer
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
@@ -99,6 +102,7 @@ func New(cfg Config) (*DuckFlightSQLServer, error) {
 		maxResultBytes: cfg.MaxResultBytes,
 		tracker:        &queryTracker{ttl: trackerTTL},
 		stopCleanup:    stopCleanup,
+		tracer:         otel.Tracer("duckflight"),
 	}
 	srv.Alloc = memory.DefaultAllocator
 	srv.tracker.StartCleanup(cleanupCtx)

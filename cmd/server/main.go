@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"os"
@@ -15,7 +16,12 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/prochac/duckflight/internal/auth"
 	duckserver "github.com/prochac/duckflight/internal/server"
+	"github.com/prochac/duckflight/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/contrib/bridges/otelslog"
+	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
+	"go.opentelemetry.io/otel"
+	"google.golang.org/grpc"
 )
 
 func main() {
@@ -25,7 +31,34 @@ func main() {
 			slog.Error("invalid LOG_LEVEL, using INFO", slog.String("value", lvl), slog.String("error", err.Error()))
 		}
 	}
-	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: &level})))
+
+	ctx := context.Background()
+
+	// Initialize OpenTelemetry (before slog wiring, since we need the LoggerProvider).
+	tel, err := telemetry.Setup(ctx, telemetry.Config{
+		OTLPEndpoint: os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"),
+		ServiceName:  envOr("OTEL_SERVICE_NAME", "duckflight"),
+		Insecure:     envBool("OTEL_EXPORTER_OTLP_INSECURE"),
+	})
+	if err != nil {
+		slog.Error("failed to setup telemetry", slog.String("error", err.Error()))
+		os.Exit(1)
+	}
+
+	// Wire slog to OTel log SDK via otelslog bridge.
+	slog.SetDefault(slog.New(newLevelHandler(&level,
+		otelslog.NewHandler("duckflight",
+			otelslog.WithLoggerProvider(tel.LoggerProvider()),
+		),
+	)))
+	defer func() {
+		if err := tel.Shutdown(ctx); err != nil {
+			slog.Error("telemetry shutdown error", slog.String("error", err.Error()))
+		}
+	}()
+
+	// Initialize OTel metrics.
+	duckserver.InitMetrics(otel.GetMeterProvider().Meter("duckflight"))
 
 	cfg := duckserver.Config{
 		MemoryLimit:         envOr("MEMORY_LIMIT", "1GB"),
@@ -63,7 +96,10 @@ func main() {
 	}
 	middleware := auth.BearerTokenMiddleware(authTokens)
 
-	server := flight.NewServerWithMiddleware([]flight.ServerMiddleware{duckserver.GRPCLoggingMiddleware()}, middleware...)
+	server := flight.NewServerWithMiddleware(
+		[]flight.ServerMiddleware{duckserver.GRPCLoggingMiddleware()},
+		append(middleware, grpc.StatsHandler(otelgrpc.NewServerHandler()))...,
+	)
 	server.RegisterFlightService(flightsql.NewFlightServer(duckserver.NewLoggingServer(srv)))
 
 	addr := envOr("LISTEN_ADDR", "0.0.0.0:31337")
@@ -76,7 +112,7 @@ func main() {
 	metricAddr := envOr("METRIC_ADDR", "0.0.0.0:9090")
 	go func() {
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
+		mux.Handle("/metrics", promhttp.HandlerFor(tel.Gatherer, promhttp.HandlerOpts{}))
 		slog.Info("metrics server listening", slog.String("addr", metricAddr))
 		if err := http.ListenAndServe(metricAddr, mux); err != nil {
 			slog.Error("metrics server error", slog.String("error", err.Error()))
@@ -122,4 +158,35 @@ func envInt64(key string, fallback int64) int64 {
 		}
 	}
 	return fallback
+}
+
+func envBool(key string) bool {
+	v := os.Getenv(key)
+	return v == "true" || v == "1"
+}
+
+// levelHandler filters log records below a minimum level.
+type levelHandler struct {
+	level slog.Leveler
+	inner slog.Handler
+}
+
+func newLevelHandler(level slog.Leveler, inner slog.Handler) *levelHandler {
+	return &levelHandler{level: level, inner: inner}
+}
+
+func (h *levelHandler) Enabled(_ context.Context, l slog.Level) bool {
+	return l >= h.level.Level()
+}
+
+func (h *levelHandler) Handle(ctx context.Context, r slog.Record) error {
+	return h.inner.Handle(ctx, r)
+}
+
+func (h *levelHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &levelHandler{level: h.level, inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h *levelHandler) WithGroup(name string) slog.Handler {
+	return &levelHandler{level: h.level, inner: h.inner.WithGroup(name)}
 }

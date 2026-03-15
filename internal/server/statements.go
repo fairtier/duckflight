@@ -17,6 +17,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/prochac/duckflight/internal/engine"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -47,8 +49,13 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (ac
 		ts := val.(*txnState)
 		return ts.conn, false, nil
 	}
+
+	ctx, span := s.tracer.Start(ctx, "pool.acquire")
+	defer span.End()
+
 	ac, err = s.engine.Pool.Acquire(ctx)
 	if err != nil {
+		span.RecordError(err)
 		return nil, false, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
 	}
 	return ac, true, nil
@@ -107,8 +114,12 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	}
 	s.tracker.SetCancel(handle, queryCancel)
 
-	rdr, err := ac.Arrow.QueryContext(queryCtx, query)
+	execCtx, execSpan := s.tracer.Start(queryCtx, "execute",
+		trace.WithAttributes(attribute.String("db.statement", query)))
+	rdr, err := ac.Arrow.QueryContext(execCtx, query)
 	if err != nil {
+		execSpan.RecordError(err)
+		execSpan.End()
 		// Check context state before canceling, so we can distinguish
 		// external cancellation from our own cleanup cancel.
 		ctxErr := queryCtx.Err()
@@ -119,21 +130,22 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		s.tracker.Complete(handle)
 		switch ctxErr {
 		case context.Canceled:
-			queryCount.WithLabelValues("canceled").Inc()
+			queryCountAdd(ctx, "canceled")
 			return nil, nil, status.Error(codes.Canceled, "query canceled")
 		case context.DeadlineExceeded:
-			queryCount.WithLabelValues("timeout").Inc()
+			queryCountAdd(ctx, "timeout")
 			return nil, nil, status.Error(codes.DeadlineExceeded, "query exceeded time limit")
 		}
 		return nil, nil, status.Errorf(duckDBToGRPCCode(err), "query execution error: %s", err)
 	}
+	execSpan.End()
 
-	metered := newMeteredReader(rdr, s.maxResultBytes)
+	metered := newMeteredReader(ctx, rdr, s.maxResultBytes)
 	schema := metered.Schema()
 	ch := make(chan flight.StreamChunk)
 
 	start := time.Now()
-	activeQueries.Inc()
+	activeQueries.Add(ctx, 1)
 
 	go func() {
 		defer close(ch)
@@ -144,8 +156,8 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		}
 		defer func() {
 			s.tracker.Complete(handle)
-			activeQueries.Dec()
-			queryDuration.WithLabelValues().Observe(time.Since(start).Seconds())
+			activeQueries.Add(ctx, -1)
+			queryDuration.Record(ctx, time.Since(start).Seconds())
 		}()
 
 		for metered.Next() {
@@ -155,22 +167,22 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 			case ch <- flight.StreamChunk{Data: rec}:
 			case <-queryCtx.Done():
 				if queryCtx.Err() == context.Canceled {
-					queryCount.WithLabelValues("canceled").Inc()
+					queryCountAdd(ctx, "canceled")
 				} else {
-					queryCount.WithLabelValues("timeout").Inc()
+					queryCountAdd(ctx, "timeout")
 				}
 				return
 			}
 		}
 		if err := metered.Err(); err != nil {
-			queryCount.WithLabelValues("error").Inc()
+			queryCountAdd(ctx, "error")
 			select {
 			case ch <- flight.StreamChunk{Err: err}:
 			case <-queryCtx.Done():
 			}
 			return
 		}
-		queryCount.WithLabelValues("ok").Inc()
+		queryCountAdd(ctx, "ok")
 	}()
 
 	return schema, ch, nil

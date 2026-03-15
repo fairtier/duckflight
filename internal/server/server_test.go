@@ -36,6 +36,8 @@ type DuckFlightSQLSuite struct {
 }
 
 func (s *DuckFlightSQLSuite) SetupSuite() {
+	ensureTestMetrics()
+
 	srv, err := server.New(server.Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   2,

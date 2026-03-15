@@ -8,6 +8,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/prochac/duckflight/internal/engine"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -22,13 +24,18 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	ctx context.Context,
 	_ flightsql.ActionBeginTransactionRequest,
 ) ([]byte, error) {
+	ctx, span := s.tracer.Start(ctx, "transaction.begin")
+	defer span.End()
+
 	ac, err := s.engine.Pool.Acquire(ctx)
 	if err != nil {
+		span.RecordError(err)
 		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
 	}
 
 	tx, err := ac.BeginTx(ctx)
 	if err != nil {
+		span.RecordError(err)
 		s.engine.Pool.Release(ac)
 		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %s", err)
 	}
@@ -38,6 +45,7 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	// which breaks snapshot isolation guarantees for the client.
 	rdr, err := ac.Arrow.QueryContext(ctx, "SELECT 0 FROM duckdb_tables() LIMIT 0")
 	if err != nil {
+		span.RecordError(err)
 		_ = tx.Rollback()
 		s.engine.Pool.Release(ac)
 		return nil, status.Errorf(codes.Internal, "failed to initialize transaction snapshot: %s", err)
@@ -58,6 +66,18 @@ func (s *DuckFlightSQLServer) EndTransaction(
 		return status.Error(codes.InvalidArgument, "must specify Commit or Rollback")
 	}
 
+	var op string
+	switch req.GetAction() {
+	case flightsql.EndTransactionCommit:
+		op = "commit"
+	case flightsql.EndTransactionRollback:
+		op = "rollback"
+	}
+
+	_, span := s.tracer.Start(ctx, "transaction.end",
+		trace.WithAttributes(attribute.String("db.operation", op)))
+	defer span.End()
+
 	handle := string(req.GetTransactionId())
 	val, loaded := s.openTransactions.LoadAndDelete(handle)
 	if !loaded {
@@ -69,10 +89,12 @@ func (s *DuckFlightSQLServer) EndTransaction(
 	switch req.GetAction() {
 	case flightsql.EndTransactionCommit:
 		if err := ts.tx.Commit(); err != nil {
+			span.RecordError(err)
 			return status.Errorf(codes.Internal, "failed to commit: %s", err)
 		}
 	case flightsql.EndTransactionRollback:
 		if err := ts.tx.Rollback(); err != nil {
+			span.RecordError(err)
 			return status.Errorf(codes.Internal, "failed to rollback: %s", err)
 		}
 	}
