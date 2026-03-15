@@ -22,40 +22,41 @@ avoiding the duckdb-go bug. Regression test: `TestSIGSEGV_IngestThenGetTablesWit
 
 ---
 
-## 2. Zero-Copy Metadata Streaming
+## ~~2. Zero-Copy Metadata Streaming~~ (Done)
 
-Metadata endpoints currently iterate rows, clone strings, and rebuild Arrow batches manually.
-DuckDB already produces Arrow batches — we throw them away and reconstruct.
+Implemented in two steps:
 
-See `docs/plan-zero-copy-metadata.md` for the full design.
+1. **Zero-copy streaming** (`e526dd4`): Replaced manual row-by-row Arrow batch rebuilding
+   with `streamMetadata` helper that streams DuckDB's Arrow batches directly to Flight SQL
+   clients. SQL queries alias columns to match `schema_ref` field names and cast types where
+   needed, eliminating the Go-side `RecordReader` wrapper. Net -261 lines.
 
-### Summary
+2. **Bulk column metadata** for `include_schema`: Replaced per-table `buildTableSchema`
+   (N queries per batch) with `buildBatchTableSchemas` (1 query per batch). Fetches all
+   column metadata for the batch in a single `information_schema.columns` query with an
+   `IN` filter, groups by table, then looks up each schema from the map.
 
-- Build a nullability-fixing `RecordReader` wrapper (O(1) per batch, no data copy).
-- Build a schema-enriching reader for `GetTables` with `include_schema`.
-- Replace manual builder pattern in `DoGetCatalogs`, `DoGetDBSchemas`, `DoGetTables`,
-  `DoGetPrimaryKeys`, and foreign key endpoints.
-- Benchmark with 100, 1000, 5000 tables to validate the gain is worth the complexity.
+**Benchstat results** — zero-copy streaming (baseline `e0c91ab` vs `e526dd4`, n=6):
 
-### Baseline benchmarks (done)
+| Endpoint                     | sec/op            | B/op               | allocs/op   |
+|------------------------------|-------------------|--------------------|-------------|
+| DoGetCatalogs                | ~ (p=0.065)       | **-3.40%**         | **-3.43%**  |
+| DoGetDBSchemas               | ~ (p=0.589)       | **-6.12%**         | **-6.52%**  |
+| DoGetTables/100              | +28.66%           | **-21.62%**        | **-12.04%** |
+| DoGetTables/1000             | ~ (p=0.132)       | ~ (p=0.240)        | **-15.51%** |
+| DoGetTables/5000             | +25.65%           | **-60.32%**        | ~ (p=0.372) |
+| DoGetPrimaryKeys (all tiers) | **-12.70%** (100) | **-8.2%**          | **-8.8%**   |
+| DoGetExportedKeys (all)      | **-8% to -17%**   | **-7.2% to -7.4%** | **-9.4%**   |
+| DoGetCrossReference (all)    | **-14% to -16%**  | **-7.3% to -7.4%** | **-9.4%**   |
+| **geomean**                  | **-0.62%**        | **-12.15%**        | **-7.20%**  |
 
-`internal/server/bench_test.go` — full round-trip (`GetFlightInfo` → `DoGet` → drain) benchmarks
-for all metadata endpoints. Seeds 3 schemas (`bench_100`, `bench_1000`, `bench_5000`) with
-plain tables (PK) and FK parent/child pairs. Run baseline before optimization, compare with
-`benchstat` afterward:
+**`include_schema` bulk query** improvement (baseline `e0c91ab` vs bulk, n=6):
 
-```bash
-go test -tags=duckdb_arrow -run='^$' -bench=Benchmark -benchmem -count=6 -timeout=30m ./internal/server/ | tee bench_baseline.txt
-# ... implement zero-copy ...
-go test -tags=duckdb_arrow -run='^$' -bench=Benchmark -benchmem -count=6 -timeout=30m ./internal/server/ | tee bench_zerocopy.txt
-benchstat bench_baseline.txt bench_zerocopy.txt
-```
-
-### Affected files
-
-- `internal/server/metadata.go`
-- `internal/server/primarykeys.go`
-- `internal/server/foreignkeys.go`
+| Tier | sec/op       | B/op     | allocs/op |
+|------|--------------|----------|-----------|
+| 100  | 1.47s → 48ms | **-46%** | **-62%**  |
+| 1000 | 13.9s → 66ms | **-41%** | **-64%**  |
+| 5000 | 88s → 167ms  | **-45%** | **-64%**  |
 
 ---
 
@@ -245,7 +246,7 @@ for C-side leak detection remains a future option.
 |-----|------------------------------------------|------------------------------|------------|----------|
 | BUG | ~~SIGSEGV in DoGetTables~~               | ~~Critical (process crash)~~ | ~~Low~~    | Fixed    |
 | 1   | ~~Prepared statement parameter binding~~ | ~~High (correctness)~~       | ~~Medium~~ | Done     |
-| 2   | Zero-copy metadata streaming             | Medium (performance)         | Medium     | P1       |
+| 2   | ~~Zero-copy metadata streaming~~         | ~~Medium (performance)~~     | ~~Medium~~ | Done     |
 | 3   | ~~Cancellation & polling~~               | ~~Medium (usability)~~       | ~~Low~~    | Done     |
 | 4   | ~~Bulk ingestion~~                       | ~~Medium (completeness)~~    | ~~Medium~~ | Done     |
 | 5   | ~~Distributed tracing~~                  | ~~Medium (operability)~~     | ~~Low~~    | Done     |

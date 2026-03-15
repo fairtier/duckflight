@@ -163,19 +163,25 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			rec := rdr.RecordBatch()
 			nrows := rec.NumRows()
 
-			// Build the binary schema column for each row.
-			binaryBldr := array.NewBinaryBuilder(s.Alloc, arrow.BinaryTypes.Binary)
 			catCol := rec.Column(0).(*array.String)
 			schCol := rec.Column(1).(*array.String)
 			nameCol := rec.Column(2).(*array.String)
 
+			// Bulk-fetch column metadata for all tables in this batch.
+			schemas, err := s.buildBatchTableSchemas(ctx, ac, catCol, schCol, nameCol)
+			if err != nil {
+				ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "build schemas: %s", err)}
+				return
+			}
+
+			binaryBldr := array.NewBinaryBuilder(s.Alloc, arrow.BinaryTypes.Binary)
 			for i := 0; i < int(nrows); i++ {
-				tblSchema, err := s.buildTableSchema(ctx, ac, catCol.Value(i), schCol.Value(i), nameCol.Value(i))
-				if err != nil {
+				key := tableKey{catCol.Value(i), schCol.Value(i), nameCol.Value(i)}
+				if tblSchema, ok := schemas[key]; ok {
+					binaryBldr.Append(flight.SerializeSchema(tblSchema, s.Alloc))
+				} else {
 					binaryBldr.AppendNull()
-					continue
 				}
-				binaryBldr.Append(flight.SerializeSchema(tblSchema, s.Alloc))
 			}
 
 			schemaArr := binaryBldr.NewArray()
@@ -200,36 +206,76 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	return schema_ref.TablesWithIncludedSchema, ch, nil
 }
 
-// buildTableSchema constructs an Arrow schema for a table entirely from
-// information_schema.columns. This avoids querying the table directly, which
-// can trigger a SIGSEGV in duckdb-go for tables created via Arrow.RegisterView.
-func (s *DuckFlightSQLServer) buildTableSchema(
-	ctx context.Context, ac *engine.ArrowConn,
-	catalog, dbSchema, tableName string,
-) (*arrow.Schema, error) {
-	query := fmt.Sprintf(
-		"SELECT column_name, data_type, numeric_precision, numeric_scale "+
-			"FROM information_schema.columns "+
-			"WHERE table_catalog = '%s' AND table_schema = '%s' AND table_name = '%s' "+
-			"ORDER BY ordinal_position",
-		escapeSQLString(catalog), escapeSQLString(dbSchema), escapeSQLString(tableName),
-	)
+type tableKey struct {
+	catalog, schema, table string
+}
 
-	rdr, err := ac.Arrow.QueryContext(ctx, query)
+// buildBatchTableSchemas fetches column metadata for all tables in a batch
+// with a single query and returns a map of table → Arrow schema.
+func (s *DuckFlightSQLServer) buildBatchTableSchemas(
+	ctx context.Context, ac *engine.ArrowConn,
+	catCol, schCol, nameCol *array.String,
+) (map[tableKey]*arrow.Schema, error) {
+	n := catCol.Len()
+	if n == 0 {
+		return nil, nil
+	}
+
+	// Build a VALUES list for the batch filter.
+	var sb strings.Builder
+	sb.WriteString(
+		"SELECT table_catalog, table_schema, table_name, " +
+			"column_name, data_type, numeric_precision, numeric_scale " +
+			"FROM information_schema.columns WHERE (table_catalog, table_schema, table_name) IN (")
+	for i := 0; i < n; i++ {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		fmt.Fprintf(&sb, "('%s', '%s', '%s')",
+			escapeSQLString(catCol.Value(i)),
+			escapeSQLString(schCol.Value(i)),
+			escapeSQLString(nameCol.Value(i)))
+	}
+	sb.WriteString(") ORDER BY table_catalog, table_schema, table_name, ordinal_position")
+
+	rdr, err := ac.Arrow.QueryContext(ctx, sb.String())
 	if err != nil {
-		return nil, fmt.Errorf("query columns: %w", err)
+		return nil, fmt.Errorf("bulk query columns: %w", err)
 	}
 	defer rdr.Release()
 
-	var fields []arrow.Field
+	// Collect fields grouped by table.
+	type tableFields struct {
+		key    tableKey
+		fields []arrow.Field
+	}
+	byTable := make(map[tableKey]*tableFields)
+	// Preserve insertion order for deterministic iteration.
+	var order []tableKey
+
 	for rdr.Next() {
 		rec := rdr.RecordBatch()
-		colNames := rec.Column(0).(*array.String)
-		colTypes := rec.Column(1).(*array.String)
-		colPrec := rec.Column(2).(*array.Int32)
-		colScale := rec.Column(3).(*array.Int32)
+		cats := rec.Column(0).(*array.String)
+		schs := rec.Column(1).(*array.String)
+		tbls := rec.Column(2).(*array.String)
+		colNames := rec.Column(3).(*array.String)
+		colTypes := rec.Column(4).(*array.String)
+		colPrec := rec.Column(5).(*array.Int32)
+		colScale := rec.Column(6).(*array.Int32)
 
-		for i := 0; i < colNames.Len(); i++ {
+		for i := 0; i < int(rec.NumRows()); i++ {
+			key := tableKey{
+				catalog: strings.Clone(cats.Value(i)),
+				schema:  strings.Clone(schs.Value(i)),
+				table:   strings.Clone(tbls.Value(i)),
+			}
+			tf, ok := byTable[key]
+			if !ok {
+				tf = &tableFields{key: key}
+				byTable[key] = tf
+				order = append(order, key)
+			}
+
 			name := strings.Clone(colNames.Value(i))
 			dataType := strings.Clone(colTypes.Value(i))
 
@@ -244,7 +290,7 @@ func (s *DuckFlightSQLServer) buildTableSchema(
 			mdBuilder := flightsql.NewColumnMetadataBuilder()
 			mdBuilder.TypeName(dataType)
 
-			fields = append(fields, arrow.Field{
+			tf.fields = append(tf.fields, arrow.Field{
 				Name:     name,
 				Type:     duckDBDataTypeToArrow(dataType, precision, scale),
 				Nullable: true,
@@ -256,7 +302,11 @@ func (s *DuckFlightSQLServer) buildTableSchema(
 		return nil, fmt.Errorf("read columns: %w", err)
 	}
 
-	return arrow.NewSchema(fields, nil), nil
+	result := make(map[tableKey]*arrow.Schema, len(order))
+	for _, key := range order {
+		result[key] = arrow.NewSchema(byTable[key].fields, nil)
+	}
+	return result, nil
 }
 
 // duckDBDataTypeToArrow maps a DuckDB data_type string to an arrow.DataType.
