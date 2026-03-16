@@ -162,20 +162,37 @@ clients and server is required.
 
 ---
 
-## 11. Load Testing
+## ~~11. Load Testing~~ (Done)
 
-No load testing has been performed.
+Implemented in `internal/server/load_test.go`. Custom Go client using `flightsql.Client`
+(Flight SQL requires two-step GetFlightInfo → DoGet that generic gRPC tools can't orchestrate).
 
-### What's needed
+**Ramp-up tests** (`TestLoadRampUp{Select,Metadata,Transactions}`): Gradually increase
+concurrency from 1 to `LOAD_MAX_CLIENTS` in exponential steps (1, 2, 4, 8, ...). Each stage
+runs for `LOAD_STAGE_DURATION`, collecting per-stage p50/p95/p99 latency, throughput (ops/sec),
+and error rate. Output is a comparison table showing how latency degrades as load increases.
 
-- Use `ghz` (gRPC benchmarking tool) or a custom Go client to generate load.
-- Test scenarios:
-  - Concurrent SELECT queries (pool saturation).
-  - Mixed read/write workload.
-  - Metadata endpoint throughput.
-  - Large result set streaming (bytes/sec).
-- Tune `POOL_SIZE`, `MAX_THREADS`, `MEMORY_LIMIT` based on results.
-- Establish baseline performance numbers for documentation.
+**Sustained mixed test** (`TestLoadSustainedMixed`): Runs readers and writers at full
+concurrency for `LOAD_SUSTAINED_DURATION` with periodic interval reporting (reads/s, writes/s,
+errors every 5s).
+
+**Fixed-iteration tests**: `TestLoadConcurrentSelect` (pool saturation at various pool/client
+ratios), `TestLoadMixedReadWrite` (transactional writes + concurrent reads with row count
+verification), `TestLoadLargeResultStreaming` (throughput in bytes/sec for wide result sets),
+`TestLoadTransactionContention` (pool exhaustion via held transactions).
+
+**Parallel benchmarks**: `BenchmarkParallel{Select,Metadata,MixedWorkload}` using `b.RunParallel`
+for `go test -bench` integration.
+
+**Configurable via environment variables** (defaults suit CI, `LOAD_HEAVY=1` for real load):
+
+| Variable                  | Default | Heavy |
+|---------------------------|---------|-------|
+| `LOAD_POOL_SIZE`          | 4       | 4     |
+| `LOAD_MAX_CLIENTS`        | 16      | 64    |
+| `LOAD_STAGE_DURATION`     | 3s      | 10s   |
+| `LOAD_ITERATIONS`         | 100     | 2000  |
+| `LOAD_SUSTAINED_DURATION` | 10s     | 60s   |
 
 ---
 
@@ -216,7 +233,7 @@ for C-side leak detection remains a future option.
 | 5   | ~~Distributed tracing~~                  | ~~Medium (operability)~~     | ~~Low~~    | Done     |
 | 6   | Rate limiting                            | Low (defense)                | Low        | P2       |
 | 7   | TLS                                      | Low (deploy-dependent)       | Low        | P2       |
-| 8   | Load testing                             | Medium (confidence)          | Medium     | P2       |
+| 8   | ~~Load testing~~                         | ~~Medium (confidence)~~      | ~~Medium~~ | Done     |
 | 9   | ~~Static extension build~~               | ~~Medium (cold start)~~      | ~~Medium~~ | Done     |
 | 10  | Savepoints                               | Low (niche)                  | Low        | P3       |
 | 11  | ~~Polling~~                              | ~~Low (niche)~~              | ~~Medium~~ | Done     |
