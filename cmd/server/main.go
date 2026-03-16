@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"log/slog"
 	"net/http"
 	"os"
@@ -23,6 +25,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 func main() {
@@ -113,7 +116,36 @@ func main() {
 		middlewares = append(middlewares, *m)
 	}
 
-	server := flight.NewServerWithMiddleware(middlewares, grpc.StatsHandler(otelgrpc.NewServerHandler()))
+	grpcOpts := []grpc.ServerOption{grpc.StatsHandler(otelgrpc.NewServerHandler())}
+
+	if certFile, keyFile := os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY"); certFile != "" && keyFile != "" {
+		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+		if err != nil {
+			slog.Error("failed to load TLS certificate", slog.String("error", err.Error()))
+			os.Exit(1)
+		}
+		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+
+		if caFile := os.Getenv("TLS_CA"); caFile != "" {
+			caPEM, err := os.ReadFile(caFile)
+			if err != nil {
+				slog.Error("failed to read TLS CA", slog.String("error", err.Error()))
+				os.Exit(1)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(caPEM) {
+				slog.Error("failed to parse TLS CA certificate")
+				os.Exit(1)
+			}
+			tlsCfg.ClientCAs = pool
+			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+		slog.Info("TLS enabled", slog.String("cert", certFile), slog.String("key", keyFile))
+	}
+
+	server := flight.NewServerWithMiddleware(middlewares, grpcOpts...)
 	server.RegisterFlightService(flightsql.NewFlightServer(duckserver.NewLoggingServer(srv)))
 
 	addr := envOr("LISTEN_ADDR", "0.0.0.0:31337")

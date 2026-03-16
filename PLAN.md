@@ -142,20 +142,14 @@ GitHub Actions release workflow uses BuildKit with GHA cache to avoid rebuilding
 
 ---
 
-## 10. TLS
+## ~~10. TLS~~ (Done)
 
-gRPC server currently runs without TLS. Encryption is delegated to the load balancer.
-
-### What's needed
-
-- Accept `TLS_CERT` and `TLS_KEY` environment variables.
-- Configure gRPC server with `credentials.NewServerTLSFromFile`.
-- Update Helm chart to support TLS secrets.
-
-### When to implement
-
-When deploying without a TLS-terminating load balancer, or when mTLS between
-clients and server is required.
+Implemented. The gRPC server optionally enables TLS via `TLS_CERT` and `TLS_KEY`
+environment variables. When both are set, `tls.LoadX509KeyPair` loads the certificate
+and `grpc.Creds(credentials.NewTLS(...))` is passed to `NewServerWithMiddleware`.
+If `TLS_CA` is also set, mutual TLS (mTLS) is enabled — clients must present a
+certificate signed by the specified CA. Helm chart supports TLS via `tls.enabled`,
+`tls.existingSecret`, and `tls.caSecret` values.
 
 ---
 
@@ -229,7 +223,7 @@ for C-side leak detection remains a future option.
 | 4   | ~~Bulk ingestion~~                       | ~~Medium (completeness)~~    | ~~Medium~~ | Done     |
 | 5   | ~~Distributed tracing~~                  | ~~Medium (operability)~~     | ~~Low~~    | Done     |
 | 6   | ~~Rate limiting~~                        | ~~Low (defense)~~            | ~~Low~~    | Done     |
-| 7   | TLS                                      | Low (deploy-dependent)       | Low        | P2       |
+| 7   | ~~TLS~~                                  | ~~Low (deploy-dependent)~~   | ~~Low~~    | Done     |
 | 8   | ~~Load testing~~                         | ~~Medium (confidence)~~      | ~~Medium~~ | Done     |
 | 9   | ~~Static extension build~~               | ~~Medium (cold start)~~      | ~~Medium~~ | Done     |
 | 10  | Savepoints                               | Low (niche)                  | Low        | P3       |

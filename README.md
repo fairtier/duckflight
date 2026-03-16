@@ -85,6 +85,9 @@ All configuration is via environment variables:
 | `AUTH_TOKENS`           |                 | Comma-separated bearer tokens (empty = auth disabled) |
 | `RATE_LIMIT_RPS`        | `0`             | Max requests per second (0 = disabled)                |
 | `RATE_LIMIT_BURST`      | `0`             | Burst size (0 = defaults to RPS value)                |
+| `TLS_CERT`              |                 | Path to TLS certificate file (PEM)                    |
+| `TLS_KEY`               |                 | Path to TLS private key file (PEM)                    |
+| `TLS_CA`                |                 | Path to CA cert for client verification (mTLS)        |
 | `ICEBERG_ENDPOINT`      |                 | Iceberg REST Catalog URL                              |
 | `ICEBERG_WAREHOUSE`     |                 | Warehouse name to ATTACH                              |
 | `ICEBERG_CLIENT_ID`     |                 | OAuth2 client ID for catalog auth                     |

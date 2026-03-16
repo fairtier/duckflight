@@ -77,6 +77,27 @@ spec:
             - name: S3_URL_STYLE
               value: {{ .Values.s3.urlStyle | quote }}
             {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: TLS_CERT
+              value: "/etc/tls/tls.crt"
+            - name: TLS_KEY
+              value: "/etc/tls/tls.key"
+            {{- if .Values.tls.caSecret }}
+            - name: TLS_CA
+              value: "/etc/tls/ca/ca.crt"
+            {{- end }}
+            {{- end }}
+          {{- if .Values.tls.enabled }}
+          volumeMounts:
+            - name: tls-certs
+              mountPath: /etc/tls
+              readOnly: true
+            {{- if .Values.tls.caSecret }}
+            - name: tls-ca
+              mountPath: /etc/tls/ca
+              readOnly: true
+            {{- end }}
+          {{- end }}
           resources:
             requests:
               memory: {{ .Values.resources.requests.memory | quote }}
@@ -94,3 +115,14 @@ spec:
               port: 31337
             initialDelaySeconds: 10
             periodSeconds: 30
+      {{- if .Values.tls.enabled }}
+      volumes:
+        - name: tls-certs
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+        {{- if .Values.tls.caSecret }}
+        - name: tls-ca
+          secret:
+            secretName: {{ .Values.tls.caSecret }}
+        {{- end }}
+      {{- end }}

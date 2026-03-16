@@ -16,6 +16,11 @@ s3:
   region: ""
   urlStyle: "path"
 
+tls:
+  enabled: false
+  existingSecret: ""  # Kubernetes TLS secret with tls.crt and tls.key
+  caSecret: ""        # Secret with ca.crt for mTLS (optional)
+
 resources:
   memoryLimit: "2GB"
   maxThreads: 4
