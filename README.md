@@ -83,6 +83,8 @@ All configuration is via environment variables:
 | `POOL_SIZE`             | `8`             | Arrow connection pool size                            |
 | `MAX_RESULT_BYTES`      | `0`             | Max bytes per query result (0 = unlimited)            |
 | `AUTH_TOKENS`           |                 | Comma-separated bearer tokens (empty = auth disabled) |
+| `RATE_LIMIT_RPS`        | `0`             | Max requests per second (0 = disabled)                |
+| `RATE_LIMIT_BURST`      | `0`             | Burst size (0 = defaults to RPS value)                |
 | `ICEBERG_ENDPOINT`      |                 | Iceberg REST Catalog URL                              |
 | `ICEBERG_WAREHOUSE`     |                 | Warehouse name to ATTACH                              |
 | `ICEBERG_CLIENT_ID`     |                 | OAuth2 client ID for catalog auth                     |

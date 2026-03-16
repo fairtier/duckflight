@@ -31,7 +31,8 @@ internal/
   engine/
     engine.go                DuckDB connector lifecycle, boot SQL, Iceberg ATTACH
     pool.go                  Bounded channel-based ArrowConn pool
-  auth/middleware.go         Bearer token gRPC interceptors (unary + stream)
+  auth/middleware.go         Bearer token flight.ServerMiddleware (unary + stream)
+  ratelimit/middleware.go    Token-bucket rate limit flight.ServerMiddleware
   server/
     server.go                DuckFlightSQLServer (embeds flightsql.BaseServer), SqlInfo registration
     statements.go            GetFlightInfoStatement, DoGetStatement, DoPutCommandStatementUpdate, GetSchemaStatement
@@ -80,6 +81,7 @@ test/
 | `flightsql_query_duration_seconds` | Histogram | —                           |
 | `flightsql_bytes_streamed_total`   | Counter   | —                           |
 | `flightsql_active_queries`         | Gauge     | —                           |
+| `flightsql_ratelimit_rejected`     | Counter   | —                           |
 
 ## Configuration
 
@@ -90,6 +92,7 @@ All via environment variables. See README.md for the full table. Key ones:
 - `ICEBERG_*` — Iceberg REST Catalog connection (optional)
 - `S3_*` — S3 storage credentials (optional, for when catalog doesn't vend credentials)
 - `AUTH_TOKENS` — comma-separated bearer tokens (empty = auth disabled)
+- `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` — global token-bucket rate limiter (0 = disabled)
 - `LOG_LEVEL` — slog level (DEBUG, INFO, WARN, ERROR)
 
 ## Testing Patterns
@@ -99,6 +102,7 @@ All via environment variables. See README.md for the full table. Key ones:
 - **metering_test.go** — Unit tests for meteredReader
 - **engine_test.go** — Engine init and pool tests
 - **middleware_test.go** — Auth token validation
+- **ratelimit/middleware_test.go** — Rate limit middleware tests
 - **iceberg_integration_test.go** — Full Docker stack via testcontainers (build tag: `iceberg_integration`)
 
 Test helper: `server.SeedSQL(ctx, sql)` executes setup SQL on the global engine.

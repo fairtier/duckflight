@@ -52,8 +52,11 @@ func (s *AuthSuite) SetupSuite() {
 	})
 	s.Require().NoError(err)
 
-	middleware := auth.BearerTokenMiddleware([]string{"test-secret"})
-	s.server = flight.NewServerWithMiddleware(nil, middleware...)
+	var middlewares []flight.ServerMiddleware
+	if m := auth.BearerTokenMiddleware([]string{"test-secret"}); m != nil {
+		middlewares = append(middlewares, *m)
+	}
+	s.server = flight.NewServerWithMiddleware(middlewares)
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
 	s.Require().NoError(s.server.Init("localhost:0"))
 

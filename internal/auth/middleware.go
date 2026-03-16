@@ -4,16 +4,17 @@ import (
 	"context"
 	"strings"
 
+	"github.com/apache/arrow-go/v18/arrow/flight"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
-// BearerTokenMiddleware returns gRPC server options (unary + stream interceptors)
-// that validate bearer tokens against the provided set of valid tokens.
-// If tokens is empty, all requests are allowed (auth disabled).
-func BearerTokenMiddleware(tokens []string) []grpc.ServerOption {
+// BearerTokenMiddleware returns a flight.ServerMiddleware that validates bearer
+// tokens against the provided set of valid tokens.
+// If tokens is empty, returns nil (auth disabled).
+func BearerTokenMiddleware(tokens []string) *flight.ServerMiddleware {
 	if len(tokens) == 0 {
 		return nil
 	}
@@ -39,23 +40,18 @@ func BearerTokenMiddleware(tokens []string) []grpc.ServerOption {
 		return nil
 	}
 
-	unary := grpc.UnaryInterceptor(func(
-		ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler,
-	) (any, error) {
-		if err := validate(ctx); err != nil {
-			return nil, err
-		}
-		return handler(ctx, req)
-	})
-
-	stream := grpc.StreamInterceptor(func(
-		srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler,
-	) error {
-		if err := validate(ss.Context()); err != nil {
-			return err
-		}
-		return handler(srv, ss)
-	})
-
-	return []grpc.ServerOption{unary, stream}
+	return &flight.ServerMiddleware{
+		Unary: func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if err := validate(ctx); err != nil {
+				return nil, err
+			}
+			return handler(ctx, req)
+		},
+		Stream: func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			if err := validate(ss.Context()); err != nil {
+				return err
+			}
+			return handler(srv, ss)
+		},
+	}
 }

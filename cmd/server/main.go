@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/prochac/duckflight/internal/auth"
+	"github.com/prochac/duckflight/internal/ratelimit"
 	duckserver "github.com/prochac/duckflight/internal/server"
 	"github.com/prochac/duckflight/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -58,7 +59,9 @@ func main() {
 	}()
 
 	// Initialize OTel metrics.
-	duckserver.InitMetrics(otel.GetMeterProvider().Meter("duckflight"))
+	meter := otel.GetMeterProvider().Meter("duckflight")
+	duckserver.InitMetrics(meter)
+	ratelimit.InitMetrics(meter)
 
 	cfg := duckserver.Config{
 		MemoryLimit:         envOr("MEMORY_LIMIT", "1GB"),
@@ -94,12 +97,23 @@ func main() {
 			}
 		}
 	}
-	middleware := auth.BearerTokenMiddleware(authTokens)
 
-	server := flight.NewServerWithMiddleware(
-		[]flight.ServerMiddleware{duckserver.GRPCLoggingMiddleware()},
-		append(middleware, grpc.StatsHandler(otelgrpc.NewServerHandler()))...,
-	)
+	// Rate limit middleware — set RATE_LIMIT_RPS env var to enable.
+	rateLimitRPS := envFloat64("RATE_LIMIT_RPS", 0)
+	rateLimitBurst := envInt("RATE_LIMIT_BURST", 0)
+
+	// Middleware order: logging (outer) → auth → rate limit (inner).
+	// Auth rejects unauthenticated requests before consuming rate limit tokens.
+	var middlewares []flight.ServerMiddleware
+	middlewares = append(middlewares, duckserver.GRPCLoggingMiddleware())
+	if m := auth.BearerTokenMiddleware(authTokens); m != nil {
+		middlewares = append(middlewares, *m)
+	}
+	if m := ratelimit.Middleware(rateLimitRPS, rateLimitBurst); m != nil {
+		middlewares = append(middlewares, *m)
+	}
+
+	server := flight.NewServerWithMiddleware(middlewares, grpc.StatsHandler(otelgrpc.NewServerHandler()))
 	server.RegisterFlightService(flightsql.NewFlightServer(duckserver.NewLoggingServer(srv)))
 
 	addr := envOr("LISTEN_ADDR", "0.0.0.0:31337")
@@ -155,6 +169,15 @@ func envInt64(key string, fallback int64) int64 {
 	if v := os.Getenv(key); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
+		}
+	}
+	return fallback
+}
+
+func envFloat64(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			return f
 		}
 	}
 	return fallback

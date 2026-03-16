@@ -93,21 +93,18 @@ stdout exporters are used.
 
 ---
 
-## 6. Rate Limiting
+## ~~6. Rate Limiting~~ (Done)
 
-No application-level or gateway-level rate limiting is configured.
+Implemented global token-bucket rate limiter as a `flight.ServerMiddleware` gRPC
+interceptor. Uses `golang.org/x/time/rate` with configurable RPS and burst size
+(`RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` env vars; 0 = disabled). Rejects excess
+requests with `codes.ResourceExhausted`. Prometheus counter
+`flightsql.ratelimit.rejected` tracks rejections.
 
-### What's needed
-
-- Add Envoy Gateway `BackendTrafficPolicy` rate limiting rules (per-tenant, per-IP).
-- Consider application-level query rate limiting (queries per second per connection).
-- Expose rate limit metrics to Prometheus.
-
-### Why it matters
-
-Defense against runaway clients or misconfigured ETL pipelines that flood the server
-with queries. The connection pool provides backpressure, but a burst of cheap metadata
-queries can still overwhelm the server.
+Also refactored auth middleware from `[]grpc.ServerOption` to `*flight.ServerMiddleware`
+so all middleware goes through `NewServerWithMiddleware`'s middleware slice.
+Middleware order: logging (outer) → auth → rate limit (inner) — unauthenticated
+requests are rejected before consuming rate limit tokens.
 
 ---
 
@@ -231,7 +228,7 @@ for C-side leak detection remains a future option.
 | 3   | ~~Cancellation & polling~~               | ~~Medium (usability)~~       | ~~Low~~    | Done     |
 | 4   | ~~Bulk ingestion~~                       | ~~Medium (completeness)~~    | ~~Medium~~ | Done     |
 | 5   | ~~Distributed tracing~~                  | ~~Medium (operability)~~     | ~~Low~~    | Done     |
-| 6   | Rate limiting                            | Low (defense)                | Low        | P2       |
+| 6   | ~~Rate limiting~~                        | ~~Low (defense)~~            | ~~Low~~    | Done     |
 | 7   | TLS                                      | Low (deploy-dependent)       | Low        | P2       |
 | 8   | ~~Load testing~~                         | ~~Medium (confidence)~~      | ~~Medium~~ | Done     |
 | 9   | ~~Static extension build~~               | ~~Medium (cold start)~~      | ~~Medium~~ | Done     |
