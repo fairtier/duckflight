@@ -53,23 +53,18 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 		}
 	}
 
-	trackerTTL := 30 * time.Minute
-	if timeout > 0 {
-		trackerTTL = 2 * timeout
-	}
-
-	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
-
 	resourceTTL := 30 * time.Minute
 	if timeout > 0 {
 		resourceTTL = 2 * timeout
 	}
 
+	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
+
 	srv := &DuckFlightSQLServer{
 		engine:         eng,
 		queryTimeout:   timeout,
 		maxResultBytes: cfg.MaxResultBytes,
-		tracker:        &queryTracker{ttl: trackerTTL},
+		tracker:        &queryTracker{ttl: resourceTTL},
 		resourceTTL:    resourceTTL,
 		stopCleanup:    stopCleanup,
 		tracer:         otel.Tracer("duckflight"),
