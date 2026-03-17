@@ -132,29 +132,6 @@ func (l *loggingServer) GetSchemaStatement(ctx context.Context, cmd flightsql.St
 	return result, err
 }
 
-// --- Substrait (not implemented, delegated to BaseServer) ---
-
-func (l *loggingServer) GetFlightInfoSubstraitPlan(ctx context.Context, cmd flightsql.StatementSubstraitPlan, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
-	start := time.Now()
-	info, err := l.DuckFlightSQLServer.GetFlightInfoSubstraitPlan(ctx, cmd, desc)
-	logCall(ctx, "GetFlightInfoSubstraitPlan", start, err, flightInfoAttrs(info)...)
-	return info, err
-}
-
-func (l *loggingServer) GetSchemaSubstraitPlan(ctx context.Context, cmd flightsql.StatementSubstraitPlan, desc *flight.FlightDescriptor) (*flight.SchemaResult, error) {
-	start := time.Now()
-	result, err := l.DuckFlightSQLServer.GetSchemaSubstraitPlan(ctx, cmd, desc)
-	logCall(ctx, "GetSchemaSubstraitPlan", start, err)
-	return result, err
-}
-
-func (l *loggingServer) DoPutCommandSubstraitPlan(ctx context.Context, cmd flightsql.StatementSubstraitPlan) (int64, error) {
-	start := time.Now()
-	n, err := l.DuckFlightSQLServer.DoPutCommandSubstraitPlan(ctx, cmd)
-	logCall(ctx, "DoPutCommandSubstraitPlan", start, err)
-	return n, err
-}
-
 // --- Catalogs (implemented) ---
 
 func (l *loggingServer) GetFlightInfoCatalogs(ctx context.Context, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
@@ -286,14 +263,7 @@ func (l *loggingServer) DoPutPreparedStatementUpdate(ctx context.Context, cmd fl
 	return n, err
 }
 
-func (l *loggingServer) CreatePreparedSubstraitPlan(ctx context.Context, req flightsql.ActionCreatePreparedSubstraitPlanRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
-	start := time.Now()
-	result, err := l.DuckFlightSQLServer.CreatePreparedSubstraitPlan(ctx, req)
-	logCall(ctx, "CreatePreparedSubstraitPlan", start, err)
-	return result, err
-}
-
-// --- Ingestion (not implemented) ---
+// --- Ingestion (implemented) ---
 
 func (l *loggingServer) DoPutCommandStatementIngest(ctx context.Context, cmd flightsql.StatementIngest, rdr flight.MessageReader) (int64, error) {
 	start := time.Now()
@@ -322,22 +292,6 @@ func (l *loggingServer) EndTransaction(ctx context.Context, req flightsql.Action
 		action = "rollback"
 	}
 	logCall(ctx, "EndTransaction", start, err, slog.String("action", action))
-	return err
-}
-
-// --- Savepoints (not implemented) ---
-
-func (l *loggingServer) BeginSavepoint(ctx context.Context, req flightsql.ActionBeginSavepointRequest) ([]byte, error) {
-	start := time.Now()
-	id, err := l.DuckFlightSQLServer.BeginSavepoint(ctx, req)
-	logCall(ctx, "BeginSavepoint", start, err)
-	return id, err
-}
-
-func (l *loggingServer) EndSavepoint(ctx context.Context, req flightsql.ActionEndSavepointRequest) error {
-	start := time.Now()
-	err := l.DuckFlightSQLServer.EndSavepoint(ctx, req)
-	logCall(ctx, "EndSavepoint", start, err)
 	return err
 }
 
@@ -459,30 +413,7 @@ func (l *loggingServer) DoGetSqlInfo(ctx context.Context, cmd flightsql.GetSqlIn
 	return schema, ch, err
 }
 
-// --- Session management (not implemented) ---
-
-func (l *loggingServer) SetSessionOptions(ctx context.Context, req *flight.SetSessionOptionsRequest) (*flight.SetSessionOptionsResult, error) {
-	start := time.Now()
-	result, err := l.DuckFlightSQLServer.SetSessionOptions(ctx, req)
-	logCall(ctx, "SetSessionOptions", start, err)
-	return result, err
-}
-
-func (l *loggingServer) GetSessionOptions(ctx context.Context, req *flight.GetSessionOptionsRequest) (*flight.GetSessionOptionsResult, error) {
-	start := time.Now()
-	result, err := l.DuckFlightSQLServer.GetSessionOptions(ctx, req)
-	logCall(ctx, "GetSessionOptions", start, err)
-	return result, err
-}
-
-func (l *loggingServer) CloseSession(ctx context.Context, req *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
-	start := time.Now()
-	result, err := l.DuckFlightSQLServer.CloseSession(ctx, req)
-	logCall(ctx, "CloseSession", start, err)
-	return result, err
-}
-
-// --- Flight management (not implemented) ---
+// --- Flight management (implemented) ---
 
 func (l *loggingServer) CancelFlightInfo(ctx context.Context, req *flight.CancelFlightInfoRequest) (result flight.CancelFlightInfoResult, err error) {
 	start := time.Now()
@@ -493,40 +424,10 @@ func (l *loggingServer) CancelFlightInfo(ctx context.Context, req *flight.Cancel
 	return
 }
 
-func (l *loggingServer) RenewFlightEndpoint(ctx context.Context, req *flight.RenewFlightEndpointRequest) (*flight.FlightEndpoint, error) {
-	start := time.Now()
-	ep, err := l.DuckFlightSQLServer.RenewFlightEndpoint(ctx, req)
-	logCall(ctx, "RenewFlightEndpoint", start, err)
-	return ep, err
-}
-
-// --- Polling (not implemented) ---
-
-func (l *loggingServer) PollFlightInfo(ctx context.Context, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
-	start := time.Now()
-	info, err := l.DuckFlightSQLServer.PollFlightInfo(ctx, desc)
-	logCall(ctx, "PollFlightInfo", start, err)
-	return info, err
-}
-
 func (l *loggingServer) PollFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
 	start := time.Now()
 	info, err := l.DuckFlightSQLServer.PollFlightInfoStatement(ctx, cmd, desc)
 	logCall(ctx, "PollFlightInfoStatement", start, err, slog.String("query", cmd.GetQuery()))
-	return info, err
-}
-
-func (l *loggingServer) PollFlightInfoSubstraitPlan(ctx context.Context, cmd flightsql.StatementSubstraitPlan, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
-	start := time.Now()
-	info, err := l.DuckFlightSQLServer.PollFlightInfoSubstraitPlan(ctx, cmd, desc)
-	logCall(ctx, "PollFlightInfoSubstraitPlan", start, err)
-	return info, err
-}
-
-func (l *loggingServer) PollFlightInfoPreparedStatement(ctx context.Context, cmd flightsql.PreparedStatementQuery, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
-	start := time.Now()
-	info, err := l.DuckFlightSQLServer.PollFlightInfoPreparedStatement(ctx, cmd, desc)
-	logCall(ctx, "PollFlightInfoPreparedStatement", start, err)
 	return info, err
 }
 
