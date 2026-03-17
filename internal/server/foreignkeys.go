@@ -95,17 +95,3 @@ func (s *DuckFlightSQLServer) DoGetCrossReference(
 			escapeSQLString(pk.Table), escapeSQLString(fk.Table))
 	return s.streamMetadata(ctx, query, schema_ref.ImportedExportedKeysAndCrossReference)
 }
-
-func catalogFilter(col string, c *string) string {
-	if c != nil {
-		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*c))
-	}
-	return col + " = current_database()"
-}
-
-func schemaFilter(col string, s *string) string {
-	if s != nil {
-		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*s))
-	}
-	return col + " = current_schema()"
-}

@@ -85,15 +85,10 @@ func (s *DuckFlightSQLServer) GetFlightInfoSchemas(_ context.Context, _ flightsq
 }
 
 func (s *DuckFlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.GetDBSchemas) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	query := "SELECT catalog_name, schema_name AS db_schema_name FROM information_schema.schemata WHERE 1=1"
-
-	if catalog := cmd.GetCatalog(); catalog != nil {
-		query += fmt.Sprintf(" AND catalog_name = '%s'", escapeSQLString(*catalog))
-	} else {
-		query += " AND catalog_name = current_database()"
-	}
-	if schemaFilter := cmd.GetDBSchemaFilterPattern(); schemaFilter != nil {
-		query += fmt.Sprintf(" AND schema_name LIKE '%s'", escapeSQLString(*schemaFilter))
+	query := "SELECT catalog_name, schema_name AS db_schema_name FROM information_schema.schemata WHERE " +
+		catalogFilter("catalog_name", cmd.GetCatalog())
+	if sf := cmd.GetDBSchemaFilterPattern(); sf != nil {
+		query += fmt.Sprintf(" AND schema_name LIKE '%s'", escapeSQLString(*sf))
 	}
 	query += " ORDER BY catalog_name, db_schema_name"
 
@@ -111,18 +106,13 @@ func (s *DuckFlightSQLServer) GetFlightInfoTables(_ context.Context, cmd flights
 }
 
 func (s *DuckFlightSQLServer) doGetTablesQuery(cmd flightsql.GetTables) string {
-	query := "SELECT table_catalog AS catalog_name, table_schema AS db_schema_name, table_name, table_type FROM information_schema.tables WHERE 1=1"
-
-	if catalog := cmd.GetCatalog(); catalog != nil {
-		query += fmt.Sprintf(" AND table_catalog = '%s'", escapeSQLString(*catalog))
-	} else {
-		query += " AND table_catalog = current_database()"
+	query := "SELECT table_catalog AS catalog_name, table_schema AS db_schema_name, table_name, table_type FROM information_schema.tables WHERE " +
+		catalogFilter("table_catalog", cmd.GetCatalog())
+	if sf := cmd.GetDBSchemaFilterPattern(); sf != nil {
+		query += fmt.Sprintf(" AND table_schema LIKE '%s'", escapeSQLString(*sf))
 	}
-	if schemaFilter := cmd.GetDBSchemaFilterPattern(); schemaFilter != nil {
-		query += fmt.Sprintf(" AND table_schema LIKE '%s'", escapeSQLString(*schemaFilter))
-	}
-	if tableFilter := cmd.GetTableNameFilterPattern(); tableFilter != nil {
-		query += fmt.Sprintf(" AND table_name LIKE '%s'", escapeSQLString(*tableFilter))
+	if tf := cmd.GetTableNameFilterPattern(); tf != nil {
+		query += fmt.Sprintf(" AND table_name LIKE '%s'", escapeSQLString(*tf))
 	}
 	if types := cmd.GetTableTypes(); len(types) > 0 {
 		quoted := make([]string, len(types))
@@ -384,6 +374,20 @@ func (s *DuckFlightSQLServer) DoGetTableTypes(_ context.Context) (*arrow.Schema,
 	close(ch)
 
 	return schema_ref.TableTypes, ch, nil
+}
+
+func catalogFilter(col string, c *string) string {
+	if c != nil {
+		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*c))
+	}
+	return col + " = current_database()"
+}
+
+func schemaFilter(col string, s *string) string {
+	if s != nil {
+		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*s))
+	}
+	return col + " = current_schema()"
 }
 
 // escapeSQLString escapes single quotes in SQL string literals.

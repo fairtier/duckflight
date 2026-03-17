@@ -32,20 +32,11 @@ func (s *DuckFlightSQLServer) DoGetPrimaryKeys(
 		CAST(generate_subscripts(constraint_column_names, 1) AS INTEGER) AS key_sequence,
 		NULL::VARCHAR AS key_name
 	FROM duckdb_constraints()
-	WHERE constraint_type = 'PRIMARY KEY'`
-
-	if cmd.Catalog != nil {
-		query += fmt.Sprintf(" AND database_name = '%s'", escapeSQLString(*cmd.Catalog))
-	} else {
-		query += " AND database_name = current_database()"
-	}
-	if cmd.DBSchema != nil {
-		query += fmt.Sprintf(" AND schema_name = '%s'", escapeSQLString(*cmd.DBSchema))
-	} else {
-		query += " AND schema_name = current_schema()"
-	}
-	query += fmt.Sprintf(" AND table_name = '%s'", escapeSQLString(cmd.Table))
-	query += " ORDER BY catalog_name, db_schema_name, table_name, key_sequence"
+	WHERE constraint_type = 'PRIMARY KEY'` +
+		" AND " + catalogFilter("database_name", cmd.Catalog) +
+		" AND " + schemaFilter("schema_name", cmd.DBSchema) +
+		fmt.Sprintf(" AND table_name = '%s'", escapeSQLString(cmd.Table)) +
+		" ORDER BY catalog_name, db_schema_name, table_name, key_sequence"
 
 	return s.streamMetadata(ctx, query, schema_ref.PrimaryKeys)
 }
