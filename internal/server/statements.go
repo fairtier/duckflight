@@ -344,6 +344,25 @@ func ingestBatch(ctx context.Context, ac *engine.ArrowConn, rec arrow.RecordBatc
 	return n, nil
 }
 
+// ingestAll loops over a MessageReader and ingests each batch using the given SQL.
+func ingestAll(ctx context.Context, ac *engine.ArrowConn, rdr flight.MessageReader, insertSQL string) (int64, error) {
+	var totalRows int64
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		rec.Retain()
+		n, err := ingestBatch(ctx, ac, rec, insertSQL)
+		rec.Release()
+		if err != nil {
+			return totalRows, err
+		}
+		totalRows += n
+	}
+	if err := rdr.Err(); err != nil {
+		return totalRows, status.Errorf(codes.Internal, "reading ingest stream: %s", err)
+	}
+	return totalRows, nil
+}
+
 // DoPutCommandStatementIngest handles bulk ingestion of Arrow record batches
 // into a target table via DuckDB's Arrow view registration.
 func (s *DuckFlightSQLServer) DoPutCommandStatementIngest(
@@ -407,40 +426,11 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementIngest(
 			return 0, err
 		}
 
-		var totalRows int64
-		totalRows += n
-
 		// Insert remaining batches.
-		for rdr.Next() {
-			rec := rdr.RecordBatch()
-			rec.Retain()
-			n, err := ingestBatch(ctx, ac, rec, insertSQL)
-			rec.Release()
-			if err != nil {
-				return totalRows, err
-			}
-			totalRows += n
-		}
-		if err := rdr.Err(); err != nil {
-			return totalRows, status.Errorf(codes.Internal, "reading ingest stream: %s", err)
-		}
-		return totalRows, nil
+		remaining, err := ingestAll(ctx, ac, rdr, insertSQL)
+		return n + remaining, err
 	}
 
 	// Non-CREATE mode: just INSERT INTO (table must already exist).
-	var totalRows int64
-	for rdr.Next() {
-		rec := rdr.RecordBatch()
-		rec.Retain()
-		n, err := ingestBatch(ctx, ac, rec, insertSQL)
-		rec.Release()
-		if err != nil {
-			return totalRows, err
-		}
-		totalRows += n
-	}
-	if err := rdr.Err(); err != nil {
-		return totalRows, status.Errorf(codes.Internal, "reading ingest stream: %s", err)
-	}
-	return totalRows, nil
+	return ingestAll(ctx, ac, rdr, insertSQL)
 }
