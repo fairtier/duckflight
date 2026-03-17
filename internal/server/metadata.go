@@ -34,9 +34,9 @@ func (s *DuckFlightSQLServer) flightInfoForCommand(desc *flight.FlightDescriptor
 func (s *DuckFlightSQLServer) streamMetadata(
 	ctx context.Context, query string, schema *arrow.Schema,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, nil, err
 	}
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
@@ -133,9 +133,9 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	}
 
 	// With include_schema we need to append a binary column per batch.
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, nil, err
 	}
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)

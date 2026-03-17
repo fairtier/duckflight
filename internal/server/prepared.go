@@ -111,7 +111,7 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	s.preparedStmts.Store(string(handle), preparedStatement{query: query, createdAt: time.Now()})
 
 	// Get schema via LIMIT 0 query.
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
 	}
@@ -171,9 +171,9 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 	}
 	ps := val.(preparedStatement)
 
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
-		return nil, nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, nil, err
 	}
 
 	// Build args from first parameter row (if any).
@@ -263,9 +263,9 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 		args = ps.params
 	}
 
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
-		return 0, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return 0, err
 	}
 	defer s.engine.Pool.Release(ac)
 

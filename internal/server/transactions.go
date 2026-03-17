@@ -29,10 +29,10 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	ctx, span := s.tracer.Start(ctx, "transaction.begin")
 	defer span.End()
 
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
 		span.RecordError(err)
-		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, err
 	}
 
 	tx, err := ac.BeginTx(ctx)

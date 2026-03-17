@@ -38,6 +38,16 @@ func genHandle() []byte {
 	return []byte(hex.EncodeToString(b))
 }
 
+// acquirePoolConn acquires a connection from the pool, wrapping errors with
+// the appropriate gRPC status code.
+func (s *DuckFlightSQLServer) acquirePoolConn(ctx context.Context) (*engine.ArrowConn, error) {
+	ac, err := s.engine.Pool.Acquire(ctx)
+	if err != nil {
+		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+	}
+	return ac, nil
+}
+
 // acquireConn returns either the transaction's connection or a pool connection.
 // If fromPool is true, the caller must release it when done.
 func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (ac *engine.ArrowConn, fromPool bool, err error) {
@@ -53,10 +63,10 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (ac
 	ctx, span := s.tracer.Start(ctx, "pool.acquire")
 	defer span.End()
 
-	ac, err = s.engine.Pool.Acquire(ctx)
+	ac, err = s.acquirePoolConn(ctx)
 	if err != nil {
 		span.RecordError(err)
-		return nil, false, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, false, err
 	}
 	return ac, true, nil
 }
@@ -218,9 +228,9 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 ) (*flight.SchemaResult, error) {
 	query := cmd.GetQuery()
 
-	ac, err := s.engine.Pool.Acquire(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
-		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
+		return nil, err
 	}
 	defer s.engine.Pool.Release(ac)
 
