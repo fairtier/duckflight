@@ -112,15 +112,15 @@ requests are rejected before consuming rate limit tokens.
 
 `BeginSavepoint` and `EndSavepoint` are part of the Flight SQL spec but not implemented.
 
-### What's needed
+### Status
 
-- Implement `BeginSavepoint` → `SAVEPOINT <name>` on the transaction's connection.
-- Implement `EndSavepoint` → `RELEASE SAVEPOINT <name>` or `ROLLBACK TO SAVEPOINT <name>`.
-- DuckDB supports savepoints natively.
+**Blocked.** DuckDB does not support `SAVEPOINT`, `RELEASE SAVEPOINT`, or
+`ROLLBACK TO SAVEPOINT`. The transaction docs only cover `BEGIN`, `COMMIT`,
+`ROLLBACK`, and `ABORT`. Cannot implement without upstream DuckDB support.
 
 ### Priority
 
-Low. Most Flight SQL clients do not use savepoints. Implement on demand.
+Low. Most Flight SQL clients do not use savepoints. Revisit if DuckDB adds savepoint support.
 
 ---
 
@@ -226,6 +226,6 @@ for C-side leak detection remains a future option.
 | 7   | ~~TLS~~                                  | ~~Low (deploy-dependent)~~   | ~~Low~~    | Done     |
 | 8   | ~~Load testing~~                         | ~~Medium (confidence)~~      | ~~Medium~~ | Done     |
 | 9   | ~~Static extension build~~               | ~~Medium (cold start)~~      | ~~Medium~~ | Done     |
-| 10  | Savepoints                               | Low (niche)                  | Low        | P3       |
+| 10  | Savepoints                               | Low (niche)                  | Low        | Blocked  |
 | 11  | ~~Polling~~                              | ~~Low (niche)~~              | ~~Medium~~ | Done     |
 | 12  | ~~CGO memory leak testing~~              | ~~High (reliability)~~       | ~~Medium~~ | Done     |
