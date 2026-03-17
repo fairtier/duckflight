@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	duckserver "github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
@@ -195,7 +196,7 @@ func (s *IcebergSuite) SetupSuite() {
 
 	// 9. Boot DuckFlight server with Iceberg catalog attached.
 	// S3 credentials are passed so DuckDB can read/write data files in MinIO.
-	srv, err := duckserver.New(duckserver.Config{
+	srv, err := duckserver.New(&config.Config{
 		MemoryLimit:      "512MB",
 		MaxThreads:       2,
 		QueryTimeout:     "30s",

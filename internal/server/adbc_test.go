@@ -19,6 +19,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc/codes"
@@ -40,7 +41,7 @@ type ADBCSuite struct {
 }
 
 func (s *ADBCSuite) SetupSuite() {
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",

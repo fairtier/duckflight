@@ -14,6 +14,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -32,7 +33,7 @@ func newSoakEnv(t *testing.T) *soakEnv {
 	t.Helper()
 	ensureTestMetrics()
 
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "256MB",
 		MaxThreads:   2,
 		QueryTimeout: "30s",

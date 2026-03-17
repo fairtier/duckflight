@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/server"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/suite"
@@ -80,7 +81,7 @@ type MeteringSuite struct {
 func (s *MeteringSuite) SetupSuite() {
 	ensureTestMetrics()
 
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:    "256MB",
 		MaxThreads:     2,
 		QueryTimeout:   "30s",

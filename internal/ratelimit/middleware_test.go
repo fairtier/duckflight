@@ -9,6 +9,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/ratelimit"
 	"github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
@@ -30,7 +31,7 @@ type RateLimitSuite struct {
 }
 
 func (s *RateLimitSuite) SetupSuite() {
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "256MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",
@@ -95,7 +96,7 @@ type ExceededSuite struct {
 }
 
 func (s *ExceededSuite) SetupSuite() {
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "256MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",
@@ -166,7 +167,7 @@ type BurstSuite struct {
 }
 
 func (s *BurstSuite) SetupSuite() {
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "256MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",
@@ -246,7 +247,7 @@ type DisabledSuite struct {
 }
 
 func (s *DisabledSuite) SetupSuite() {
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "256MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",

@@ -12,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -33,7 +34,7 @@ import (
 //
 //	go test -tags=duckdb_arrow -count=1 -run TestSIGSEGV_IngestThenGetTablesWithSchema ./internal/server/...
 func TestSIGSEGV_IngestThenGetTablesWithSchema(t *testing.T) {
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",

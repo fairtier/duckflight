@@ -18,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -113,7 +114,7 @@ func newLoadEnv(t testing.TB, poolSize, numClients int) *loadEnv {
 	t.Helper()
 	ensureTestMetrics()
 
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   4,
 		QueryTimeout: "120s",
@@ -1111,7 +1112,7 @@ func newLoadBenchEnv(b *testing.B, poolSize int) *loadEnv {
 	b.Helper()
 	ensureTestMetrics()
 
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   4,
 		QueryTimeout: "60s",

@@ -15,6 +15,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
@@ -39,7 +40,7 @@ type DuckFlightSQLSuite struct {
 func (s *DuckFlightSQLSuite) SetupSuite() {
 	ensureTestMetrics()
 
-	srv, err := server.New(server.Config{
+	srv, err := server.New(&config.Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   2,
 		QueryTimeout: "10s",

@@ -17,6 +17,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/prochac/duckflight/internal/auth"
+	"github.com/prochac/duckflight/internal/config"
 	"github.com/prochac/duckflight/internal/ratelimit"
 	duckserver "github.com/prochac/duckflight/internal/server"
 	"github.com/prochac/duckflight/internal/telemetry"
@@ -66,7 +67,7 @@ func main() {
 	duckserver.InitMetrics(meter)
 	ratelimit.InitMetrics(meter)
 
-	cfg := duckserver.Config{
+	cfg := &config.Config{
 		MemoryLimit:         envOr("MEMORY_LIMIT", "1GB"),
 		MaxThreads:          envInt("MAX_THREADS", 4),
 		QueryTimeout:        envOr("QUERY_TIMEOUT", "30s"),
