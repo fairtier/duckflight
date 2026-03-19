@@ -11,6 +11,7 @@ import (
 	"io"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/apache/arrow-adbc/go/adbc"
 	flightsqldriver "github.com/apache/arrow-adbc/go/adbc/driver/flightsql"
@@ -95,6 +96,19 @@ func (s *ADBCSuite) SetupTest() {
 }
 
 func (s *ADBCSuite) TearDownTest() {
+	// The ADBC driver may cancel gRPC streams before server-side
+	// goroutines run their deferred cleanup (active query decrement,
+	// pool release). Wait briefly for in-flight operations to drain.
+	pool := s.srv.Engine().Pool
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if s.srv.OpenTransactionCount() == 0 &&
+			s.srv.ActiveQueryCount() == 0 &&
+			pool.Cap() == pool.Len() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	s.Assert().Equal(0, s.srv.OpenTransactionCount(), "leaked transactions")
 	// Note: PreparedStatementCount is not checked here because the ADBC
 	// FlightSQL driver does not always call ClosePreparedStatement when

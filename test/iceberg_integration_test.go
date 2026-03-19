@@ -215,7 +215,7 @@ func (s *IcebergSuite) SetupSuite() {
 	s.server = flight.NewServerWithMiddleware(nil)
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
 	s.Require().NoError(s.server.Init("localhost:0"))
-	go s.server.Serve()
+	go func() { _ = s.server.Serve() }()
 
 	cl, err := flightsql.NewClient(
 		s.server.Addr().String(),
@@ -230,7 +230,7 @@ func (s *IcebergSuite) TearDownSuite() {
 	ctx := context.Background()
 
 	if s.client != nil {
-		s.client.Close()
+		_ = s.client.Close()
 	}
 	if s.server != nil {
 		s.server.Shutdown()
@@ -270,16 +270,19 @@ func (s *IcebergSuite) httpPost(url string, body any) []byte {
 	data, err := json.Marshal(body)
 	s.Require().NoError(err)
 
-	resp, err := http.Post(url, "application/json", bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(data))
+	s.Require().NoError(err)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
 	s.Require().NoError(err)
 	respBody, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
+	_ = resp.Body.Close()
 	s.Require().True(resp.StatusCode >= 200 && resp.StatusCode < 300,
 		"POST %s returned %d: %s", url, resp.StatusCode, string(respBody))
 	return respBody
 }
 
-func (s *IcebergSuite) execQuery(query string) (*arrow.Schema, []arrow.RecordBatch) {
+func (s *IcebergSuite) execQuery(query string) []arrow.RecordBatch {
 	ctx := context.Background()
 	info, err := s.client.Execute(ctx, query)
 	s.Require().NoError(err)
@@ -295,8 +298,7 @@ func (s *IcebergSuite) execQuery(query string) (*arrow.Schema, []arrow.RecordBat
 		recs = append(recs, rec)
 	}
 	s.Require().NoError(rdr.Err())
-	schema := rdr.Schema()
-	return schema, recs
+	return recs
 }
 
 func releaseRecs(recs []arrow.RecordBatch) {
@@ -321,7 +323,7 @@ func (s *IcebergSuite) TestIceberg_WriteAndReadBack() {
 	s.Require().NoError(err)
 	s.EqualValues(2, result)
 
-	_, recs := s.execQuery("SELECT id, name FROM test_rw ORDER BY id")
+	recs := s.execQuery("SELECT id, name FROM test_rw ORDER BY id")
 	defer releaseRecs(recs)
 
 	s.Require().NotEmpty(recs)
@@ -392,7 +394,7 @@ func (s *IcebergSuite) TestIceberg_TransactionCommit() {
 
 	s.Require().NoError(tx.Commit(ctx))
 
-	_, recs := s.execQuery("SELECT * FROM txn_commit")
+	recs := s.execQuery("SELECT * FROM txn_commit")
 	defer releaseRecs(recs)
 
 	var totalRows int64
@@ -418,7 +420,7 @@ func (s *IcebergSuite) TestIceberg_TransactionRollback() {
 
 	s.Require().NoError(tx.Rollback(ctx))
 
-	_, recs := s.execQuery("SELECT * FROM txn_rollback")
+	recs := s.execQuery("SELECT * FROM txn_rollback")
 	defer releaseRecs(recs)
 
 	var totalRows int64
