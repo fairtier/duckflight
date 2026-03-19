@@ -57,10 +57,17 @@ func (s *DuckFlightSQLServer) streamMetadata(
 				cols[i] = rec.Column(i)
 			}
 			out := array.NewRecordBatch(schema, cols, rec.NumRows())
-			ch <- flight.StreamChunk{Data: out}
+			select {
+			case ch <- flight.StreamChunk{Data: out}:
+			case <-ctx.Done():
+				return
+			}
 		}
 		if err := rdr.Err(); err != nil {
-			ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}
+			select {
+			case ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}:
+			case <-ctx.Done():
+			}
 		}
 	}()
 	return schema, ch, nil
@@ -160,7 +167,10 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			// Bulk-fetch column metadata for all tables in this batch.
 			schemas, err := s.buildBatchTableSchemas(ctx, ac, catCol, schCol, nameCol)
 			if err != nil {
-				ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "build schemas: %s", err)}
+				select {
+				case ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "build schemas: %s", err)}:
+				case <-ctx.Done():
+				}
 				return
 			}
 
@@ -186,10 +196,17 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			out := array.NewRecordBatch(schema_ref.TablesWithIncludedSchema, cols, nrows)
 			schemaArr.Release()
 
-			ch <- flight.StreamChunk{Data: out}
+			select {
+			case ch <- flight.StreamChunk{Data: out}:
+			case <-ctx.Done():
+				return
+			}
 		}
 		if err := rdr.Err(); err != nil {
-			ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}
+			select {
+			case ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}:
+			case <-ctx.Done():
+			}
 		}
 	}()
 

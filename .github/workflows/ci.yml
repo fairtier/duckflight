@@ -35,4 +35,17 @@ jobs:
           go-version-file: go.mod
 
       - name: Run tests
-        run: go test -tags=duckdb_arrow -race -count=1 ./test/... ./internal/...
+        run: go test -tags=duckdb_arrow -race -count=1 ./internal/...
+
+  integration:
+    name: Integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run Iceberg integration tests
+        run: go test -tags="duckdb_arrow" -race -count=1 -timeout=10m ./test/...

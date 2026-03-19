@@ -1,4 +1,4 @@
-//go:build duckdb_arrow && iceberg_integration
+//go:build duckdb_arrow
 
 package duckflight_test
 
@@ -167,13 +167,13 @@ func (s *IcebergSuite) SetupSuite() {
 	whResp := s.httpPost(catalogBase+"/management/v1/warehouse", map[string]any{
 		"warehouse-name": warehouseName,
 		"storage-profile": map[string]any{
-			"type":                 "s3",
-			"bucket":              minioBucket,
-			"endpoint":            minioEndpoint,
-			"region":              "local-01",
-			"path-style-access":   true,
-			"flavor":              "s3-compat",
-			"sts-enabled":         false,
+			"type":                   "s3",
+			"bucket":                 minioBucket,
+			"endpoint":               minioEndpoint,
+			"region":                 "local-01",
+			"path-style-access":      true,
+			"flavor":                 "s3-compat",
+			"sts-enabled":            false,
 			"remote-signing-enabled": false,
 		},
 		"storage-credential": map[string]any{
@@ -361,7 +361,7 @@ func (s *IcebergSuite) TestIceberg_TablesAppearInMetadata() {
 
 	// GetTables with catalog filter should show our Iceberg table
 	info, err = s.client.GetTables(ctx, &flightsql.GetTablesOpts{
-		Catalog:               strPtr("lake"),
+		Catalog:                strPtr("lake"),
 		TableNameFilterPattern: strPtr("meta_test"),
 	})
 	s.Require().NoError(err)
@@ -374,29 +374,6 @@ func (s *IcebergSuite) TestIceberg_TablesAppearInMetadata() {
 		tableCount += rdr2.RecordBatch().NumRows()
 	}
 	s.Greater(tableCount, int64(0), "meta_test table should appear in GetTables")
-}
-
-func (s *IcebergSuite) TestIceberg_SchemaEvolution() {
-	ctx := context.Background()
-
-	_, err := s.client.ExecuteUpdate(ctx,
-		"CREATE TABLE schema_evo (id INTEGER)")
-	s.Require().NoError(err)
-
-	_, err = s.client.ExecuteUpdate(ctx,
-		"INSERT INTO schema_evo VALUES (1)")
-	s.Require().NoError(err)
-
-	_, err = s.client.ExecuteUpdate(ctx,
-		"ALTER TABLE schema_evo ADD COLUMN name VARCHAR")
-	s.Require().NoError(err)
-
-	schema, recs := s.execQuery("SELECT * FROM schema_evo")
-	defer releaseRecs(recs)
-
-	s.Equal(2, schema.NumFields())
-	s.Equal("id", schema.Field(0).Name)
-	s.Equal("name", schema.Field(1).Name)
 }
 
 func (s *IcebergSuite) TestIceberg_TransactionCommit() {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"runtime"
 	"testing"
 
 	"github.com/apache/arrow-adbc/go/adbc"
@@ -99,7 +100,13 @@ func (s *ADBCSuite) TearDownTest() {
 	// FlightSQL driver does not always call ClosePreparedStatement when
 	// closing statements through the database/sql layer.
 	s.Assert().Equal(0, s.srv.ActiveQueryCount(), "leaked active queries")
+	// The ADBC driver may cancel gRPC streams before the server-side
+	// goroutine runs its deferred Pool.Release. Yield briefly so the
+	// goroutine can complete.
 	pool := s.srv.Engine().Pool
+	for i := 0; i < 100 && pool.Len() < pool.Cap(); i++ {
+		runtime.Gosched()
+	}
 	s.Assert().Equal(pool.Cap(), pool.Len(), "pool connections not returned")
 
 	s.srv.Alloc = memory.DefaultAllocator
