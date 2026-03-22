@@ -4,10 +4,16 @@ on:
   push:
     tags: ["helm/v*"]
 
+env:
+  REGISTRY: ghcr.io
+
 jobs:
   helm:
     name: Helm
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v6
 
@@ -16,11 +22,17 @@ jobs:
       - name: Helm lint
         run: helm lint helm/duckflight/
 
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin
+
+      - name: Set chart version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#helm/v}"
+          yq -i ".version = \"${VERSION}\"" helm/duckflight/Chart.yaml
+          yq -i ".appVersion = \"${VERSION}\"" helm/duckflight/Chart.yaml
+
       - name: Helm package
         run: helm package helm/duckflight/
 
-      - name: Upload chart artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: helm-chart
-          path: "*.tgz"
+      - name: Push chart to GHCR
+        run: helm push duckflight-*.tgz oci://${{ env.REGISTRY }}/fairtier/charts
