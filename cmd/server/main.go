@@ -83,6 +83,7 @@ func main() {
 		S3SecretKey:         os.Getenv("S3_SECRET_KEY"),
 		S3Region:            os.Getenv("S3_REGION"),
 		S3URLStyle:          os.Getenv("S3_URL_STYLE"),
+		ExtensionDir:        os.Getenv("EXTENSION_DIR"),
 	}
 
 	srv, err := duckserver.New(cfg)

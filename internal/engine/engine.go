@@ -31,13 +31,15 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 			fmt.Sprintf("SET threads = %d", cfg.MaxThreads),
 		}
 
+		if cfg.ExtensionDir != "" {
+			bootSQL = append(bootSQL, fmt.Sprintf("SET extension_directory = '%s'", cfg.ExtensionDir))
+		}
+
 		if cfg.IcebergEndpoint != "" {
 			if !staticExtensions {
-				bootSQL = append(bootSQL,
-					"INSTALL iceberg",
-					"LOAD iceberg",
-				)
+				bootSQL = append(bootSQL, "INSTALL iceberg")
 			}
+			bootSQL = append(bootSQL, "LOAD iceberg")
 
 			// Catalog auth (OAuth2) — optional
 			if cfg.IcebergClientID != "" {

@@ -27,6 +27,9 @@ type Config struct {
 	S3Region    string
 	S3URLStyle  string // "path" for MinIO, "vhost" for AWS (default)
 
+	// Extensions
+	ExtensionDir string // custom extension_directory for pre-installed extensions
+
 	// Server
 	ListenAddr string
 
