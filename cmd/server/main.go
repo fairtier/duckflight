@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
@@ -50,19 +51,21 @@ func main() {
 		slog.Error("failed to setup telemetry", slog.String("error", err.Error()))
 		os.Exit(1)
 	}
+	defer func() {
+		shCtx, shCancel := context.WithTimeout(context.Background(), time.Second*3)
+		defer shCancel()
+		if err := tel.Shutdown(shCtx); err != nil {
+			slog.Error("telemetry shutdown error", slog.String("error", err.Error()))
+		}
+	}()
 
 	// Wire slog to OTel log SDK via otelslog bridge.
+	// The LoggerProvider always exports to stderr; when OTLP is configured it also exports to the collector.
 	slog.SetDefault(slog.New(newLevelHandler(&level,
 		otelslog.NewHandler("duckflight",
 			otelslog.WithLoggerProvider(tel.LoggerProvider()),
 		),
 	)))
-	defer func() {
-		if err := tel.Shutdown(ctx); err != nil {
-			slog.Error("telemetry shutdown error", slog.String("error", err.Error()))
-		}
-	}()
-
 	// Initialize OTel metrics.
 	meter := otel.GetMeterProvider().Meter("duckflight")
 	duckserver.InitMetrics(meter)

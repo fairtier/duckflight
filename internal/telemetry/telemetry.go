@@ -3,13 +3,14 @@ package telemetry
 import (
 	"context"
 	"fmt"
+	"os"
 
 	promclient "github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
-	"go.opentelemetry.io/otel/exporters/stdout/stdoutlog"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/exporters/stdout/stdoutlog"
 	"go.opentelemetry.io/otel/log/global"
 	sdklog "go.opentelemetry.io/otel/sdk/log"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
@@ -89,8 +90,15 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	t.Gatherer = registry
 	otel.SetMeterProvider(mp)
 
-	// Logging: OTLP exporter when endpoint is set, stdout otherwise.
-	var logExporter sdklog.Exporter
+	// Logging: always export to stderr; additionally export via OTLP when endpoint is set.
+	stderrExporter, err := stdoutlog.New(stdoutlog.WithWriter(os.Stderr))
+	if err != nil {
+		return nil, fmt.Errorf("creating stderr log exporter: %w", err)
+	}
+	lpOpts := []sdklog.LoggerProviderOption{
+		sdklog.WithProcessor(sdklog.NewBatchProcessor(stderrExporter)),
+		sdklog.WithResource(res),
+	}
 	if cfg.OTLPEndpoint != "" {
 		logOpts := []otlploggrpc.Option{
 			otlploggrpc.WithEndpoint(cfg.OTLPEndpoint),
@@ -98,20 +106,13 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 		if cfg.Insecure {
 			logOpts = append(logOpts, otlploggrpc.WithDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())))
 		}
-		logExporter, err = otlploggrpc.New(ctx, logOpts...)
+		otlpExporter, err := otlploggrpc.New(ctx, logOpts...)
 		if err != nil {
 			return nil, fmt.Errorf("creating log exporter: %w", err)
 		}
-	} else {
-		logExporter, err = stdoutlog.New()
-		if err != nil {
-			return nil, fmt.Errorf("creating stdout log exporter: %w", err)
-		}
+		lpOpts = append(lpOpts, sdklog.WithProcessor(sdklog.NewBatchProcessor(otlpExporter)))
 	}
-	lp := sdklog.NewLoggerProvider(
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
-		sdklog.WithResource(res),
-	)
+	lp := sdklog.NewLoggerProvider(lpOpts...)
 	t.loggerProvider = lp
 	global.SetLoggerProvider(lp)
 
