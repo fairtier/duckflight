@@ -29,6 +29,10 @@ spec:
               value: "0.0.0.0:31337"
             - name: METRIC_ADDR
               value: "0.0.0.0:9090"
+            {{- if .Values.logLevel }}
+            - name: LOG_LEVEL
+              value: {{ .Values.logLevel | quote }}
+            {{- end }}
             - name: MEMORY_LIMIT
               value: {{ .Values.resources.memoryLimit | quote }}
             - name: MAX_THREADS
@@ -37,10 +41,22 @@ spec:
               value: {{ .Values.resources.queryTimeout | quote }}
             - name: POOL_SIZE
               value: {{ .Values.resources.poolSize | quote }}
+            {{- if .Values.resources.maxResultBytes }}
+            - name: MAX_RESULT_BYTES
+              value: {{ .Values.resources.maxResultBytes | quote }}
+            {{- end }}
+            {{- if .Values.resources.extensionDir }}
+            - name: EXTENSION_DIR
+              value: {{ .Values.resources.extensionDir | quote }}
+            {{- end }}
             - name: ICEBERG_ENDPOINT
               value: {{ .Values.iceberg.endpoint | quote }}
             - name: ICEBERG_WAREHOUSE
               value: {{ .Values.iceberg.warehouse | quote }}
+            {{- if .Values.iceberg.oauth2URI }}
+            - name: ICEBERG_OAUTH2_URI
+              value: {{ .Values.iceberg.oauth2URI | quote }}
+            {{- end }}
             {{- if .Values.iceberg.existingSecret }}
             - name: ICEBERG_CLIENT_ID
               valueFrom:
@@ -76,6 +92,33 @@ spec:
             {{- if .Values.s3.urlStyle }}
             - name: S3_URL_STYLE
               value: {{ .Values.s3.urlStyle | quote }}
+            {{- end }}
+            {{- if .Values.auth.existingSecret }}
+            - name: AUTH_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: auth-tokens
+            {{- end }}
+            {{- if .Values.rateLimit.rps }}
+            - name: RATE_LIMIT_RPS
+              value: {{ .Values.rateLimit.rps | quote }}
+            {{- end }}
+            {{- if .Values.rateLimit.burst }}
+            - name: RATE_LIMIT_BURST
+              value: {{ .Values.rateLimit.burst | quote }}
+            {{- end }}
+            {{- if .Values.otel.endpoint }}
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: {{ .Values.otel.endpoint | quote }}
+            {{- end }}
+            {{- if .Values.otel.serviceName }}
+            - name: OTEL_SERVICE_NAME
+              value: {{ .Values.otel.serviceName | quote }}
+            {{- end }}
+            {{- if .Values.otel.insecure }}
+            - name: OTEL_EXPORTER_OTLP_INSECURE
+              value: "true"
             {{- end }}
             {{- if .Values.tls.enabled }}
             - name: TLS_CERT

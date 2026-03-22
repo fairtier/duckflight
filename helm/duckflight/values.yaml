@@ -5,9 +5,12 @@ image:
 
 tenant: ""
 
+logLevel: ""  # DEBUG, INFO, WARN, ERROR (default: INFO)
+
 iceberg:
   endpoint: ""
   warehouse: ""
+  oauth2URI: ""  # OAuth2 token endpoint
   existingSecret: "iceberg-credentials"  # must have client-id, client-secret keys
 
 s3:
@@ -21,11 +24,25 @@ tls:
   existingSecret: ""  # Kubernetes TLS secret with tls.crt and tls.key
   caSecret: ""        # Secret with ca.crt for mTLS (optional)
 
+auth:
+  existingSecret: ""  # must have auth-tokens key (comma-separated bearer tokens)
+
+rateLimit:
+  rps: 0      # requests per second (0 = disabled)
+  burst: 0    # burst size
+
+otel:
+  endpoint: ""    # OTLP endpoint
+  serviceName: "" # service name (default: duckflight)
+  insecure: false # use insecure connection
+
 resources:
   memoryLimit: "2GB"
   maxThreads: 4
   queryTimeout: "60s"
   poolSize: 8
+  maxResultBytes: 0  # max bytes per query result (0 = unlimited)
+  extensionDir: ""   # custom DuckDB extension directory
 
   requests:
     memory: "2560Mi"
