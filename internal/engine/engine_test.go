@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prochac/duckflight/internal/config"
+	"github.com/fairtier/duckflight/internal/config"
 )
 
 func newTestEngine(t *testing.T) *Engine {

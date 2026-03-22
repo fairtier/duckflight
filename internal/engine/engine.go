@@ -9,7 +9,7 @@ import (
 	"sync"
 
 	"github.com/duckdb/duckdb-go/v2"
-	"github.com/prochac/duckflight/internal/config"
+	"github.com/fairtier/duckflight/internal/config"
 )
 
 // Engine owns the DuckDB connector, runs boot SQL, and provides

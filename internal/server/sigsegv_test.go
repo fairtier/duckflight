@@ -12,8 +12,8 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/prochac/duckflight/internal/config"
-	"github.com/prochac/duckflight/internal/server"
+	"github.com/fairtier/duckflight/internal/config"
+	"github.com/fairtier/duckflight/internal/server"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )

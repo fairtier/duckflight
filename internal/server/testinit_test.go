@@ -5,10 +5,10 @@ package server_test
 import (
 	"sync"
 
+	"github.com/fairtier/duckflight/internal/server"
 	promclient "github.com/prometheus/client_golang/prometheus"
 	otelprom "go.opentelemetry.io/otel/exporters/prometheus"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
-	"github.com/prochac/duckflight/internal/server"
 )
 
 var (

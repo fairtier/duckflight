@@ -12,7 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
-	"github.com/prochac/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )

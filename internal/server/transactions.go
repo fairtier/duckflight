@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
-	"github.com/prochac/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/engine"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"

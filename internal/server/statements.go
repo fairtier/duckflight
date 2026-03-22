@@ -16,7 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	duckdb "github.com/duckdb/duckdb-go/v2"
-	"github.com/prochac/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/engine"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
