@@ -27,6 +27,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/reflection"
 )
 
 func main() {
@@ -149,6 +150,7 @@ func main() {
 
 	server := flight.NewServerWithMiddleware(middlewares, grpcOpts...)
 	server.RegisterFlightService(flightsql.NewFlightServer(duckserver.NewLoggingServer(srv)))
+	reflection.Register(server)
 
 	addr := envOr("LISTEN_ADDR", "0.0.0.0:31337")
 	if err := server.Init(addr); err != nil {
