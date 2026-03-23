@@ -96,7 +96,7 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 		return nil, fmt.Errorf("creating stderr log exporter: %w", err)
 	}
 	lpOpts := []sdklog.LoggerProviderOption{
-		sdklog.WithProcessor(sdklog.NewBatchProcessor(stderrExporter)),
+		sdklog.WithProcessor(sdklog.NewSimpleProcessor(stderrExporter)),
 		sdklog.WithResource(res),
 	}
 	if cfg.OTLPEndpoint != "" {

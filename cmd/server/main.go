@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -32,6 +33,12 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	var level slog.LevelVar
 	if lvl := os.Getenv("LOG_LEVEL"); lvl != "" {
 		if err := level.UnmarshalText([]byte(lvl)); err != nil {
@@ -49,7 +56,7 @@ func main() {
 	})
 	if err != nil {
 		slog.Error("failed to setup telemetry", slog.String("error", err.Error()))
-		os.Exit(1)
+		return err
 	}
 	defer func() {
 		shCtx, shCancel := context.WithTimeout(context.Background(), time.Second*3)
@@ -93,7 +100,7 @@ func main() {
 	srv, err := duckserver.New(cfg)
 	if err != nil {
 		slog.Error("failed to create server", slog.String("error", err.Error()))
-		os.Exit(1)
+		return err
 	}
 
 	// Auth middleware — set AUTH_TOKENS env var (comma-separated) to enable.
@@ -128,7 +135,7 @@ func main() {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			slog.Error("failed to load TLS certificate", slog.String("error", err.Error()))
-			os.Exit(1)
+			return err
 		}
 		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
 
@@ -136,12 +143,12 @@ func main() {
 			caPEM, err := os.ReadFile(caFile)
 			if err != nil {
 				slog.Error("failed to read TLS CA", slog.String("error", err.Error()))
-				os.Exit(1)
+				return err
 			}
 			pool := x509.NewCertPool()
 			if !pool.AppendCertsFromPEM(caPEM) {
 				slog.Error("failed to parse TLS CA certificate")
-				os.Exit(1)
+				return fmt.Errorf("failed to parse TLS CA certificate")
 			}
 			tlsCfg.ClientCAs = pool
 			tlsCfg.ClientAuth = tls.RequireAndVerifyClientCert
@@ -158,7 +165,7 @@ func main() {
 	addr := envOr("LISTEN_ADDR", "0.0.0.0:31337")
 	if err := server.Init(addr); err != nil {
 		slog.Error("failed to init server", slog.String("error", err.Error()))
-		os.Exit(1)
+		return err
 	}
 
 	// Metrics endpoint
@@ -186,6 +193,7 @@ func main() {
 
 	slog.Info("shutting down")
 	server.Shutdown()
+	return nil
 }
 
 func envOr(key, fallback string) string {
