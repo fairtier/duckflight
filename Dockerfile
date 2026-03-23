@@ -15,13 +15,19 @@ ARG TARGETARCH
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download github.com/duckdb/duckdb-go/v2
+# Download iceberg + runtime dependencies not statically linked.
+# json, parquet, icu are already built into the duckdb-go binary.
+# avro is a new transitive dependency of the iceberg extension.
 RUN DUCKDB_VERSION=$(grep -m1 '^DUCKDB_VERSION=' \
       "$(go env GOMODCACHE)"/github.com/duckdb/duckdb-go/v2@*/Makefile \
       | cut -d= -f2) && \
     DUCKDB_PLATFORM="linux_${TARGETARCH}" && \
-    mkdir -p "/extensions/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}" && \
-    curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}/iceberg.duckdb_extension.gz" \
-      | gunzip > "/extensions/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}/iceberg.duckdb_extension"
+    EXT_DIR="/extensions/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}" && \
+    mkdir -p "${EXT_DIR}" && \
+    for ext in iceberg avro; do \
+      curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}/${ext}.duckdb_extension.gz" \
+        | gunzip > "${EXT_DIR}/${ext}.duckdb_extension"; \
+    done
 
 FROM debian:trixie-slim
 RUN apt-get update && \
