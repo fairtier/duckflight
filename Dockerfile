@@ -24,7 +24,7 @@ RUN DUCKDB_VERSION=$(grep -m1 '^DUCKDB_VERSION=' \
     DUCKDB_PLATFORM="linux_${TARGETARCH}" && \
     EXT_DIR="/extensions/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}" && \
     mkdir -p "${EXT_DIR}" && \
-    for ext in iceberg avro; do \
+    for ext in iceberg avro httpfs; do \
       curl -fsSL "https://extensions.duckdb.org/${DUCKDB_VERSION}/${DUCKDB_PLATFORM}/${ext}.duckdb_extension.gz" \
         | gunzip > "${EXT_DIR}/${ext}.duckdb_extension"; \
     done
