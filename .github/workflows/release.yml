@@ -52,6 +52,12 @@ jobs:
           cache-from: type=gha,scope=build-${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=build-${{ matrix.platform }}
 
+      - name: Prepare platform slug
+        id: platform
+        run: echo "slug=${PLATFORM//\//-}" >> "$GITHUB_OUTPUT"
+        env:
+          PLATFORM: ${{ matrix.platform }}
+
       - name: Export digest
         run: |
           mkdir -p /tmp/digests
@@ -61,7 +67,7 @@ jobs:
       - name: Upload digest
         uses: actions/upload-artifact@v4
         with:
-          name: digests-${{ hashFiles('/tmp/digests/*') }}
+          name: digests-${{ steps.platform.outputs.slug }}
           path: /tmp/digests/*
           if-no-files-found: error
           retention-days: 1
