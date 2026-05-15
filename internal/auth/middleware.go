@@ -6,12 +6,19 @@ import (
 	"crypto/subtle"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// healthMethodPrefix matches grpc.health.v1.Health/Check and /Watch.
+// Kubernetes gRPC probes can't send bearer tokens, so the auth middleware
+// must let health RPCs through unconditionally.
+const healthMethodPrefix = "/grpc.health.v1.Health/"
 
 // Config bundles every auth backend the server can be wired with. Any nil/zero
 // field disables that backend; if all are zero, Middleware returns nil and
@@ -62,7 +69,21 @@ func Middleware(cfg Config) (*flight.ServerMiddleware, error) {
 		v.local = newLocalJWT(secret, ttl)
 	}
 
-	m := flight.CreateServerBasicAuthMiddleware(v)
+	inner := flight.CreateServerBasicAuthMiddleware(v)
+	m := flight.ServerMiddleware{
+		Unary: func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if strings.HasPrefix(info.FullMethod, healthMethodPrefix) {
+				return handler(ctx, req)
+			}
+			return inner.Unary(ctx, req, info, handler)
+		},
+		Stream: func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+			if strings.HasPrefix(info.FullMethod, healthMethodPrefix) {
+				return handler(srv, ss)
+			}
+			return inner.Stream(srv, ss, info, handler)
+		},
+	}
 	return &m, nil
 }
 
