@@ -12,8 +12,11 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors"
+	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/selector"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 )
 
@@ -452,18 +455,32 @@ func GRPCLoggingMiddleware() flight.ServerMiddleware {
 		slog.LogAttrs(ctx, slog.LevelInfo, "grpc call", attrs...)
 	}
 
+	notHealth := selector.MatchFunc(func(_ context.Context, callMeta interceptors.CallMeta) bool {
+		switch callMeta.FullMethod() {
+		case grpc_health_v1.Health_Check_FullMethodName,
+			grpc_health_v1.Health_List_FullMethodName,
+			grpc_health_v1.Health_Watch_FullMethodName:
+			return false
+		}
+		return true
+	})
+
+	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		start := time.Now()
+		resp, err := handler(ctx, req)
+		logGRPC(ctx, info.FullMethod, start, err)
+		return resp, err
+	}
+
+	stream := func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+		start := time.Now()
+		err := handler(srv, ss)
+		logGRPC(ss.Context(), info.FullMethod, start, err)
+		return err
+	}
+
 	return flight.ServerMiddleware{
-		Unary: func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-			start := time.Now()
-			resp, err := handler(ctx, req)
-			logGRPC(ctx, info.FullMethod, start, err)
-			return resp, err
-		},
-		Stream: func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-			start := time.Now()
-			err := handler(srv, ss)
-			logGRPC(ss.Context(), info.FullMethod, start, err)
-			return err
-		},
+		Unary:  selector.UnaryServerInterceptor(unary, notHealth),
+		Stream: selector.StreamServerInterceptor(stream, notHealth),
 	}
 }
