@@ -73,32 +73,37 @@ Without Iceberg configuration, the server starts with a plain in-memory DuckDB �
 
 All configuration is via environment variables:
 
-| Variable                | Default         | Description                                           |
-|-------------------------|-----------------|-------------------------------------------------------|
-| `LISTEN_ADDR`           | `0.0.0.0:31337` | gRPC listen address                                   |
-| `METRIC_ADDR`           | `0.0.0.0:9090`  | Prometheus metrics address                            |
-| `MEMORY_LIMIT`          | `1GB`           | DuckDB memory limit                                   |
-| `MAX_THREADS`           | `4`             | DuckDB thread count                                   |
-| `QUERY_TIMEOUT`         | `30s`           | DuckDB statement timeout                              |
-| `POOL_SIZE`             | `8`             | Arrow connection pool size                            |
-| `MAX_RESULT_BYTES`      | `0`             | Max bytes per query result (0 = unlimited)            |
-| `AUTH_TOKENS`           |                 | Comma-separated bearer tokens (empty = auth disabled) |
-| `RATE_LIMIT_RPS`        | `0`             | Max requests per second (0 = disabled)                |
-| `RATE_LIMIT_BURST`      | `0`             | Burst size (0 = defaults to RPS value)                |
-| `TLS_CERT`              |                 | Path to TLS certificate file (PEM)                    |
-| `TLS_KEY`               |                 | Path to TLS private key file (PEM)                    |
-| `TLS_CA`                |                 | Path to CA cert for client verification (mTLS)        |
-| `ICEBERG_ENDPOINT`      |                 | Iceberg REST Catalog URL                              |
-| `ICEBERG_WAREHOUSE`     |                 | Warehouse name to ATTACH                              |
-| `ICEBERG_CLIENT_ID`     |                 | OAuth2 client ID for catalog auth                     |
-| `ICEBERG_CLIENT_SECRET` |                 | OAuth2 client secret                                  |
-| `ICEBERG_OAUTH2_URI`    |                 | OAuth2 token endpoint                                 |
-| `S3_ENDPOINT`           |                 | S3-compatible storage endpoint                        |
-| `S3_ACCESS_KEY`         |                 | S3 access key                                         |
-| `S3_SECRET_KEY`         |                 | S3 secret key                                         |
-| `S3_REGION`             |                 | S3 region                                             |
-| `S3_URL_STYLE`          |                 | `path` for MinIO, `vhost` for AWS                     |
-| `LOG_LEVEL`             | `INFO`          | Log level: DEBUG, INFO, WARN, ERROR                   |
+| Variable                | Default         | Description                                                                                                            |
+|-------------------------|-----------------|------------------------------------------------------------------------------------------------------------------------|
+| `LISTEN_ADDR`           | `0.0.0.0:31337` | gRPC listen address                                                                                                    |
+| `METRIC_ADDR`           | `0.0.0.0:9090`  | Prometheus metrics address                                                                                             |
+| `MEMORY_LIMIT`          | `1GB`           | DuckDB memory limit                                                                                                    |
+| `MAX_THREADS`           | `4`             | DuckDB thread count                                                                                                    |
+| `QUERY_TIMEOUT`         | `30s`           | DuckDB statement timeout                                                                                               |
+| `POOL_SIZE`             | `8`             | Arrow connection pool size                                                                                             |
+| `MAX_RESULT_BYTES`      | `0`             | Max bytes per query result (0 = unlimited)                                                                             |
+| `AUTH_TOKENS`           |                 | Comma-separated opaque bearer tokens (long-lived API keys)                                                             |
+| `AUTH_USERS`            |                 | Comma-separated `user:password` pairs for the Flight Handshake basic-auth flow                                         |
+| `AUTH_JWT_SECRET`       |                 | HMAC secret signing handshake-issued JWTs (required when `AUTH_USERS` is set; auto-generated otherwise with a warning) |
+| `AUTH_JWT_TTL`          | `1h`            | Lifetime of handshake-issued JWTs                                                                                      |
+| `OIDC_ISSUER`           |                 | OIDC issuer URL; enables JWT validation against its JWKS                                                               |
+| `OIDC_AUDIENCE`         |                 | Optional; if set, JWT `aud` claim must contain this value                                                              |
+| `RATE_LIMIT_RPS`        | `0`             | Max requests per second (0 = disabled)                                                                                 |
+| `RATE_LIMIT_BURST`      | `0`             | Burst size (0 = defaults to RPS value)                                                                                 |
+| `TLS_CERT`              |                 | Path to TLS certificate file (PEM)                                                                                     |
+| `TLS_KEY`               |                 | Path to TLS private key file (PEM)                                                                                     |
+| `TLS_CA`                |                 | Path to CA cert for client verification (mTLS)                                                                         |
+| `ICEBERG_ENDPOINT`      |                 | Iceberg REST Catalog URL                                                                                               |
+| `ICEBERG_WAREHOUSE`     |                 | Warehouse name to ATTACH                                                                                               |
+| `ICEBERG_CLIENT_ID`     |                 | OAuth2 client ID for catalog auth                                                                                      |
+| `ICEBERG_CLIENT_SECRET` |                 | OAuth2 client secret                                                                                                   |
+| `ICEBERG_OAUTH2_URI`    |                 | OAuth2 token endpoint                                                                                                  |
+| `S3_ENDPOINT`           |                 | S3-compatible storage endpoint                                                                                         |
+| `S3_ACCESS_KEY`         |                 | S3 access key                                                                                                          |
+| `S3_SECRET_KEY`         |                 | S3 secret key                                                                                                          |
+| `S3_REGION`             |                 | S3 region                                                                                                              |
+| `S3_URL_STYLE`          |                 | `path` for MinIO, `vhost` for AWS                                                                                      |
+| `LOG_LEVEL`             | `INFO`          | Log level: DEBUG, INFO, WARN, ERROR                                                                                    |
 
 ## Connecting
 
@@ -107,6 +112,42 @@ Any Flight SQL client works. Example with the ADBC Go driver:
 ```go
 db, _ := sql.Open("flightsql", "grpc://localhost:31337")
 rows, _ := db.QueryContext(ctx, "SELECT * FROM lake.default.my_table LIMIT 10")
+```
+
+## Authentication
+
+Three auth backends can be combined freely. With none configured, auth is disabled.
+
+Examples below use [databow](https://github.com/columnar-tech/databow), an ADBC CLI client.
+
+**Opaque bearer tokens** (`AUTH_TOKENS`) — long-lived API keys for service-to-service:
+
+```bash
+databow --driver flightsql --uri grpc+tcp://localhost:31337 \
+  --option "adbc.flight.sql.authorization_header=Bearer my_token" \
+  --query "SELECT 1"
+```
+
+**Local users via Flight Handshake** (`AUTH_USERS`) — username/password, server mints a short-lived JWT on Handshake:
+
+```bash
+AUTH_USERS="alice:secret123" AUTH_JWT_SECRET="$(openssl rand -hex 32)" ./duckflight
+# ...
+databow --driver flightsql --uri grpc+tcp://localhost:31337 \
+  --username alice --password secret123 --query "SELECT 1"
+```
+
+`AUTH_JWT_SECRET` must be set explicitly for multi-replica deployments so any pod can verify any pod's tokens.
+
+**OIDC** (`OIDC_ISSUER`) — clients fetch JWTs directly from your IdP; the server validates against its JWKS. ADBC's FlightSQL driver handles the OAuth2 flow including refresh:
+
+```bash
+databow --driver flightsql --uri grpc+tls://duckflight.example.com:443 \
+  --option "adbc.flight.sql.oauth.flow=client_credentials" \
+  --option "adbc.flight.sql.oauth.token_uri=https://idp.example.com/oauth/token" \
+  --option "adbc.flight.sql.oauth.client_id=…" \
+  --option "adbc.flight.sql.oauth.client_secret=…" \
+  --query "SELECT 1"
 ```
 
 ## Kubernetes deployment

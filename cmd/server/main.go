@@ -103,15 +103,24 @@ func run() error {
 		return err
 	}
 
-	// Auth middleware — set AUTH_TOKENS env var (comma-separated) to enable.
-	var authTokens []string
-	if t := os.Getenv("AUTH_TOKENS"); t != "" {
-		for _, tok := range strings.Split(t, ",") {
-			tok = strings.TrimSpace(tok)
-			if tok != "" {
-				authTokens = append(authTokens, tok)
-			}
+	authCfg := auth.Config{
+		Users:        parseUsers(os.Getenv("AUTH_USERS")),
+		JWTSecret:    []byte(os.Getenv("AUTH_JWT_SECRET")),
+		JWTTTL:       envDuration("AUTH_JWT_TTL", time.Hour),
+		StaticTokens: parseCSV(os.Getenv("AUTH_TOKENS")),
+	}
+	if iss := os.Getenv("OIDC_ISSUER"); iss != "" {
+		v, err := auth.NewOIDCVerifier(ctx, iss, os.Getenv("OIDC_AUDIENCE"))
+		if err != nil {
+			slog.Error("oidc setup failed", slog.String("issuer", iss), slog.String("error", err.Error()))
+			return err
 		}
+		authCfg.OIDC = v
+	}
+	authMW, err := auth.Middleware(authCfg)
+	if err != nil {
+		slog.Error("auth middleware setup failed", slog.String("error", err.Error()))
+		return err
 	}
 
 	// Rate limit middleware — set RATE_LIMIT_RPS env var to enable.
@@ -122,8 +131,8 @@ func run() error {
 	// Auth rejects unauthenticated requests before consuming rate limit tokens.
 	var middlewares []flight.ServerMiddleware
 	middlewares = append(middlewares, duckserver.GRPCLoggingMiddleware())
-	if m := auth.BearerTokenMiddleware(authTokens); m != nil {
-		middlewares = append(middlewares, *m)
+	if authMW != nil {
+		middlewares = append(middlewares, *authMW)
 	}
 	if m := ratelimit.Middleware(rateLimitRPS, rateLimitBurst); m != nil {
 		middlewares = append(middlewares, *m)
@@ -233,6 +242,53 @@ func envFloat64(key string, fallback float64) float64 {
 func envBool(key string) bool {
 	v := os.Getenv(key)
 	return v == "true" || v == "1"
+}
+
+func envDuration(key string, fallback time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return fallback
+}
+
+func parseCSV(v string) []string {
+	if v == "" {
+		return nil
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func parseUsers(v string) map[string]string {
+	if v == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, pair := range strings.Split(v, ",") {
+		pair = strings.TrimSpace(pair)
+		if pair == "" {
+			continue
+		}
+		user, pass, ok := strings.Cut(pair, ":")
+		if !ok || user == "" {
+			slog.Warn("AUTH_USERS entry missing ':' separator; skipping", slog.String("entry", pair))
+			continue
+		}
+		out[user] = pass
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // levelHandler filters log records below a minimum level.

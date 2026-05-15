@@ -99,6 +99,31 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.auth.existingSecret }}
                   key: auth-tokens
+                  optional: true
+            - name: AUTH_USERS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: auth-users
+                  optional: true
+            - name: AUTH_JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: jwt-secret
+                  optional: true
+            {{- end }}
+            {{- if .Values.auth.jwtTTL }}
+            - name: AUTH_JWT_TTL
+              value: {{ .Values.auth.jwtTTL | quote }}
+            {{- end }}
+            {{- if .Values.oidc.issuer }}
+            - name: OIDC_ISSUER
+              value: {{ .Values.oidc.issuer | quote }}
+            {{- end }}
+            {{- if .Values.oidc.audience }}
+            - name: OIDC_AUDIENCE
+              value: {{ .Values.oidc.audience | quote }}
             {{- end }}
             {{- if .Values.rateLimit.rps }}
             - name: RATE_LIMIT_RPS

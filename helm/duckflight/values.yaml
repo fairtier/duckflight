@@ -25,7 +25,17 @@ tls:
   caSecret: ""        # Secret with ca.crt for mTLS (optional)
 
 auth:
-  existingSecret: ""  # must have auth-tokens key (comma-separated bearer tokens)
+  # Optional Secret containing static bearer tokens, basic-auth users, and the
+  # JWT signing key. Recognized keys (all optional):
+  #   auth-tokens  — comma-separated opaque bearer tokens
+  #   auth-users   — comma-separated user:password pairs
+  #   jwt-secret   — HMAC secret used to sign handshake-issued JWTs
+  existingSecret: ""
+  jwtTTL: ""    # e.g. "1h"; default 1h when empty
+
+oidc:
+  issuer: ""    # full issuer URL; enables OIDC bearer-token acceptance
+  audience: ""  # optional; if set, JWT `aud` must match
 
 rateLimit:
   rps: 0      # requests per second (0 = disabled)
