@@ -29,6 +29,8 @@ import (
 	"go.opentelemetry.io/otel"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/health"
+	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/reflection"
 )
 
@@ -171,6 +173,10 @@ func run() error {
 	server.RegisterFlightService(flightsql.NewFlightServer(duckserver.NewLoggingServer(srv)))
 	reflection.Register(server)
 
+	healthSrv := health.NewServer()
+	healthSrv.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	grpc_health_v1.RegisterHealthServer(server, healthSrv)
+
 	addr := envOr("LISTEN_ADDR", "0.0.0.0:31337")
 	if err := server.Init(addr); err != nil {
 		slog.Error("failed to init server", slog.String("error", err.Error()))
@@ -201,6 +207,7 @@ func run() error {
 	<-sig
 
 	slog.Info("shutting down")
+	healthSrv.Shutdown()
 	server.Shutdown()
 	return nil
 }
