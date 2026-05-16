@@ -83,9 +83,11 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 		_ = srv.RegisterSqlInfo(id, val)
 	}
 
-	// Server identity
+	// Server identity. The version string is prefixed with "duckdb " because some
+	// clients (e.g. gizmosql SQLAlchemy dialect) gate behavior on the underlying
+	// SQL engine vendor reported via SqlInfoFlightSqlServerVersion.
 	reg(flightsql.SqlInfoFlightSqlServerName, "DuckFlight")
-	reg(flightsql.SqlInfoFlightSqlServerVersion, "0.1.0")
+	reg(flightsql.SqlInfoFlightSqlServerVersion, "duckdb "+fetchDuckDBVersion(srv.engine))
 	reg(flightsql.SqlInfoFlightSqlServerArrowVersion, arrow.PkgVersion)
 	reg(flightsql.SqlInfoFlightSqlServerReadOnly, false)
 	reg(flightsql.SqlInfoFlightSqlServerSql, true)
@@ -197,6 +199,35 @@ func buildConvertMap() map[int32][]int32 {
 	m[int32(flightsql.SqlConvertIntervalYearMonth)] = str
 
 	return m
+}
+
+// fetchDuckDBVersion returns the DuckDB library version, e.g. "v1.2.0".
+// Falls back to "unknown" if the query fails.
+func fetchDuckDBVersion(eng *engine.Engine) string {
+	ac, err := eng.Pool.Acquire(context.Background())
+	if err != nil {
+		return "unknown"
+	}
+	defer eng.Pool.Release(ac)
+
+	rdr, err := ac.Arrow.QueryContext(context.Background(), "SELECT version()")
+	if err != nil {
+		return "unknown"
+	}
+	defer rdr.Release()
+
+	if !rdr.Next() {
+		return "unknown"
+	}
+	rec := rdr.RecordBatch()
+	if rec.NumCols() == 0 || rec.NumRows() == 0 {
+		return "unknown"
+	}
+	col, ok := rec.Column(0).(*array.String)
+	if !ok || col.Len() == 0 || col.IsNull(0) {
+		return "unknown"
+	}
+	return col.Value(0)
 }
 
 // fetchKeywords queries DuckDB for its reserved keywords list.
