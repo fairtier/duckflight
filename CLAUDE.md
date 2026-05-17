@@ -2,7 +2,10 @@
 
 ## What is this
 
-A Flight SQL server backed by DuckDB with native Apache Iceberg support. Standard Flight SQL clients (ADBC, JDBC, Python, Go) connect and query Iceberg tables over gRPC. One deployment per tenant, stateless compute, horizontally scalable.
+A Flight SQL server backed by DuckDB with native Apache Iceberg support.
+Standard Flight SQL clients (ADBC, JDBC, Python, Go) connect and query Iceberg
+tables over gRPC. One deployment per tenant, stateless compute, horizontally
+scalable.
 
 ## Build & Test
 
@@ -20,7 +23,8 @@ go test -tags="duckdb_arrow iceberg_integration" -race -count=1 ./test/...
 golangci-lint run --build-tags=duckdb_arrow
 ```
 
-The `duckdb_arrow` build tag is **always required** — it enables the Arrow C Data Interface in go-duckdb.
+The `duckdb_arrow` build tag is **always required** — it enables the Arrow C
+Data Interface in go-duckdb.
 
 ## Architecture
 
@@ -31,13 +35,15 @@ internal/
   engine/
     engine.go                DuckDB connector lifecycle, boot SQL, Iceberg ATTACH
     pool.go                  Bounded channel-based ArrowConn pool
-  auth/middleware.go         Bearer token flight.ServerMiddleware (unary + stream)
+  auth/middleware.go         Bearer token flight.ServerMiddleware; stamps a sid into Handshake-issued JWTs
+  auth/jwt.go                HS256 token mint/verify with sid (session id) claim
   ratelimit/middleware.go    Token-bucket rate limit flight.ServerMiddleware
+  session/manager.go         Pins one DuckDB connection per Flight session, idle reaper
   server/
-    server.go                DuckFlightSQLServer (embeds flightsql.BaseServer), SqlInfo registration
-    statements.go            GetFlightInfoStatement, DoGetStatement, DoPutCommandStatementUpdate, GetSchemaStatement
+    server.go                DuckFlightSQLServer (embeds flightsql.BaseServer), SqlInfo registration, CloseSession → session.Manager.Close
+    statements.go            GetFlightInfoStatement, DoGetStatement, DoPutCommandStatementUpdate, GetSchemaStatement; acquireConn routing
     prepared.go              CreatePreparedStatement, ClosePreparedStatement, DoGet/DoPut prepared
-    transactions.go          BeginTransaction, EndTransaction (pool-based, not session-based)
+    transactions.go          BeginTransaction, EndTransaction — bind to session conn when present, pool conn otherwise
     metadata.go              DoGetCatalogs, DoGetDBSchemas, DoGetTables, DoGetTableTypes
     primarykeys.go           DoGetPrimaryKeys via duckdb_constraints()
     foreignkeys.go           DoGetImportedKeys, DoGetExportedKeys, DoGetCrossReference
@@ -50,17 +56,40 @@ test/
 
 ## Key Design Decisions
 
-**Stateless sessions.** No SessionManager or dedicated session connections. Transactions borrow a pool connection for their lifetime (BEGIN to COMMIT/ROLLBACK), then release it. `CloseSession` is a no-op.
+**Per-client sessions.** When a request carries an authenticated session id
+(`auth.SessionIDFromContext`), every RPC for that client routes to a single
+DuckDB connection pinned by `session.Manager`. Handshake-issued JWTs stamp a
+fresh UUID into the `sid` claim; OIDC/static tokens derive a stable sid from
+`sha256(token)`. This makes DuckDB-native `BEGIN`/`COMMIT`/`ROLLBACK`, `CREATE
+TEMP TABLE`, `SET`, `PRAGMA`, `ATTACH`, and prepared statements behave the
+way standard SQL clients (SQLAlchemy, ADBC DBAPI with `autocommit=False`,
+JDBC) expect. Anonymous (no-auth) requests fall back to one-shot pool
+borrowing. Idle sessions are reaped on a 1-minute tick. See
+[internal/session/manager.go](internal/session/manager.go).
 
-**Query execution flow.** `GetFlightInfoStatement` caches the query under a random handle. `DoGetStatement` executes it (load-and-delete from cache), streams Arrow batches via channel.
+**`acquireConn` precedence** (`internal/server/statements.go`):
+1. explicit Flight transaction (`txnID != ""`) → the txn's pinned conn,
+2. session id in ctx → the session's pinned conn (lock held for the call),
+3. otherwise → one-shot pool conn.
 
-**Transaction snapshot.** `BeginTransaction` forces snapshot initialization with `SELECT 0 FROM duckdb_tables() LIMIT 0` immediately after `BEGIN`, because DuckDB defers snapshot to first statement otherwise.
+**Query execution flow.** `GetFlightInfoStatement` caches the query under a
+random handle. `DoGetStatement` executes it (load-and-delete from cache),
+streams Arrow batches via channel.
 
-**Prepared statements.** Query-string-based. Parameters are accepted (`DoPutPreparedStatementQuery`) but not yet applied — the query runs as-is.
+**Transaction snapshot.** `BeginTransaction` forces snapshot initialization with
+`SELECT 0 FROM duckdb_tables() LIMIT 0` immediately after `BEGIN`, because
+DuckDB defers snapshot to first statement otherwise.
 
-**Metadata queries.** Use `information_schema` and `duckdb_constraints()`. When catalog filter is unset, defaults to `current_database()`. When schema filter is unset, defaults to `current_schema()`.
+**Prepared statements.** Query-string-based with bind parameters applied at
+execute time (`DoGetPreparedStatement`/`DoPutPreparedStatementUpdate` pass the
+last parameter row through DuckDB's positional bind).
 
-**Write serialization.** `Engine.WriteMu` mutex exists but is currently unused in shipping code. DuckDB handles single-writer semantics per connection.
+**Metadata queries.** Use `information_schema` and `duckdb_constraints()`. When
+catalog filter is unset, defaults to `current_database()`. When schema filter is
+unset, defaults to `current_schema()`.
+
+**Write serialization.** `Engine.WriteMu` mutex exists but is currently unused
+in shipping code. DuckDB handles single-writer semantics per connection.
 
 ## Key Dependencies
 
@@ -86,13 +115,16 @@ test/
 ## Configuration
 
 All via environment variables. See README.md for the full table. Key ones:
+
 - `LISTEN_ADDR` (default `0.0.0.0:31337`) — gRPC server
 - `METRIC_ADDR` (default `0.0.0.0:9090`) — Prometheus metrics
 - `MEMORY_LIMIT`, `MAX_THREADS`, `QUERY_TIMEOUT`, `POOL_SIZE` — DuckDB tuning
 - `ICEBERG_*` — Iceberg REST Catalog connection (optional)
-- `S3_*` — S3 storage credentials (optional, for when catalog doesn't vend credentials)
+- `S3_*` — S3 storage credentials (optional, for when catalog doesn't vend
+  credentials)
 - `AUTH_TOKENS` — comma-separated bearer tokens (empty = auth disabled)
-- `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` — global token-bucket rate limiter (0 = disabled)
+- `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` — global token-bucket rate limiter (0 =
+  disabled)
 - `LOG_LEVEL` — slog level (DEBUG, INFO, WARN, ERROR)
 
 ## Testing Patterns
@@ -103,16 +135,34 @@ All via environment variables. See README.md for the full table. Key ones:
 - **engine_test.go** — Engine init and pool tests
 - **middleware_test.go** — Auth token validation
 - **ratelimit/middleware_test.go** — Rate limit middleware tests
-- **iceberg_integration_test.go** — Full Docker stack via testcontainers (build tag: `iceberg_integration`)
+- **iceberg_integration_test.go** — Full Docker stack via testcontainers (
+  `duckdb_arrow`)
+- **sqlalchemy_integration_test.go** — Spins up a Python container running
+  pytest against the in-process server. Exercises the gizmosql SQLAlchemy
+  dialect and raw `adbc_driver_flightsql`. Build tag: `sqlalchemy_integration`.
+  Python test sources live under `test/python/` and are embedded into the test
+  binary.
 
 Test helper: `server.SeedSQL(ctx, sql)` executes setup SQL on the global engine.
 
+**Bare BEGIN/COMMIT/ROLLBACK** sent as SQL strings (e.g. by the gizmosql
+SQLAlchemy dialect's `do_begin`/`do_commit`/`do_rollback`) are handled
+natively by DuckDB: all RPCs for a session land on the same pinned
+connection, so `ROLLBACK` after `BEGIN` works without any server-side
+classification. The Flight RPC path
+(`BeginTransaction`/`EndTransaction`) is independent — it gets its own txn
+handle and binds to the session conn when one exists.
+
 ## Deployment
 
-- **Dockerfile**: multi-stage (golang:1.26 builder, debian:bookworm-slim runtime)
-- **docker-compose.yml**: full local stack (PostgreSQL, MinIO, Lakekeeper, DuckFlight)
-- **helm/duckflight/**: Helm chart with Deployment, Service, HPA, GRPCRoute, BackendTrafficPolicy
-- **CI**: `.github/workflows/ci.yml` (lint + test), `release.yml` (Docker to GHCR), `release-helm.yml`
+- **Dockerfile**: multi-stage (golang:1.26 builder, debian:bookworm-slim
+  runtime)
+- **docker-compose.yml**: full local stack (PostgreSQL, MinIO, Lakekeeper,
+  DuckFlight)
+- **helm/duckflight/**: Helm chart with Deployment, Service, HPA, GRPCRoute,
+  BackendTrafficPolicy
+- **CI**: `.github/workflows/ci.yml` (lint + test), `release.yml` (Docker to
+  GHCR), `release-helm.yml`
 
 ## Reference implementation:
 

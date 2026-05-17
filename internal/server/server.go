@@ -15,8 +15,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/config"
 	"github.com/fairtier/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/session"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 )
@@ -26,6 +28,7 @@ type DuckFlightSQLServer struct {
 	flightsql.BaseServer
 
 	engine           *engine.Engine
+	sessions         *session.Manager
 	preparedStmts    sync.Map // handle string -> preparedStatement
 	openTransactions sync.Map // handle string -> *txnState
 	queryTimeout     time.Duration
@@ -63,6 +66,7 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 
 	srv := &DuckFlightSQLServer{
 		engine:         eng,
+		sessions:       session.NewManager(eng.Pool, resourceTTL),
 		queryTimeout:   timeout,
 		maxResultBytes: cfg.MaxResultBytes,
 		tracker:        &queryTracker{ttl: resourceTTL},
@@ -73,6 +77,7 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 	srv.Alloc = memory.DefaultAllocator
 	srv.tracker.StartCleanup(cleanupCtx)
 	srv.startResourceCleanup(cleanupCtx)
+	srv.sessions.StartReaper(cleanupCtx)
 	registerSqlInfo(srv)
 
 	globalEngine = eng
@@ -261,8 +266,12 @@ func fetchKeywords(eng *engine.Engine) []string {
 	return keywords
 }
 
-// CloseSession is called by clients on disconnect. No-op since we don't track sessions.
-func (s *DuckFlightSQLServer) CloseSession(_ context.Context, _ *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
+// CloseSession releases the DuckDB connection pinned to the caller's session
+// (if any) back to the pool. Idempotent — calling on an unknown sid is a no-op.
+func (s *DuckFlightSQLServer) CloseSession(ctx context.Context, _ *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
+	if sid := auth.SessionIDFromContext(ctx); sid != "" {
+		s.sessions.Close(sid)
+	}
 	return &flight.CloseSessionResult{Status: flight.CloseSessionResultClosed}, nil
 }
 

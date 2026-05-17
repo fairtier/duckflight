@@ -1,0 +1,7 @@
+adbc-driver-flightsql==1.10.*
+adbc-driver-manager==1.10.*
+pyarrow==18.*
+sqlalchemy==2.0.*
+pytest==8.*
+# Runtime deps of the gizmosql dialect that we install with --no-deps.
+importlib-metadata==8.7.*

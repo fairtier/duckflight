@@ -16,6 +16,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	duckdb "github.com/duckdb/duckdb-go/v2"
+	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/engine"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -48,27 +49,52 @@ func (s *DuckFlightSQLServer) acquirePoolConn(ctx context.Context) (*engine.Arro
 	return ac, nil
 }
 
-// acquireConn returns either the transaction's connection or a pool connection.
-// If fromPool is true, the caller must release it when done.
-func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (ac *engine.ArrowConn, fromPool bool, err error) {
+// acquireConn returns a usable [engine.ArrowConn] and a release function that
+// callers MUST invoke when done. Routing precedence:
+//
+//  1. txnID set      → the txn's pinned conn (held by the open Flight txn).
+//                       The session lock (if any) is held until release().
+//  2. session in ctx → the session's pinned conn, with the session lock held
+//                       for the lifetime of the call. Lets DuckDB-native
+//                       BEGIN/COMMIT/ROLLBACK, TEMP tables, SET, PRAGMA, and
+//                       prepared statements work the way clients expect.
+//  3. otherwise      → a one-shot pool conn returned to the pool on release.
+func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*engine.ArrowConn, func(), error) {
 	if txnID != "" {
 		val, ok := s.openTransactions.Load(txnID)
 		if !ok {
-			return nil, false, status.Error(codes.InvalidArgument, "invalid transaction handle")
+			return nil, nil, status.Error(codes.InvalidArgument, "invalid transaction handle")
 		}
 		ts := val.(*txnState)
-		return ts.conn, false, nil
+		// If the txn is bound to a session, lock the session for this call so
+		// concurrent RPCs on the same session serialize correctly.
+		if ts.sid != "" {
+			sess, release, err := s.sessions.Acquire(ctx, ts.sid)
+			if err != nil {
+				return nil, nil, err
+			}
+			return sess.Conn(), release, nil
+		}
+		return ts.conn, func() {}, nil
+	}
+
+	if sid := auth.SessionIDFromContext(ctx); sid != "" {
+		sess, release, err := s.sessions.Acquire(ctx, sid)
+		if err != nil {
+			return nil, nil, err
+		}
+		return sess.Conn(), release, nil
 	}
 
 	ctx, span := s.tracer.Start(ctx, "pool.acquire")
 	defer span.End()
 
-	ac, err = s.acquirePoolConn(ctx)
+	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
 		span.RecordError(err)
-		return nil, false, err
+		return nil, nil, err
 	}
-	return ac, true, nil
+	return ac, func() { s.engine.Pool.Release(ac) }, nil
 }
 
 // GetFlightInfoStatement stores the query for later execution by DoGetStatement.
@@ -113,7 +139,7 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		return nil, nil, status.Error(codes.NotFound, fmt.Sprintf("statement handle not found: %q", handle))
 	}
 
-	ac, fromPool, err := s.acquireConn(ctx, txnID)
+	ac, release, err := s.acquireConn(ctx, txnID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -134,9 +160,7 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		// external cancellation from our own cleanup cancel.
 		ctxErr := queryCtx.Err()
 		queryCancel()
-		if fromPool {
-			s.engine.Pool.Release(ac)
-		}
+		release()
 		s.tracker.Complete(handle)
 		switch ctxErr {
 		case context.Canceled:
@@ -161,9 +185,7 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		defer close(ch)
 		defer metered.Release()
 		defer queryCancel()
-		if fromPool {
-			defer s.engine.Pool.Release(ac)
-		}
+		defer release()
 		defer func() {
 			s.tracker.Complete(handle)
 			activeQueries.Add(ctx, -1)
@@ -205,13 +227,11 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
 ) (int64, error) {
 	txnID := string(cmd.GetTransactionId())
 
-	ac, fromPool, err := s.acquireConn(ctx, txnID)
+	ac, release, err := s.acquireConn(ctx, txnID)
 	if err != nil {
 		return 0, err
 	}
-	if fromPool {
-		defer s.engine.Pool.Release(ac)
-	}
+	defer release()
 
 	n, err := ac.ExecContext(ctx, cmd.GetQuery())
 	if err != nil {
@@ -228,11 +248,14 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 ) (*flight.SchemaResult, error) {
 	query := cmd.GetQuery()
 
-	ac, err := s.acquirePoolConn(ctx)
+	// Use the session's conn if there is one so that session-local state
+	// (search_path, temp tables, attached databases) is honored during the
+	// schema probe.
+	ac, release, err := s.acquireConn(ctx, string(cmd.GetTransactionId()))
 	if err != nil {
 		return nil, err
 	}
-	defer s.engine.Pool.Release(ac)
+	defer release()
 
 	// Execute with LIMIT 0 to get schema without results.
 	rdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query))
@@ -380,13 +403,11 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementIngest(
 		return 0, status.Error(codes.InvalidArgument, "table definition options are required")
 	}
 
-	ac, fromPool, err := s.acquireConn(ctx, string(cmd.GetTransactionId()))
+	ac, release, err := s.acquireConn(ctx, string(cmd.GetTransactionId()))
 	if err != nil {
 		return 0, err
 	}
-	if fromPool {
-		defer s.engine.Pool.Release(ac)
-	}
+	defer release()
 
 	target := qualifiedTableName(cmd.GetCatalog(), cmd.GetSchema(), table)
 	insertSQL := fmt.Sprintf("INSERT INTO %s SELECT * FROM __ingest_view", target)

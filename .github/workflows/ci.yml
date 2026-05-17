@@ -49,3 +49,20 @@ jobs:
 
       - name: Run Iceberg integration tests
         run: go test -tags="duckdb_arrow" -race -count=1 -timeout=10m ./test/...
+
+  sqlalchemy-integration:
+    name: SQLAlchemy + ADBC integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Run SQLAlchemy / gizmosql dialect integration test
+        # Boots DuckFlight in-process and runs a pytest container against it.
+        # Exercises both raw adbc_driver_flightsql and the gizmosql SQLAlchemy
+        # dialect — catches the kind of client-side bugs (rollback handling,
+        # SqlInfo corruption) that Go-only tests miss.
+        run: go test -tags="duckdb_arrow sqlalchemy_integration" -race -count=1 -timeout=20m ./test/...

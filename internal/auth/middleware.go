@@ -3,7 +3,9 @@ package auth
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"errors"
 	"log/slog"
 	"strings"
@@ -19,6 +21,21 @@ import (
 // Kubernetes gRPC probes can't send bearer tokens, so the auth middleware
 // must let health RPCs through unconditionally.
 const healthMethodPrefix = "/grpc.health.v1.Health/"
+
+// Identity is the value stored on the gRPC context by the auth middleware.
+// Retrieve it with [flight.AuthFromContext] or [IdentityFromContext]; pull
+// just the session id with [SessionIDFromContext].
+type Identity struct {
+	// Subject is the authenticated principal (username, OIDC sub, or a static
+	// marker like "static").
+	Subject string
+	// SessionID pins the client to a server-side session backed by a dedicated
+	// DuckDB connection. For Handshake-issued JWTs this is a UUID generated at
+	// issue time; for OIDC and static tokens it's a deterministic hash of the
+	// raw bearer token so the same client gets a stable session for the
+	// token's lifetime.
+	SessionID string
+}
 
 // Config bundles every auth backend the server can be wired with. Any nil/zero
 // field disables that backend; if all are zero, Middleware returns nil and
@@ -112,14 +129,15 @@ func (v *validator) Validate(username, password string) (string, error) {
 }
 
 // IsValid is called by every other RPC with the bearer token from
-// `Authorization: Bearer …`. The identity it returns is plumbed into the
-// gRPC context via flight's authCtxKey, available to handlers if they care.
+// `Authorization: Bearer …`. The returned [Identity] is plumbed into the
+// gRPC context via flight's authCtxKey; handlers may pull it back out with
+// [flight.AuthFromContext] (or the typed helpers in this package).
 func (v *validator) IsValid(token string) (any, error) {
 	if token == "" {
 		return nil, status.Error(codes.Unauthenticated, "missing authorization header")
 	}
 	if _, ok := v.staticTokens[token]; ok {
-		return "static", nil
+		return Identity{Subject: "static", SessionID: deriveSessionID(token)}, nil
 	}
 
 	iss, err := tokenIssuer(token)
@@ -134,16 +152,47 @@ func (v *validator) IsValid(token string) (any, error) {
 		if err != nil {
 			return nil, status.Errorf(codes.Unauthenticated, "oidc: %s", err)
 		}
-		return sub, nil
+		// External issuer can't stamp our session ids; derive a stable one
+		// from the token so the same bearer always lands on the same session.
+		return Identity{Subject: sub, SessionID: deriveSessionID(token)}, nil
 	case v.local != nil && iss == localJWTIssuer:
-		sub, err := v.local.verify(token)
+		sub, sid, err := v.local.verify(token)
 		if err != nil {
 			return nil, status.Errorf(codes.Unauthenticated, "jwt: %s", err)
 		}
-		return sub, nil
+		// Fallback: an old token minted before the sid claim existed gets a
+		// derived id so it still pins to a session.
+		if sid == "" {
+			sid = deriveSessionID(token)
+		}
+		return Identity{Subject: sub, SessionID: sid}, nil
 	default:
 		return nil, status.Error(codes.Unauthenticated, "unknown token issuer")
 	}
+}
+
+// deriveSessionID hashes a bearer token into a stable, opaque session id.
+func deriveSessionID(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:8]) // 16 hex chars — collision-resistant per token
+}
+
+// IdentityFromContext returns the authenticated [Identity] attached by the
+// auth middleware, or (zero, false) if none is present (auth disabled).
+func IdentityFromContext(ctx context.Context) (Identity, bool) {
+	v := flight.AuthFromContext(ctx)
+	if v == nil {
+		return Identity{}, false
+	}
+	id, ok := v.(Identity)
+	return id, ok
+}
+
+// SessionIDFromContext returns the session id of the authenticated request,
+// or "" if none is present.
+func SessionIDFromContext(ctx context.Context) string {
+	id, _ := IdentityFromContext(ctx)
+	return id.SessionID
 }
 
 // NewOIDCVerifier exposes oidc construction so cmd/server can build it during

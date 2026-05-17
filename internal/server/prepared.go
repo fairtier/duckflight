@@ -110,16 +110,20 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	handle := genHandle()
 	s.preparedStmts.Store(string(handle), preparedStatement{query: query, createdAt: time.Now()})
 
-	// Get schema via LIMIT 0 query.
-	ac, err := s.acquirePoolConn(ctx)
+	// Schema via LIMIT 0 probe. Routed through acquireConn so a session's
+	// connection-local state (e.g. attached catalogs, search_path) is in scope.
+	ac, release, err := s.acquireConn(ctx, "")
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
 	}
-	defer s.engine.Pool.Release(ac)
+	defer release()
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query+" LIMIT 0")
 	if err != nil {
-		// Return handle without schema if schema detection fails.
+		// Return handle without schema if schema detection fails. This covers
+		// statements DuckDB can't probe with LIMIT 0 (e.g. bare BEGIN/COMMIT)
+		// — DoGet/DoPut will execute the original query on the session conn
+		// where it works naturally.
 		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
 	}
 	defer rdr.Release()
@@ -171,7 +175,7 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 	}
 	ps := val.(preparedStatement)
 
-	ac, err := s.acquirePoolConn(ctx)
+	ac, release, err := s.acquireConn(ctx, "")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -184,7 +188,7 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 
 	rdr, err := ac.Arrow.QueryContext(ctx, ps.query, args...)
 	if err != nil {
-		s.engine.Pool.Release(ac)
+		release()
 		return nil, nil, status.Errorf(codes.Internal, "query execution error: %s", err)
 	}
 
@@ -194,7 +198,7 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 	go func() {
 		defer close(ch)
 		defer rdr.Release()
-		defer s.engine.Pool.Release(ac)
+		defer release()
 
 		for rdr.Next() {
 			rec := rdr.RecordBatch()
@@ -263,11 +267,11 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 		args = ps.params
 	}
 
-	ac, err := s.acquirePoolConn(ctx)
+	ac, release, err := s.acquireConn(ctx, "")
 	if err != nil {
 		return 0, err
 	}
-	defer s.engine.Pool.Release(ac)
+	defer release()
 
 	if len(args) == 0 {
 		n, err := ac.ExecContext(ctx, ps.query)

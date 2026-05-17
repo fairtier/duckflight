@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/engine"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -15,13 +16,21 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// txnState tracks one open Flight transaction. Exactly one of (sid, conn) is
+// meaningful: if sid != "", the transaction runs on that session's pinned
+// connection; otherwise conn is a pool-borrowed connection held for the
+// transaction's lifetime.
 type txnState struct {
+	sid       string
 	conn      *engine.ArrowConn
 	tx        driver.Tx
 	createdAt time.Time
 }
 
-// BeginTransaction acquires a connection from the pool and starts a transaction.
+// BeginTransaction starts a transaction. If the caller has an authenticated
+// session, the transaction binds to that session's connection (so subsequent
+// statements without an explicit txnID still see the open transaction);
+// otherwise it pins a one-off pool connection for the txn's lifetime.
 func (s *DuckFlightSQLServer) BeginTransaction(
 	ctx context.Context,
 	_ flightsql.ActionBeginTransactionRequest,
@@ -29,16 +38,32 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	ctx, span := s.tracer.Start(ctx, "transaction.begin")
 	defer span.End()
 
-	ac, err := s.acquirePoolConn(ctx)
-	if err != nil {
-		span.RecordError(err)
-		return nil, err
+	sid := auth.SessionIDFromContext(ctx)
+
+	var (
+		ac      *engine.ArrowConn
+		release func()
+	)
+	if sid != "" {
+		sess, rel, err := s.sessions.Acquire(ctx, sid)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		ac, release = sess.Conn(), rel
+	} else {
+		c, err := s.acquirePoolConn(ctx)
+		if err != nil {
+			span.RecordError(err)
+			return nil, err
+		}
+		ac, release = c, func() { s.engine.Pool.Release(c) }
 	}
 
 	tx, err := ac.BeginTx(ctx)
 	if err != nil {
 		span.RecordError(err)
-		s.engine.Pool.Release(ac)
+		release()
 		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %s", err)
 	}
 
@@ -49,17 +74,29 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	if err != nil {
 		span.RecordError(err)
 		_ = tx.Rollback()
-		s.engine.Pool.Release(ac)
+		release()
 		return nil, status.Errorf(codes.Internal, "failed to initialize transaction snapshot: %s", err)
 	}
 	rdr.Release()
 
+	state := &txnState{tx: tx, createdAt: time.Now()}
+	if sid != "" {
+		state.sid = sid
+		// Drop the per-RPC session lock; future RPCs on this txn re-acquire it.
+		release()
+	} else {
+		state.conn = ac
+		// Anonymous: conn stays pinned until EndTransaction.
+	}
+
 	handle := genHandle()
-	s.openTransactions.Store(string(handle), &txnState{conn: ac, tx: tx, createdAt: time.Now()})
+	s.openTransactions.Store(string(handle), state)
 	return handle, nil
 }
 
-// EndTransaction commits or rolls back a transaction and releases the connection.
+// EndTransaction commits or rolls back a transaction. If it ran on a session,
+// re-acquires the session lock for the commit/rollback so the underlying
+// connection isn't touched concurrently with another RPC.
 func (s *DuckFlightSQLServer) EndTransaction(
 	ctx context.Context,
 	req flightsql.ActionEndTransactionRequest,
@@ -86,7 +123,21 @@ func (s *DuckFlightSQLServer) EndTransaction(
 		return status.Error(codes.InvalidArgument, "transaction id not found")
 	}
 	ts := val.(*txnState)
-	defer s.engine.Pool.Release(ts.conn)
+
+	// Re-acquire the session lock (if any) so the commit/rollback driver call
+	// is serialized with other RPCs on the same session. For anonymous txns we
+	// just need to remember to release the pinned conn.
+	var release func()
+	if ts.sid != "" {
+		_, rel, err := s.sessions.Acquire(ctx, ts.sid)
+		if err != nil {
+			return err
+		}
+		release = rel
+	} else {
+		release = func() { s.engine.Pool.Release(ts.conn) }
+	}
+	defer release()
 
 	switch req.GetAction() {
 	case flightsql.EndTransactionCommit:
