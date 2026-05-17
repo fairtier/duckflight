@@ -171,3 +171,67 @@ def test_prepared_statement_with_params(raw_adbc):
         cur.execute("SELECT ? + ?", parameters=[1, 2])
         rows = cur.fetchall()
     assert rows == [(3,)]
+
+
+def _new_raw_conn(autocommit: bool):
+    """Helper: open a fresh raw ADBC conn against the test server."""
+    import adbc_driver_flightsql.dbapi as flight_dbapi
+
+    from conftest import HOST, PORT, USER, PASSWORD
+
+    return flight_dbapi.connect(
+        f"grpc+tcp://{HOST}:{PORT}",
+        db_kwargs={"username": USER, "password": PASSWORD},
+        autocommit=autocommit,
+    )
+
+
+def test_flight_begin_after_sql_begin_is_idempotent():
+    """SQL ``BEGIN`` already opened a DuckDB txn — a subsequent Flight
+    ``ActionBeginTransaction`` (triggered by ADBC ``set_autocommit(False)``)
+    must attach to that existing txn instead of failing."""
+    conn = _new_raw_conn(autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("BEGIN")  # raw SQL → DuckDB now in txn
+        # Toggle autocommit off → ADBC issues ActionBeginTransaction on
+        # the same session conn. Pre-fix: "multiple transactions" error.
+        conn.adbc_connection.set_autocommit(False)
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            assert cur.fetchall() == [(1,)]
+        # Flight EndTransaction (commit) runs SQL COMMIT — which closes the
+        # one DuckDB txn shared by both layers.
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sql_begin_after_flight_begin_is_idempotent():
+    """Mirror case: Flight ``ActionBeginTransaction`` opened DuckDB's txn —
+    a subsequent SQL ``BEGIN`` (the dialect's ``do_begin``) must no-op
+    instead of failing."""
+    conn = _new_raw_conn(autocommit=False)  # implicit Flight txn on first stmt
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")  # triggers ActionBeginTransaction
+            assert cur.fetchall() == [(1,)]
+            cur.execute("BEGIN")  # dialect-style raw SQL BEGIN — must no-op
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_sql_rollback_with_no_txn_is_idempotent():
+    """The original Superset failure mode: ``_finalize_fairy`` fires
+    ``do_rollback`` (raw SQL ``ROLLBACK``) on a conn that has no active
+    txn. Pre-fix: ``cannot rollback - no transaction is active`` errored
+    the connection cleanup."""
+    conn = _new_raw_conn(autocommit=True)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("ROLLBACK")
+            cur.execute("SELECT 1")
+            assert cur.fetchall() == [(1,)]
+    finally:
+        conn.close()

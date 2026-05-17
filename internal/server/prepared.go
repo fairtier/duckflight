@@ -180,6 +180,16 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 		return nil, nil, err
 	}
 
+	// Redundant BEGIN/COMMIT/ROLLBACK against the connection's current
+	// transaction state → no-op (see [shouldSkipTxnControl]).
+	if skip, _ := shouldSkipTxnControl(ctx, ac, ps.query); skip {
+		release()
+		schema := arrow.NewSchema([]arrow.Field{}, nil)
+		ch := make(chan flight.StreamChunk)
+		close(ch)
+		return schema, ch, nil
+	}
+
 	// Build args from first parameter row (if any).
 	var args []any
 	if len(ps.params) > 0 {
@@ -272,6 +282,10 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 		return 0, err
 	}
 	defer release()
+
+	if skip, _ := shouldSkipTxnControl(ctx, ac, ps.query); skip {
+		return 0, nil
+	}
 
 	if len(args) == 0 {
 		n, err := ac.ExecContext(ctx, ps.query)

@@ -33,6 +33,41 @@ func duckDBToGRPCCode(err error) codes.Code {
 	return codes.InvalidArgument
 }
 
+// shouldSkipTxnControl reports whether a transaction-control statement
+// (BEGIN/COMMIT/ROLLBACK/…) is redundant given the connection's current
+// transaction state, so that it can be no-oped instead of executed. The
+// collision happens in practice when two client layers manage transactions
+// on the same session-pinned connection: ADBC's autocommit toggle issues
+// Flight ActionBeginTransaction, while SQLAlchemy's autobegin invokes the
+// dialect's do_begin/do_rollback as raw SQL. Both layers intend the same
+// state transition; whichever fires first wins, and the second would
+// otherwise hit DuckDB's strict state machine — which not only rejects
+// the redundant call but, for BEGIN-in-BEGIN, leaves the existing
+// transaction in an aborted state that breaks every subsequent statement.
+//
+// Returns (true, "") when the statement should be skipped. Otherwise
+// returns (false, "") and the caller should execute the statement normally.
+// All classification uses DuckDB's own parser ([ArrowConn.ClassifyTxnStatement])
+// and an explicit transaction-state probe ([ArrowConn.InExplicitTransaction]);
+// no SQL-string or error-message substring matching is involved.
+func shouldSkipTxnControl(ctx context.Context, ac *engine.ArrowConn, query string) (bool, error) {
+	intent := ac.ClassifyTxnStatement(ctx, query)
+	if intent == engine.TxnIntentNone {
+		return false, nil
+	}
+	inTxn, err := ac.InExplicitTransaction(ctx)
+	if err != nil {
+		return false, err
+	}
+	switch intent {
+	case engine.TxnIntentBegin:
+		return inTxn, nil // BEGIN inside a txn → skip
+	case engine.TxnIntentEnd:
+		return !inTxn, nil // COMMIT/ROLLBACK outside a txn → skip
+	}
+	return false, nil
+}
+
 func genHandle() []byte {
 	b := make([]byte, 16)
 	_, _ = rand.Read(b)
@@ -144,6 +179,21 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		return nil, nil, err
 	}
 
+	// If the statement is a transaction-control statement that would collide
+	// with the connection's current state (BEGIN inside an existing txn, or
+	// COMMIT/ROLLBACK outside one), skip it. Letting it through would either
+	// abort an in-progress txn (BEGIN-in-BEGIN) or surface a confusing error
+	// for a client whose intent is already satisfied.
+	if skip, _ := shouldSkipTxnControl(ctx, ac, query); skip {
+		release()
+		s.tracker.Complete(handle)
+		schema := arrow.NewSchema([]arrow.Field{}, nil)
+		ch := make(chan flight.StreamChunk)
+		close(ch)
+		queryCountAdd(ctx, "ok")
+		return schema, ch, nil
+	}
+
 	queryCtx, queryCancel := context.WithCancel(ctx)
 	if s.queryTimeout > 0 {
 		queryCtx, queryCancel = context.WithTimeout(ctx, s.queryTimeout)
@@ -233,7 +283,11 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
 	}
 	defer release()
 
-	n, err := ac.ExecContext(ctx, cmd.GetQuery())
+	query := cmd.GetQuery()
+	if skip, _ := shouldSkipTxnControl(ctx, ac, query); skip {
+		return 0, nil
+	}
+	n, err := ac.ExecContext(ctx, query)
 	if err != nil {
 		return 0, status.Errorf(codes.Internal, "update error: %s", err)
 	}

@@ -4,7 +4,6 @@ package server
 
 import (
 	"context"
-	"database/sql/driver"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
@@ -23,7 +22,6 @@ import (
 type txnState struct {
 	sid       string
 	conn      *engine.ArrowConn
-	tx        driver.Tx
 	createdAt time.Time
 }
 
@@ -31,6 +29,11 @@ type txnState struct {
 // session, the transaction binds to that session's connection (so subsequent
 // statements without an explicit txnID still see the open transaction);
 // otherwise it pins a one-off pool connection for the txn's lifetime.
+//
+// If the underlying connection is already in a DuckDB transaction — because
+// a concurrent client layer (e.g. SQLAlchemy's dialect autobegin) ran a raw
+// SQL BEGIN first — we attach to that existing transaction rather than
+// failing; see [isRedundantTxnCollision].
 func (s *DuckFlightSQLServer) BeginTransaction(
 	ctx context.Context,
 	_ flightsql.ActionBeginTransactionRequest,
@@ -60,26 +63,39 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 		ac, release = c, func() { s.engine.Pool.Release(c) }
 	}
 
-	tx, err := ac.BeginTx(ctx)
-	if err != nil {
-		span.RecordError(err)
+	// Pre-flight: avoid issuing BEGIN if DuckDB is already in an explicit
+	// transaction on this connection (e.g. a concurrent client layer ran SQL
+	// BEGIN first). Running BEGIN inside a txn doesn't just fail — it leaves
+	// DuckDB's txn in an aborted state, breaking every subsequent statement.
+	alreadyInTxn, probeErr := ac.InExplicitTransaction(ctx)
+	if probeErr != nil {
+		span.RecordError(probeErr)
 		release()
-		return nil, status.Errorf(codes.Internal, "failed to begin transaction: %s", err)
+		return nil, status.Errorf(codes.Internal, "failed to probe transaction state: %s", probeErr)
 	}
 
-	// Force DuckDB to take a snapshot immediately by reading from a real table.
-	// Without this, the snapshot is deferred to the first actual statement,
-	// which breaks snapshot isolation guarantees for the client.
-	rdr, err := ac.Arrow.QueryContext(ctx, "SELECT 0 FROM duckdb_tables() LIMIT 0")
-	if err != nil {
-		span.RecordError(err)
-		_ = tx.Rollback()
-		release()
-		return nil, status.Errorf(codes.Internal, "failed to initialize transaction snapshot: %s", err)
+	if !alreadyInTxn {
+		if _, err := ac.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
+			span.RecordError(err)
+			release()
+			return nil, status.Errorf(codes.Internal, "failed to begin transaction: %s", err)
+		}
+		// Force DuckDB to take a snapshot immediately by reading from a real
+		// table. Without this, the snapshot is deferred to the first actual
+		// statement, which breaks snapshot isolation guarantees for the client.
+		rdr, err := ac.Arrow.QueryContext(ctx, "SELECT 0 FROM duckdb_tables() LIMIT 0")
+		if err != nil {
+			span.RecordError(err)
+			_, _ = ac.ExecContext(ctx, "ROLLBACK")
+			release()
+			return nil, status.Errorf(codes.Internal, "failed to initialize transaction snapshot: %s", err)
+		}
+		rdr.Release()
 	}
-	rdr.Release()
+	// else: attach the new Flight handle to the existing DuckDB txn. The
+	// existing txn already took its snapshot when it opened.
 
-	state := &txnState{tx: tx, createdAt: time.Now()}
+	state := &txnState{createdAt: time.Now()}
 	if sid != "" {
 		state.sid = sid
 		// Drop the per-RPC session lock; future RPCs on this txn re-acquire it.
@@ -96,7 +112,9 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 
 // EndTransaction commits or rolls back a transaction. If it ran on a session,
 // re-acquires the session lock for the commit/rollback so the underlying
-// connection isn't touched concurrently with another RPC.
+// connection isn't touched concurrently with another RPC. Tolerates the case
+// where the DuckDB transaction was already finalized via raw SQL by a
+// concurrent client layer (see [isRedundantTxnCollision]).
 func (s *DuckFlightSQLServer) EndTransaction(
 	ctx context.Context,
 	req flightsql.ActionEndTransactionRequest,
@@ -105,12 +123,12 @@ func (s *DuckFlightSQLServer) EndTransaction(
 		return status.Error(codes.InvalidArgument, "must specify Commit or Rollback")
 	}
 
-	var op string
+	var op, endSQL string
 	switch req.GetAction() {
 	case flightsql.EndTransactionCommit:
-		op = "commit"
+		op, endSQL = "commit", "COMMIT"
 	case flightsql.EndTransactionRollback:
-		op = "rollback"
+		op, endSQL = "rollback", "ROLLBACK"
 	}
 
 	_, span := s.tracer.Start(ctx, "transaction.end",
@@ -124,32 +142,38 @@ func (s *DuckFlightSQLServer) EndTransaction(
 	}
 	ts := val.(*txnState)
 
-	// Re-acquire the session lock (if any) so the commit/rollback driver call
-	// is serialized with other RPCs on the same session. For anonymous txns we
-	// just need to remember to release the pinned conn.
-	var release func()
+	// Resolve the conn for the end-of-txn statement and the cleanup callback.
+	var (
+		ac      *engine.ArrowConn
+		release func()
+	)
 	if ts.sid != "" {
-		_, rel, err := s.sessions.Acquire(ctx, ts.sid)
+		sess, rel, err := s.sessions.Acquire(ctx, ts.sid)
 		if err != nil {
 			return err
 		}
-		release = rel
+		ac, release = sess.Conn(), rel
 	} else {
-		release = func() { s.engine.Pool.Release(ts.conn) }
+		ac, release = ts.conn, func() { s.engine.Pool.Release(ts.conn) }
 	}
 	defer release()
 
-	switch req.GetAction() {
-	case flightsql.EndTransactionCommit:
-		if err := ts.tx.Commit(); err != nil {
-			span.RecordError(err)
-			return status.Errorf(codes.Internal, "failed to commit: %s", err)
-		}
-	case flightsql.EndTransactionRollback:
-		if err := ts.tx.Rollback(); err != nil {
-			span.RecordError(err)
-			return status.Errorf(codes.Internal, "failed to rollback: %s", err)
-		}
+	// Pre-flight: if DuckDB isn't actually in an explicit transaction (a
+	// concurrent client layer may have already committed/rolled back via SQL),
+	// the corresponding COMMIT/ROLLBACK would error with "no transaction is
+	// active". Skip it.
+	inTxn, probeErr := ac.InExplicitTransaction(ctx)
+	if probeErr != nil {
+		span.RecordError(probeErr)
+		return status.Errorf(codes.Internal, "failed to probe transaction state: %s", probeErr)
+	}
+	if !inTxn {
+		return nil
+	}
+
+	if _, err := ac.ExecContext(ctx, endSQL); err != nil {
+		span.RecordError(err)
+		return status.Errorf(codes.Internal, "failed to %s: %s", op, err)
 	}
 	return nil
 }

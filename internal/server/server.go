@@ -300,8 +300,15 @@ func (s *DuckFlightSQLServer) startResourceCleanup(ctx context.Context) {
 					ts := value.(*txnState)
 					if now.Sub(ts.createdAt) > s.resourceTTL {
 						s.openTransactions.Delete(key)
-						_ = ts.tx.Rollback()
-						s.engine.Pool.Release(ts.conn)
+						// Session-bound txns share the session's pinned conn — its
+						// rollback (and conn release) is handled when the session
+						// is reaped or the session-pinned conn is reused. For
+						// anonymous txns we own the pool conn and must roll back
+						// + return it ourselves.
+						if ts.conn != nil {
+							_, _ = ts.conn.ExecContext(context.Background(), "ROLLBACK")
+							s.engine.Pool.Release(ts.conn)
+						}
 						slog.Warn("reaped stale transaction",
 							"handle", key, "age", now.Sub(ts.createdAt))
 					}
