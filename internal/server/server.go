@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -227,7 +228,8 @@ func fetchDuckDBVersion(eng *engine.Engine) string {
 	if !ok || col.Len() == 0 || col.IsNull(0) {
 		return "unknown"
 	}
-	return col.Value(0)
+	// Clone: col.Value aliases the CGo-allocated Arrow buffer freed by rdr.Release.
+	return strings.Clone(col.Value(0))
 }
 
 // fetchKeywords queries DuckDB for its reserved keywords list.
@@ -249,7 +251,8 @@ func fetchKeywords(eng *engine.Engine) []string {
 		rec := rdr.RecordBatch()
 		col := rec.Column(0).(*array.String)
 		for i := 0; i < col.Len(); i++ {
-			keywords = append(keywords, col.Value(i))
+			// Clone: col.Value aliases the CGo-allocated Arrow buffer freed by rdr.Release.
+			keywords = append(keywords, strings.Clone(col.Value(i)))
 		}
 	}
 	if rdr.Err() != nil {
