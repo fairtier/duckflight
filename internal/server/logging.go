@@ -12,8 +12,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
-	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors"
-	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/selector"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -434,10 +432,27 @@ func (l *loggingServer) PollFlightInfoStatement(ctx context.Context, cmd flights
 	return info, err
 }
 
+// isHealthMethod reports whether method is one of the gRPC health-checking
+// service methods.
+func isHealthMethod(method string) bool {
+	switch method {
+	case grpc_health_v1.Health_Check_FullMethodName,
+		grpc_health_v1.Health_List_FullMethodName,
+		grpc_health_v1.Health_Watch_FullMethodName:
+		return true
+	}
+	return false
+}
+
 // GRPCLoggingMiddleware returns a flight.ServerMiddleware that logs every
 // gRPC call at the transport level (method, duration, error, grpc_code).
+// Health-check calls are logged only on failure to keep probe noise out of
+// dashboards while still surfacing real probe regressions.
 func GRPCLoggingMiddleware() flight.ServerMiddleware {
 	logGRPC := func(ctx context.Context, method string, start time.Time, err error) {
+		if err == nil && isHealthMethod(method) {
+			return
+		}
 		attrs := []slog.Attr{
 			slog.String("grpc_method", method),
 			slog.Duration("duration", time.Since(start)),
@@ -455,16 +470,6 @@ func GRPCLoggingMiddleware() flight.ServerMiddleware {
 		slog.LogAttrs(ctx, slog.LevelInfo, "grpc call", attrs...)
 	}
 
-	notHealth := selector.MatchFunc(func(_ context.Context, callMeta interceptors.CallMeta) bool {
-		switch callMeta.FullMethod() {
-		case grpc_health_v1.Health_Check_FullMethodName,
-			grpc_health_v1.Health_List_FullMethodName,
-			grpc_health_v1.Health_Watch_FullMethodName:
-			return false
-		}
-		return true
-	})
-
 	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		start := time.Now()
 		resp, err := handler(ctx, req)
@@ -480,7 +485,7 @@ func GRPCLoggingMiddleware() flight.ServerMiddleware {
 	}
 
 	return flight.ServerMiddleware{
-		Unary:  selector.UnaryServerInterceptor(unary, notHealth),
-		Stream: selector.StreamServerInterceptor(stream, notHealth),
+		Unary:  unary,
+		Stream: stream,
 	}
 }
