@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"testing"
 	"time"
@@ -109,7 +110,7 @@ func (s *IcebergSuite) SetupSuite() {
 	minioInspect, err := s.minioC.Inspect(ctx)
 	s.Require().NoError(err)
 	minioIP := minioInspect.NetworkSettings.Networks[nw.Name].IPAddress
-	s.Require().NotEmpty(minioIP, "could not determine MinIO container IP")
+	s.Require().True(minioIP.IsValid(), "could not determine MinIO container IP")
 	minioEndpoint := fmt.Sprintf("http://%s:9000", minioIP)
 
 	// 4. Lakekeeper migrate (one-shot)
@@ -204,7 +205,7 @@ func (s *IcebergSuite) SetupSuite() {
 		IcebergEndpoint:  s.catalogURL,
 		IcebergWarehouse: warehouseName,
 		// No OAuth2 — Lakekeeper runs without auth in tests
-		S3Endpoint:  minioIP + ":9000",
+		S3Endpoint:  net.JoinHostPort(minioIP.String(), "9000"),
 		S3AccessKey: minioUser,
 		S3SecretKey: minioPassword,
 		S3Region:    "local-01",
