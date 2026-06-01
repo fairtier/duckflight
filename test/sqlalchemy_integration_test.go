@@ -16,7 +16,7 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
 	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/config"
 	duckserver "github.com/fairtier/duckflight/internal/server"
