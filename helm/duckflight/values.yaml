@@ -7,6 +7,23 @@ tenant: ""
 
 logLevel: ""  # DEBUG, INFO, WARN, ERROR (default: INFO)
 
+# The server never talks to the Kubernetes API.
+automountServiceAccountToken: false
+
+# Restricted-PSA-compliant by default. uid 1000 = the `duckflight` user baked
+# into the image (numeric so the kubelet can verify runAsNonRoot).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+
 iceberg:
   endpoint: ""
   warehouse: ""
