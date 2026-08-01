@@ -25,7 +25,7 @@ Flight SQL Client (ADBC/JDBC/Python/Go)
 
 - **One deployment per tenant** — no multi-tenant multiplexing; isolation comes from deployment isolation
 - **Stateless compute** — DuckDB is ephemeral; all durable state lives in Iceberg
-- **Horizontally scalable** — scale replicas behind a load balancer with session stickiness via auth header hashing
+- **Horizontally scalable** — scale replicas behind a load balancer with session stickiness via auth header hashing; per-client sessions survive L7 proxies via a server-minted session cookie (`arrow_flight_session_id`)
 - **Full Flight SQL protocol** — queries, prepared statements, transactions, catalog metadata
 
 ## Getting started
@@ -146,12 +146,30 @@ otherwise silently disable authentication, rate limiting or the result cap. It
 logs one explicit line at startup saying which auth backends are active, or
 `AUTH DISABLED` when none are.
 
-Each client connection gets its own server-side session, and with it a
-dedicated DuckDB connection holding its temp tables, `SET` overrides and
-transactions. Session identity comes from the handshake for `AUTH_USERS`, and
-from the token plus the peer address for `AUTH_TOKENS`/OIDC — so behind a proxy
-that pools upstream connections, clients sharing a single token may still share
-a session. Give each client its own token when they need isolation.
+Each client gets its own server-side session, and with it a dedicated DuckDB
+connection holding its temp tables, `SET` overrides and transactions. Session
+identity comes from the handshake-issued JWT for `AUTH_USERS`. For
+`AUTH_TOKENS`/OIDC the server mints an HMAC-signed session cookie
+(`arrow_flight_session_id`) on first contact; a client that echoes it keeps a
+stable per-client session no matter which connection — or which L7 proxy — its
+requests arrive on. The request that obtains the cookie still runs on the
+fallback session (token + peer address), so connection-local state created on
+the very first RPC does not carry over. Clients that never echo cookies keep
+the fallback behavior entirely: behind a proxy that pools upstream connections,
+such clients sharing a single token may share a session — give them their own
+tokens, or enable cookies. `CloseSession` releases the server-side session;
+the cookie stays valid and simply names a fresh session on next use.
+
+Enabling cookie echo per client:
+
+- **ADBC** (all languages): `--option "adbc.flight.sql.rpc.with_cookie_middleware=true"` (off by default)
+- **JDBC**: the Arrow Flight SQL driver handles cookies by default (`retainCookies=true`)
+- **arrow-go**: pass `flight.NewClientCookieMiddleware()` when constructing the client
+
+`AUTH_JWT_SECRET` also keys the cookie HMAC: set it for multi-replica
+deployments so a cookie minted by one pod verifies on another. Without it each
+process uses a random key, and foreign cookies just fall back to
+peer-address-derived sessions.
 
 **OIDC** (`OIDC_ISSUER`) — clients fetch JWTs directly from your IdP; the server validates against its JWKS. ADBC's FlightSQL driver handles the OAuth2 flow including refresh:
 

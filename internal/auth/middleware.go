@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"time"
 
@@ -124,6 +125,15 @@ func Middleware(cfg Config) (*flight.ServerMiddleware, error) {
 		v.local = newLocalJWT(secret, ttl)
 	}
 
+	// The cookie key follows AUTH_JWT_SECRET even when the Handshake flow is
+	// off, so a static/OIDC-only multi-replica deployment can keep cookies
+	// valid across replicas by setting the secret.
+	ca, err := newCookieAuthority(cfg.JWTSecret)
+	if err != nil {
+		return nil, err
+	}
+	v.cookies = ca
+
 	m := flight.ServerMiddleware{
 		Unary: func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 			if grpcutil.IsHealthMethod(info.FullMethod) {
@@ -167,6 +177,10 @@ type validator struct {
 	local        *localJWT
 	oidc         *oidcVerifier
 	staticTokens map[[sha256.Size]byte]struct{}
+	// cookies mints/verifies the session cookie that gives static/OIDC
+	// clients a per-client session id independent of the transport. Always
+	// non-nil when the middleware is enabled.
+	cookies *cookieAuthority
 }
 
 // credentialFromContext pulls `Authorization: <scheme> <credential>` out of the
@@ -205,9 +219,17 @@ func (v *validator) authenticate(ctx context.Context) (context.Context, error) {
 	if scheme != bearerScheme {
 		return nil, status.Errorf(codes.Unauthenticated, "unsupported authorization scheme %q", scheme)
 	}
-	id, err := v.identify(ctx, credential)
+	id, setCookie, err := v.identify(ctx, credential)
 	if err != nil {
 		return nil, err
+	}
+	if setCookie != "" {
+		// Best effort: a client without a cookie jar ignores it, and a
+		// SetHeader failure only means this request keeps its peer-derived
+		// session id — never a reason to fail the RPC.
+		if err := grpc.SetHeader(ctx, metadata.Pairs("set-cookie", setCookie)); err != nil {
+			slog.Debug("session set-cookie not sent", slog.String("error", err.Error()))
+		}
 	}
 	return context.WithValue(ctx, identityCtxKey{}, id), nil
 }
@@ -274,44 +296,79 @@ func (v *validator) matchesStaticToken(token string) bool {
 	return match == 1
 }
 
-// identify resolves a bearer token to an [Identity].
-func (v *validator) identify(ctx context.Context, token string) (Identity, error) {
+// identify resolves a bearer token to an [Identity]. The second return value
+// is a Set-Cookie header value to send back, or "" — returned rather than set
+// here so identify stays free of gRPC side effects.
+func (v *validator) identify(ctx context.Context, token string) (Identity, string, error) {
 	if v.matchesStaticToken(token) {
-		return Identity{Subject: "static", SessionID: deriveSessionID(ctx, token)}, nil
+		// Bind to the raw token: every static token shares the "static"
+		// subject, so binding to the subject would merge distinct tokens
+		// that happen to present the same cookie.
+		sid, setCookie := v.sessionForToken(ctx, token, token)
+		return Identity{Subject: "static", SessionID: sid}, setCookie, nil
 	}
 
 	iss, err := tokenIssuer(token)
 	if err != nil {
 		// Not a JWT and not in the static allowlist.
-		return Identity{}, status.Error(codes.Unauthenticated, "invalid bearer token")
+		return Identity{}, "", status.Error(codes.Unauthenticated, "invalid bearer token")
 	}
 
 	switch {
 	case v.oidc != nil && iss == v.oidc.issuer:
 		sub, err := v.oidc.verify(token)
 		if err != nil {
-			return Identity{}, status.Errorf(codes.Unauthenticated, "oidc: %s", err)
+			return Identity{}, "", status.Errorf(codes.Unauthenticated, "oidc: %s", err)
 		}
-		// An external issuer can't stamp our session ids, so derive one.
-		return Identity{Subject: sub, SessionID: deriveSessionID(ctx, token)}, nil
+		// An external issuer can't stamp our session ids, so use the cookie.
+		// Bind to issuer+subject rather than the raw token: OAuth refresh
+		// rotates the token mid-session, and rebinding on every rotation
+		// would orphan the client's temp tables and open transactions.
+		sid, setCookie := v.sessionForToken(ctx, token, "oidc\x00"+v.oidc.issuer+"\x00"+sub)
+		return Identity{Subject: sub, SessionID: sid}, setCookie, nil
 	case v.local != nil && iss == localJWTIssuer:
 		sub, sid, err := v.local.verify(token)
 		if err != nil {
-			return Identity{}, status.Errorf(codes.Unauthenticated, "jwt: %s", err)
+			return Identity{}, "", status.Errorf(codes.Unauthenticated, "jwt: %s", err)
 		}
-		// Fallback: an old token minted before the sid claim existed gets a
-		// derived id so it still pins to a session.
-		if sid == "" {
-			sid = deriveSessionID(ctx, token)
+		// A token with a server-stamped sid needs no cookie. An old token
+		// minted before the sid claim existed is exactly the "no stamped
+		// sid" case the cookie exists for.
+		if sid != "" {
+			return Identity{Subject: sub, SessionID: sid}, "", nil
 		}
-		return Identity{Subject: sub, SessionID: sid}, nil
+		sid, setCookie := v.sessionForToken(ctx, token, token)
+		return Identity{Subject: sub, SessionID: sid}, setCookie, nil
 	default:
-		return Identity{}, status.Error(codes.Unauthenticated, "unknown token issuer")
+		return Identity{}, "", status.Error(codes.Unauthenticated, "unknown token issuer")
 	}
 }
 
+// sessionForToken resolves the session id for a bearer token that carries no
+// server-stamped session id of its own. A valid echoed cookie wins — it
+// identifies the client regardless of which socket (or L7 proxy connection)
+// the request arrived on. Otherwise this request keeps the peer-derived id
+// and a fresh cookie is minted for the next one; clients that never echo
+// cookies therefore keep the peer-derived behavior exactly.
+func (v *validator) sessionForToken(ctx context.Context, token, binding string) (sid, setCookie string) {
+	if val, ok := incomingSessionCookie(ctx); ok {
+		if id, ok := v.cookies.verify(val); ok {
+			return cookieSessionID(id, binding), ""
+		}
+	}
+	sid = deriveSessionID(ctx, token)
+	mv, err := v.cookies.mint()
+	if err != nil {
+		slog.Warn("session cookie mint failed; using peer-derived session id", slog.String("error", err.Error()))
+		return sid, ""
+	}
+	return sid, (&http.Cookie{Name: sessionCookieName, Value: mv}).String()
+}
+
 // deriveSessionID builds a stable, opaque session id for a bearer token that
-// carries no session id of its own (static tokens, OIDC tokens).
+// carries no session id of its own (static tokens, OIDC tokens) and whose
+// request echoed no valid session cookie — it is the fallback rung under
+// [validator.sessionForToken]'s cookie lookup.
 //
 // The peer address is mixed in so the id identifies a *client connection*
 // rather than the token. Keying on the token alone would collapse every client

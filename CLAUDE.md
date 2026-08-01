@@ -35,8 +35,9 @@ internal/
   engine/
     engine.go                DuckDB connector lifecycle, boot SQL, Iceberg ATTACH
     pool.go                  Bounded channel-based ArrowConn pool
-  auth/middleware.go         Bearer token flight.ServerMiddleware (own header parsing, not arrow-go's); derives a per-connection sid
+  auth/middleware.go         Bearer token flight.ServerMiddleware (own header parsing, not arrow-go's); resolves the sid (JWT claim → cookie → peer)
   auth/jwt.go                HS256 token mint/verify with sid (session id) claim
+  auth/cookie.go             HMAC-signed session cookie mint/verify/parse (Flight arrow_flight_session_id)
   ratelimit/middleware.go    Token-bucket rate limit flight.ServerMiddleware
   session/manager.go         Pins one DuckDB connection per Flight session, idle reaper
   server/
@@ -59,15 +60,24 @@ test/
 
 **Per-client sessions.** When a request carries an authenticated session id
 (`auth.SessionIDFromContext`), every RPC for that client routes to a single
-DuckDB connection pinned by `session.Manager`. Handshake-issued JWTs stamp a
-fresh UUID into the `sid` claim; OIDC/static tokens derive a sid from
-`sha256(token + peer address)` — per *connection*, not per token, so two
-clients sharing one API key don't share a DuckDB connection (and its temp
-tables, settings and transactions). The peer address is the *immediate* peer,
-so behind an L7 proxy that pools upstream connections (the shipped Envoy
-GRPCRoute does), clients sharing a token can still land on one session — give
-each client its own token, or use the Handshake flow, whose sid is per
-handshake. This makes DuckDB-native
+DuckDB connection pinned by `session.Manager`. Sid precedence: a
+handshake-issued JWT's `sid` claim (a per-handshake UUID) → a valid echoed
+session cookie (`sid = sha256(cookieID ‖ binding)`) → `sha256(token + peer
+address)`. The cookie (`arrow_flight_session_id`, HMAC-signed, minted in
+`auth/cookie.go`) identifies the *client* rather than the socket, so it
+survives L7 proxies that pool upstream connections (the shipped Envoy
+GRPCRoute does) — without it, clients sharing one token behind such a proxy
+share the proxy's peer address and land on one session. Cookie echo is
+client-opt-in (ADBC `adbc.flight.sql.rpc.with_cookie_middleware`, JDBC default
+on); non-echoing clients keep the peer-derived fallback. The cookie's binding
+is the raw token for static tokens but `issuer+subject` for OIDC, so OAuth
+token refresh keeps the session. Forged/foreign cookies read as absent (fail
+open to peer derivation — the sid mixes in the token/subject, so forging only
+selects among the forger's own sessions). arrow-go's `flight/session`
+middleware was deliberately not used: no TTL, unbounded store growth from
+non-echoing clients, panics on store errors, no identity binding. Envoy
+stickiness still hashes the `authorization` header (one token → one pod); the
+cookie splits sessions *within* the pod. This makes DuckDB-native
 `BEGIN`/`COMMIT`/`ROLLBACK`, `CREATE TEMP TABLE`, `SET`, `PRAGMA`, `ATTACH`,
 and prepared statements behave the way standard SQL clients (SQLAlchemy, ADBC
 DBAPI with `autocommit=False`, JDBC) expect. Anonymous (no-auth) requests fall
