@@ -14,7 +14,9 @@ import (
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // ---------------------------------------------------------------------------
@@ -122,6 +124,7 @@ func (s *MeteringSuite) SetupTest() {
 }
 
 func (s *MeteringSuite) TearDownTest() {
+	waitQuiescent(s.T(), s.srv)
 	s.Assert().Equal(0, s.srv.OpenTransactionCount(), "leaked transactions")
 	s.Assert().Equal(0, s.srv.PreparedStatementCount(), "leaked prepared statements")
 	s.Assert().Equal(0, s.srv.ActiveQueryCount(), "leaked active queries")
@@ -136,7 +139,11 @@ func (s *MeteringSuite) TearDownTest() {
 // MaxResultBytes tests
 // ---------------------------------------------------------------------------
 
-func (s *MeteringSuite) TestMaxResultBytesLimitsRows() {
+// TestMaxResultBytesFailsInsteadOfTruncating pins down that hitting the cap is
+// an error, not a short read. Ending the stream cleanly would hand an ETL
+// client a truncated dataset that is indistinguishable from a complete one,
+// with a gRPC OK on top.
+func (s *MeteringSuite) TestMaxResultBytesFailsInsteadOfTruncating() {
 	ctx := context.Background()
 	info, err := s.client.Execute(ctx, "SELECT * FROM range(100000) t(id)")
 	s.Require().NoError(err)
@@ -152,8 +159,39 @@ func (s *MeteringSuite) TestMaxResultBytesLimitsRows() {
 		total += rec.NumRows()
 		rec.Release()
 	}
-	s.Less(total, int64(100000), "MaxResultBytes should limit the number of rows returned")
-	s.Greater(total, int64(0), "should return at least some rows")
+	s.Less(total, int64(100000), "MaxResultBytes should stop the stream early")
+
+	s.Require().Error(rdr.Err(), "a truncated result must not be reported as success")
+	st, ok := status.FromError(rdr.Err())
+	s.Require().True(ok)
+	s.Equal(codes.ResourceExhausted, st.Code())
+}
+
+// TestMaxResultBytesCountsNestedData covers byte accounting for nested types.
+// A LIST column's top-level buffers are only validity bits and offsets, so
+// counting those alone lets a single row stream unbounded data past a cap that
+// never trips — and undercounts the billing signal by orders of magnitude.
+func (s *MeteringSuite) TestMaxResultBytesCountsNestedData() {
+	ctx := context.Background()
+	// One row, one list of 200k int64s — ~1.6 MB of child data behind a
+	// handful of top-level bytes.
+	info, err := s.client.Execute(ctx, "SELECT list(id) AS payload FROM range(200000) t(id)")
+	s.Require().NoError(err)
+
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.Require().NoError(err)
+	defer rdr.Release()
+
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		rec.Retain()
+		rec.Release()
+	}
+
+	s.Require().Error(rdr.Err(), "nested child data must count toward MaxResultBytes")
+	st, ok := status.FromError(rdr.Err())
+	s.Require().True(ok)
+	s.Equal(codes.ResourceExhausted, st.Code())
 }
 
 func (s *MeteringSuite) TestMaxResultBytesSmallQueryPasses() {

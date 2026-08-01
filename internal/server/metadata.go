@@ -34,14 +34,17 @@ func (s *DuckFlightSQLServer) flightInfoForCommand(desc *flight.FlightDescriptor
 func (s *DuckFlightSQLServer) streamMetadata(
 	ctx context.Context, query string, schema *arrow.Schema,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	ac, err := s.acquirePoolConn(ctx)
+	// Routed through acquireConn, like every other statement path: metadata
+	// asked for inside a session has to see that session's temp tables and
+	// its transaction's snapshot, not an unrelated pool connection's view.
+	ac, release, err := s.acquireConn(ctx, "")
 	if err != nil {
 		return nil, nil, err
 	}
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
 	if err != nil {
-		s.engine.Pool.Release(ac)
+		release()
 		return nil, nil, status.Errorf(codes.Internal, "query error: %s", err)
 	}
 
@@ -49,7 +52,7 @@ func (s *DuckFlightSQLServer) streamMetadata(
 	go func() {
 		defer close(ch)
 		defer rdr.Release()
-		defer s.engine.Pool.Release(ac)
+		defer release()
 		for rdr.Next() {
 			rec := rdr.RecordBatch()
 			cols := make([]arrow.Array, rec.NumCols())
@@ -60,6 +63,7 @@ func (s *DuckFlightSQLServer) streamMetadata(
 			select {
 			case ch <- flight.StreamChunk{Data: out}:
 			case <-ctx.Done():
+				out.Release()
 				return
 			}
 		}
@@ -140,14 +144,14 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	}
 
 	// With include_schema we need to append a binary column per batch.
-	ac, err := s.acquirePoolConn(ctx)
+	ac, release, err := s.acquireConn(ctx, "")
 	if err != nil {
 		return nil, nil, err
 	}
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
 	if err != nil {
-		s.engine.Pool.Release(ac)
+		release()
 		return nil, nil, status.Errorf(codes.Internal, "query error: %s", err)
 	}
 
@@ -155,7 +159,7 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	go func() {
 		defer close(ch)
 		defer rdr.Release()
-		defer s.engine.Pool.Release(ac)
+		defer release()
 		for rdr.Next() {
 			rec := rdr.RecordBatch()
 			nrows := rec.NumRows()
@@ -199,6 +203,7 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			select {
 			case ch <- flight.StreamChunk{Data: out}:
 			case <-ctx.Done():
+				out.Release()
 				return
 			}
 		}
@@ -393,19 +398,30 @@ func (s *DuckFlightSQLServer) DoGetTableTypes(_ context.Context) (*arrow.Schema,
 	return schema_ref.TableTypes, ch, nil
 }
 
+// catalogFilter renders the catalog predicate for a metadata query. Per the
+// Flight SQL spec an omitted (nil) catalog must not narrow the result — only
+// an explicitly supplied one does, including the empty string, which selects
+// objects with no catalog. Defaulting to current_database() instead would hide
+// every ATTACHed catalog, so an Iceberg lake would simply not appear in a
+// client's schema tree.
 func catalogFilter(col string, c *string) string {
 	if c != nil {
 		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*c))
 	}
-	return col + " = current_database()"
+	return noFilter
 }
 
+// schemaFilter is the schema-name counterpart to [catalogFilter].
 func schemaFilter(col string, s *string) string {
 	if s != nil {
 		return fmt.Sprintf("%s = '%s'", col, escapeSQLString(*s))
 	}
-	return col + " = current_schema()"
+	return noFilter
 }
+
+// noFilter is a predicate that matches everything, so callers can splice it
+// into a WHERE clause without special-casing the "no filter" branch.
+const noFilter = "TRUE"
 
 // escapeSQLString escapes single quotes in SQL string literals.
 func escapeSQLString(s string) string {

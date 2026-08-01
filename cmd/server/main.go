@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -32,7 +33,18 @@ import (
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/reflection"
+)
+
+const (
+	// shutdownGrace bounds how long in-flight RPCs get to finish before the
+	// server is stopped the hard way.
+	shutdownGrace = 20 * time.Second
+	// maxConcurrentStreams caps the streams one connection may open. Health
+	// RPCs — including the streaming Watch — bypass auth, so without a cap an
+	// unauthenticated peer can pin a goroutine per stream indefinitely.
+	maxConcurrentStreams = 256
 )
 
 func main() {
@@ -81,12 +93,32 @@ func run() error {
 	duckserver.InitMetrics(meter)
 	ratelimit.InitMetrics(meter)
 
+	poolSize, err := envInt("POOL_SIZE", 8)
+	if err != nil {
+		slog.Error("invalid configuration", slog.String("error", err.Error()))
+		return err
+	}
+	if poolSize < 1 {
+		slog.Error("POOL_SIZE must be at least 1", slog.Int("value", poolSize))
+		return fmt.Errorf("POOL_SIZE must be at least 1, got %d", poolSize)
+	}
+	maxThreads, err := envInt("MAX_THREADS", 4)
+	if err != nil {
+		slog.Error("invalid configuration", slog.String("error", err.Error()))
+		return err
+	}
+	maxResultBytes, err := envInt64("MAX_RESULT_BYTES", 0)
+	if err != nil {
+		slog.Error("invalid configuration", slog.String("error", err.Error()))
+		return err
+	}
+
 	cfg := &config.Config{
 		MemoryLimit:         envOr("MEMORY_LIMIT", "1GB"),
-		MaxThreads:          envInt("MAX_THREADS", 4),
+		MaxThreads:          maxThreads,
 		QueryTimeout:        envOr("QUERY_TIMEOUT", "30s"),
-		PoolSize:            envInt("POOL_SIZE", 8),
-		MaxResultBytes:      envInt64("MAX_RESULT_BYTES", 0),
+		PoolSize:            poolSize,
+		MaxResultBytes:      maxResultBytes,
 		IcebergEndpoint:     os.Getenv("ICEBERG_ENDPOINT"),
 		IcebergWarehouse:    os.Getenv("ICEBERG_WAREHOUSE"),
 		IcebergClientID:     os.Getenv("ICEBERG_CLIENT_ID"),
@@ -106,10 +138,20 @@ func run() error {
 		return err
 	}
 
+	users, err := parseUsers(os.Getenv("AUTH_USERS"))
+	if err != nil {
+		slog.Error("invalid AUTH_USERS", slog.String("error", err.Error()))
+		return err
+	}
+	jwtTTL, err := envDuration("AUTH_JWT_TTL", time.Hour)
+	if err != nil {
+		slog.Error("invalid configuration", slog.String("error", err.Error()))
+		return err
+	}
 	authCfg := auth.Config{
-		Users:        parseUsers(os.Getenv("AUTH_USERS")),
+		Users:        users,
 		JWTSecret:    []byte(os.Getenv("AUTH_JWT_SECRET")),
-		JWTTTL:       envDuration("AUTH_JWT_TTL", time.Hour),
+		JWTTTL:       jwtTTL,
 		StaticTokens: parseCSV(os.Getenv("AUTH_TOKENS")),
 	}
 	if iss := os.Getenv("OIDC_ISSUER"); iss != "" {
@@ -127,31 +169,68 @@ func run() error {
 	}
 
 	// Rate limit middleware — set RATE_LIMIT_RPS env var to enable.
-	rateLimitRPS := envFloat64("RATE_LIMIT_RPS", 0)
-	rateLimitBurst := envInt("RATE_LIMIT_BURST", 0)
+	rateLimitRPS, err := envFloat64("RATE_LIMIT_RPS", 0)
+	if err != nil {
+		slog.Error("invalid configuration", slog.String("error", err.Error()))
+		return err
+	}
+	rateLimitBurst, err := envInt("RATE_LIMIT_BURST", 0)
+	if err != nil {
+		slog.Error("invalid configuration", slog.String("error", err.Error()))
+		return err
+	}
 
-	// Middleware order: logging (outer) → auth → rate limit (inner).
-	// Auth rejects unauthenticated requests before consuming rate limit tokens.
-	var middlewares []flight.ServerMiddleware
-	middlewares = append(middlewares, duckserver.GRPCLoggingMiddleware())
-	if authMW != nil {
-		middlewares = append(middlewares, *authMW)
+	// Middleware order: recovery (outer) → logging → rate limit → auth (inner).
+	// Recovery is outermost so a panic anywhere below it fails one call
+	// instead of the process. Rate limiting sits above auth so that the
+	// expensive part of authentication — signature verification, JWKS
+	// lookups — is itself subject to the limit.
+	middlewares := []flight.ServerMiddleware{
+		duckserver.RecoveryMiddleware(),
+		duckserver.GRPCLoggingMiddleware(),
 	}
 	if m := ratelimit.Middleware(rateLimitRPS, rateLimitBurst); m != nil {
 		middlewares = append(middlewares, *m)
 	}
+	if authMW != nil {
+		middlewares = append(middlewares, *authMW)
+	}
 
-	grpcOpts := []grpc.ServerOption{grpc.StatsHandler(otelgrpc.NewServerHandler(
-		otelgrpc.WithFilter(filters.Not(filters.HealthCheck())),
-	))}
+	grpcOpts := []grpc.ServerOption{
+		grpc.StatsHandler(otelgrpc.NewServerHandler(
+			otelgrpc.WithFilter(filters.Not(filters.HealthCheck())),
+		)),
+		// Bound what one unauthenticated peer can pin: health RPCs (including
+		// the streaming Watch) bypass auth, and each open stream holds a
+		// goroutine. Keepalive enforcement drops connections that go silent.
+		grpc.MaxConcurrentStreams(uint32(maxConcurrentStreams)),
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             30 * time.Second,
+			PermitWithoutStream: true,
+		}),
+		grpc.KeepaliveParams(keepalive.ServerParameters{
+			MaxConnectionIdle: 15 * time.Minute,
+			Time:              2 * time.Minute,
+			Timeout:           20 * time.Second,
+		}),
+	}
 
-	if certFile, keyFile := os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY"); certFile != "" && keyFile != "" {
+	certFile, keyFile := os.Getenv("TLS_CERT"), os.Getenv("TLS_KEY")
+	// Half-configured TLS is a misconfiguration, not a request for plaintext.
+	// Treating it as "TLS not requested" would silently put bearer tokens and
+	// query results on the wire in the clear.
+	if (certFile == "") != (keyFile == "") {
+		slog.Error("TLS_CERT and TLS_KEY must be set together")
+		return fmt.Errorf("TLS_CERT and TLS_KEY must be set together")
+	}
+	tlsEnabled := certFile != ""
+	if tlsEnabled {
 		cert, err := tls.LoadX509KeyPair(certFile, keyFile)
 		if err != nil {
 			slog.Error("failed to load TLS certificate", slog.String("error", err.Error()))
 			return err
 		}
-		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}}
+		tlsCfg := &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS12}
 
 		if caFile := os.Getenv("TLS_CA"); caFile != "" {
 			caPEM, err := os.ReadFile(caFile)
@@ -172,6 +251,17 @@ func run() error {
 		slog.Info("TLS enabled", slog.String("cert", certFile), slog.String("key", keyFile))
 	}
 
+	// One unambiguous line about the security posture, so an open server is
+	// never something you have to infer from a missing log entry.
+	if authMW == nil {
+		slog.Warn("AUTH DISABLED — every network peer can execute arbitrary SQL; set AUTH_USERS, AUTH_TOKENS or OIDC_ISSUER")
+	} else {
+		slog.Info("auth enabled", slog.String("backends", strings.Join(authCfg.Backends(), ",")))
+		if !tlsEnabled {
+			slog.Warn("auth is enabled but TLS is not; credentials and bearer tokens cross the network in cleartext")
+		}
+	}
+
 	server := flight.NewServerWithMiddleware(middlewares, grpcOpts...)
 	server.RegisterFlightService(flightsql.NewFlightServer(duckserver.NewLoggingServer(srv)))
 	reflection.Register(server)
@@ -188,32 +278,101 @@ func run() error {
 
 	// Metrics endpoint
 	metricAddr := envOr("METRIC_ADDR", "0.0.0.0:9090")
+	mux := http.NewServeMux()
+	mux.Handle("/metrics", promhttp.HandlerFor(tel.Gatherer, promhttp.HandlerOpts{}))
+	metricSrv := &http.Server{
+		Addr:    metricAddr,
+		Handler: mux,
+		// Without a header deadline a peer can hold connections open by
+		// dribbling out request headers.
+		ReadHeaderTimeout: 10 * time.Second,
+	}
 	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.HandlerFor(tel.Gatherer, promhttp.HandlerOpts{}))
 		slog.Info("metrics server listening", slog.String("addr", metricAddr))
-		if err := http.ListenAndServe(metricAddr, mux); err != nil {
+		if err := metricSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			slog.Error("metrics server error", slog.String("error", err.Error()))
 		}
 	}()
 
 	slog.Info("DuckFlight SQL server listening", slog.String("addr", addr))
 
-	go func() {
-		if err := server.Serve(); err != nil {
-			slog.Error("server error", slog.String("error", err.Error()))
-		}
-	}()
+	// serveErr also signals shutdown: if Serve returns, gRPC is dead and the
+	// process must exit so the orchestrator restarts it. Blocking on the
+	// signal alone would leave a process that answers health checks with
+	// SERVING while serving nothing.
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- server.Serve() }()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
-	<-sig
 
-	slog.Info("shutting down")
+	var runErr error
+	select {
+	case runErr = <-serveErr:
+		if runErr != nil {
+			slog.Error("server error", slog.String("error", runErr.Error()))
+		} else {
+			slog.Error("gRPC server stopped serving unexpectedly")
+			runErr = fmt.Errorf("gRPC server stopped serving")
+		}
+	case <-sig:
+		slog.Info("shutting down")
+	}
+
+	// Stop reporting healthy first, so load balancers drain us before the
+	// in-flight streams are cut.
 	healthSrv.Shutdown()
-	server.Shutdown()
-	return nil
+
+	// arrow-go only exposes GracefulStop, which waits on in-flight RPCs with no
+	// deadline of its own — one stalled DoGet would otherwise keep the process
+	// alive until the pod is SIGKILLed, and a second SIGTERM would be swallowed.
+	stopped := make(chan struct{})
+	go func() {
+		server.Shutdown()
+		close(stopped)
+	}()
+
+	graceful := true
+	select {
+	case <-stopped:
+	case <-time.After(shutdownGrace):
+		slog.Warn("graceful shutdown timed out", slog.Duration("after", shutdownGrace))
+		graceful = false
+	case <-sig:
+		slog.Warn("second signal received during shutdown")
+		graceful = false
+	}
+
+	shCtx, shCancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer shCancel()
+	if err := metricSrv.Shutdown(shCtx); err != nil {
+		slog.Error("metrics server shutdown error", slog.String("error", err.Error()))
+	}
+
+	if !graceful {
+		// Stop waiting and let the process exit. Deliberately skipping
+		// srv.Close(): closing DuckDB connections underneath streams that are
+		// still running them would crash in CGo, and there is nothing left to
+		// preserve — exiting reclaims everything an in-memory engine holds.
+		slog.Warn("exiting without waiting for in-flight streams")
+		return errForcedShutdown
+	}
+
+	// Closes the session manager, the background reapers and the DuckDB engine.
+	if err := srv.Close(); err != nil {
+		slog.Error("server close error", slog.String("error", err.Error()))
+	}
+	return runErr
 }
+
+// errForcedShutdown reports that shutdown gave up on in-flight RPCs, so the
+// exit status distinguishes a clean drain from a forced one.
+var errForcedShutdown = errors.New("shutdown forced before in-flight RPCs completed")
+
+// Every env parser below reports malformed input rather than falling back to
+// the default. Several of these values are protections — RATE_LIMIT_RPS,
+// MAX_RESULT_BYTES — and silently reading a typo as "0" turns them off with no
+// signal at all.
 
 func envOr(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
@@ -222,31 +381,40 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-func envInt(key string, fallback int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+func envInt(key string, fallback int) (int, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
 	}
-	return fallback
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not an integer", key, v)
+	}
+	return n, nil
 }
 
-func envInt64(key string, fallback int64) int64 {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-			return n
-		}
+func envInt64(key string, fallback int64) (int64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
 	}
-	return fallback
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not an integer", key, v)
+	}
+	return n, nil
 }
 
-func envFloat64(key string, fallback float64) float64 {
-	if v := os.Getenv(key); v != "" {
-		if f, err := strconv.ParseFloat(v, 64); err == nil {
-			return f
-		}
+func envFloat64(key string, fallback float64) (float64, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
 	}
-	return fallback
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a number", key, v)
+	}
+	return f, nil
 }
 
 func envBool(key string) bool {
@@ -254,13 +422,16 @@ func envBool(key string) bool {
 	return v == "true" || v == "1"
 }
 
-func envDuration(key string, fallback time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
+func envDuration(key string, fallback time.Duration) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
 	}
-	return fallback
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %q is not a duration", key, v)
+	}
+	return d, nil
 }
 
 func parseCSV(v string) []string {
@@ -278,27 +449,36 @@ func parseCSV(v string) []string {
 	return out
 }
 
-func parseUsers(v string) map[string]string {
+// parseUsers parses AUTH_USERS ("user:pass,user2:pass2"). A malformed entry is
+// an error rather than a skipped line: dropping it silently can leave zero
+// users parsed, which disables the whole auth layer and starts a fully open
+// server on the strength of one missing colon.
+//
+// Entries are never echoed — `AUTH_USERS=":hunter2"` would otherwise write the
+// password to stderr and on to the OTLP collector.
+func parseUsers(v string) (map[string]string, error) {
 	if v == "" {
-		return nil
+		return nil, nil
 	}
 	out := make(map[string]string)
-	for _, pair := range strings.Split(v, ",") {
+	for i, pair := range strings.Split(v, ",") {
 		pair = strings.TrimSpace(pair)
 		if pair == "" {
 			continue
 		}
 		user, pass, ok := strings.Cut(pair, ":")
-		if !ok || user == "" {
-			slog.Warn("AUTH_USERS entry missing ':' separator; skipping", slog.String("entry", pair))
-			continue
+		if !ok {
+			return nil, fmt.Errorf("AUTH_USERS entry %d is missing the ':' separator", i+1)
+		}
+		if user == "" {
+			return nil, fmt.Errorf("AUTH_USERS entry %d has an empty username", i+1)
 		}
 		out[user] = pass
 	}
 	if len(out) == 0 {
-		return nil
+		return nil, errors.New("AUTH_USERS is set but contains no usable entries")
 	}
-	return out
+	return out, nil
 }
 
 // levelHandler filters log records below a minimum level.

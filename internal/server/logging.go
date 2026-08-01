@@ -12,6 +12,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
+	"go.opentelemetry.io/otel/attribute"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/health/grpc_health_v1"
@@ -53,6 +54,30 @@ func derefStringPtr(s *string) string {
 		return *s
 	}
 	return ""
+}
+
+// queryAttrs returns the SQL text as a log attribute only when DEBUG logging
+// is on. Statements routinely carry credentials (`CREATE SECRET … SECRET
+// '…'`, `ATTACH … (TOKEN '…')`) and PII in literals, and these logs go to
+// stderr and on to the OTLP collector, so the text is not something to emit at
+// INFO on every call. The statement length still gives operators a handle on
+// call shape without the contents.
+func queryAttrs(ctx context.Context, query string) []slog.Attr {
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		return []slog.Attr{slog.String("query", query)}
+	}
+	return []slog.Attr{slog.Int("query_len", len(query))}
+}
+
+// statementAttr is the tracing counterpart of [queryAttrs]. Spans are exported
+// to the OTLP collector just like logs are, so `db.statement` is the same
+// exfiltration path for a `CREATE SECRET … SECRET '…'` as a log line is, and
+// it gets the same DEBUG gate.
+func statementAttr(ctx context.Context, query string) attribute.KeyValue {
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		return attribute.String("db.statement", query)
+	}
+	return attribute.Int("db.statement_length", len(query))
 }
 
 // schemaFields returns a compact string of field names and types, e.g.
@@ -99,7 +124,7 @@ func schemaAttrs(s *arrow.Schema) []slog.Attr {
 func (l *loggingServer) GetFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.FlightInfo, error) {
 	start := time.Now()
 	info, err := l.DuckFlightSQLServer.GetFlightInfoStatement(ctx, cmd, desc)
-	attrs := []slog.Attr{slog.String("query", cmd.GetQuery())}
+	attrs := queryAttrs(ctx, cmd.GetQuery())
 	attrs = append(attrs, flightInfoAttrs(info)...)
 	logCall(ctx, "GetFlightInfoStatement", start, err, attrs...)
 	return info, err
@@ -115,17 +140,15 @@ func (l *loggingServer) DoGetStatement(ctx context.Context, cmd flightsql.Statem
 func (l *loggingServer) DoPutCommandStatementUpdate(ctx context.Context, cmd flightsql.StatementUpdate) (int64, error) {
 	start := time.Now()
 	n, err := l.DuckFlightSQLServer.DoPutCommandStatementUpdate(ctx, cmd)
-	logCall(ctx, "DoPutCommandStatementUpdate", start, err,
-		slog.String("query", cmd.GetQuery()),
-		slog.Int64("affected_rows", n),
-	)
+	attrs := append(queryAttrs(ctx, cmd.GetQuery()), slog.Int64("affected_rows", n))
+	logCall(ctx, "DoPutCommandStatementUpdate", start, err, attrs...)
 	return n, err
 }
 
 func (l *loggingServer) GetSchemaStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.SchemaResult, error) {
 	start := time.Now()
 	result, err := l.DuckFlightSQLServer.GetSchemaStatement(ctx, cmd, desc)
-	attrs := []slog.Attr{slog.String("query", cmd.GetQuery())}
+	attrs := queryAttrs(ctx, cmd.GetQuery())
 	if result != nil {
 		attrs = append(attrs, slog.Int("schema_bytes", len(result.Schema)))
 	}
@@ -214,7 +237,7 @@ func (l *loggingServer) DoGetTableTypes(ctx context.Context) (*arrow.Schema, <-c
 func (l *loggingServer) CreatePreparedStatement(ctx context.Context, req flightsql.ActionCreatePreparedStatementRequest) (flightsql.ActionCreatePreparedStatementResult, error) {
 	start := time.Now()
 	result, err := l.DuckFlightSQLServer.CreatePreparedStatement(ctx, req)
-	attrs := []slog.Attr{slog.String("query", req.GetQuery())}
+	attrs := queryAttrs(ctx, req.GetQuery())
 	if result.DatasetSchema != nil {
 		attrs = append(attrs, slog.String("dataset_schema", schemaFields(result.DatasetSchema)))
 	}
@@ -428,7 +451,7 @@ func (l *loggingServer) CancelFlightInfo(ctx context.Context, req *flight.Cancel
 func (l *loggingServer) PollFlightInfoStatement(ctx context.Context, cmd flightsql.StatementQuery, desc *flight.FlightDescriptor) (*flight.PollInfo, error) {
 	start := time.Now()
 	info, err := l.DuckFlightSQLServer.PollFlightInfoStatement(ctx, cmd, desc)
-	logCall(ctx, "PollFlightInfoStatement", start, err, slog.String("query", cmd.GetQuery()))
+	logCall(ctx, "PollFlightInfoStatement", start, err, queryAttrs(ctx, cmd.GetQuery())...)
 	return info, err
 }
 

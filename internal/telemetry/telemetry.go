@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	promclient "github.com/prometheus/client_golang/prometheus"
 	"go.opentelemetry.io/otel"
@@ -17,8 +18,6 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 )
 
 // Config holds OpenTelemetry configuration.
@@ -41,6 +40,19 @@ func (t *Telemetry) LoggerProvider() *sdklog.LoggerProvider {
 	return t.loggerProvider
 }
 
+// normalizeOTLPEndpoint strips a scheme from the configured endpoint. The gRPC
+// exporters take a host:port dial target and do no scheme handling of their
+// own, so a natural-looking `http://collector:4317` would produce a dial
+// target that never connects.
+func normalizeOTLPEndpoint(endpoint string) string {
+	for _, scheme := range []string{"http://", "https://", "grpc://", "dns://"} {
+		if after, ok := strings.CutPrefix(endpoint, scheme); ok {
+			return strings.TrimSuffix(after, "/")
+		}
+	}
+	return endpoint
+}
+
 // Setup initializes OTel trace and metric providers.
 func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	if cfg.ServiceName == "" {
@@ -59,10 +71,10 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	// Tracing: only set up if endpoint is provided.
 	if cfg.OTLPEndpoint != "" {
 		opts := []otlptracegrpc.Option{
-			otlptracegrpc.WithEndpoint(cfg.OTLPEndpoint),
+			otlptracegrpc.WithEndpoint(normalizeOTLPEndpoint(cfg.OTLPEndpoint)),
 		}
 		if cfg.Insecure {
-			opts = append(opts, otlptracegrpc.WithDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())))
+			opts = append(opts, otlptracegrpc.WithInsecure())
 		}
 		exporter, err := otlptracegrpc.New(ctx, opts...)
 		if err != nil {
@@ -101,10 +113,10 @@ func Setup(ctx context.Context, cfg Config) (*Telemetry, error) {
 	}
 	if cfg.OTLPEndpoint != "" {
 		logOpts := []otlploggrpc.Option{
-			otlploggrpc.WithEndpoint(cfg.OTLPEndpoint),
+			otlploggrpc.WithEndpoint(normalizeOTLPEndpoint(cfg.OTLPEndpoint)),
 		}
 		if cfg.Insecure {
-			logOpts = append(logOpts, otlploggrpc.WithDialOption(grpc.WithTransportCredentials(insecure.NewCredentials())))
+			logOpts = append(logOpts, otlploggrpc.WithInsecure())
 		}
 		otlpExporter, err := otlploggrpc.New(ctx, logOpts...)
 		if err != nil {

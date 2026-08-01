@@ -3,22 +3,70 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/scalar"
+	"github.com/fairtier/duckflight/internal/engine"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
+// preparedStatement is stored by pointer so parameter binding and idle-timer
+// updates don't have to read-modify-write a map value and clobber each other.
 type preparedStatement struct {
-	query     string
-	params    [][]any
+	query string
+	// txnID binds the statement to the Flight transaction it was created in,
+	// so executing it runs on that transaction's connection. Without this an
+	// INSERT prepared inside a transaction runs on an unrelated pool
+	// connection in autocommit and survives the client's rollback.
+	txnID     string
 	createdAt time.Time
+	lastUsed  atomic.Int64 // unix nanos
+
+	mu     sync.Mutex
+	params [][]any
+}
+
+func (ps *preparedStatement) touch() { ps.lastUsed.Store(time.Now().UnixNano()) }
+
+func (ps *preparedStatement) idleFor(now time.Time) time.Duration {
+	return now.Sub(time.Unix(0, ps.lastUsed.Load()))
+}
+
+func (ps *preparedStatement) setParams(params [][]any) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	ps.params = params
+}
+
+func (ps *preparedStatement) getParams() [][]any {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	return ps.params
+}
+
+// resolveConn routes a prepared statement to the connection it belongs on.
+//
+// A statement created inside a transaction stays bound to it. Once that
+// transaction is committed or rolled back the statement has no home: falling
+// back to a pool connection would silently run it in autocommit, which is the
+// exact failure this binding exists to prevent, so say so instead.
+func (s *DuckFlightSQLServer) resolveConn(ctx context.Context, ps *preparedStatement) (*engine.ArrowConn, func(), error) {
+	if ps.txnID != "" {
+		if _, ok := s.openTransactions.Load(ps.txnID); !ok {
+			return nil, nil, status.Error(codes.FailedPrecondition,
+				"prepared statement belongs to a transaction that has already ended; prepare it again")
+		}
+	}
+	return s.acquireConn(ctx, ps.txnID)
 }
 
 // scalarToIFace converts an Arrow scalar to a Go interface value.
@@ -49,9 +97,12 @@ func scalarToIFace(s scalar.Scalar) (any, error) {
 	case *scalar.Float64:
 		return val.Value, nil
 	case *scalar.String:
+		// string() copies, so the result does not alias the scalar's buffer.
 		return string(val.Value.Bytes()), nil
 	case *scalar.Binary:
-		return val.Value.Bytes(), nil
+		// Bytes() aliases the Arrow buffer, which is released as soon as the
+		// batch is; the value has to outlive it.
+		return bytes.Clone(val.Value.Bytes()), nil
 	case *scalar.Boolean:
 		return val.Value, nil
 	case scalar.DateScalar:
@@ -86,10 +137,12 @@ func extractParams(rdr flight.MessageReader) ([][]any, error) {
 				if err != nil {
 					return nil, err
 				}
+				// Convert before releasing: scalarToIFace reads the scalar's
+				// buffers, which Release invalidates.
+				row[c], err = scalarToIFace(sc)
 				if r, ok := sc.(scalar.Releasable); ok {
 					r.Release()
 				}
-				row[c], err = scalarToIFace(sc)
 				if err != nil {
 					return nil, err
 				}
@@ -106,23 +159,31 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	req flightsql.ActionCreatePreparedStatementRequest,
 ) (flightsql.ActionCreatePreparedStatementResult, error) {
 	query := req.GetQuery()
+	txnID := string(req.GetTransactionId())
 
 	handle := genHandle()
-	s.preparedStmts.Store(string(handle), preparedStatement{query: query, createdAt: time.Now()})
+	ps := &preparedStatement{query: query, txnID: txnID, createdAt: time.Now()}
+	ps.touch()
+	s.preparedStmts.Store(string(handle), ps)
 
-	// Schema via LIMIT 0 probe. Routed through acquireConn so a session's
-	// connection-local state (e.g. attached catalogs, search_path) is in scope.
-	ac, release, err := s.acquireConn(ctx, "")
+	// Schema probe. Routed through acquireConn so the transaction's or
+	// session's connection-local state (attached catalogs, search_path,
+	// uncommitted rows) is in scope.
+	ac, release, err := s.acquireConn(ctx, txnID)
 	if err != nil {
 		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
 	}
 	defer release()
 
-	rdr, err := ac.Arrow.QueryContext(ctx, query+" LIMIT 0")
+	// Wrapping in a subselect rather than appending " LIMIT 0" keeps the probe
+	// from executing the statement: a trailing line comment would swallow the
+	// suffix, and `UPDATE … RETURNING x LIMIT 0` is a valid statement that
+	// performs the update.
+	rdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query))
 	if err != nil {
 		// Return handle without schema if schema detection fails. This covers
-		// statements DuckDB can't probe with LIMIT 0 (e.g. bare BEGIN/COMMIT)
-		// — DoGet/DoPut will execute the original query on the session conn
+		// statements that aren't queries (DML, DDL, bare BEGIN/COMMIT) —
+		// DoGet/DoPut will execute the original query on the right connection
 		// where it works naturally.
 		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
 	}
@@ -173,58 +234,107 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 	if !ok {
 		return nil, nil, status.Error(codes.InvalidArgument, "prepared statement not found")
 	}
-	ps := val.(preparedStatement)
+	ps := val.(*preparedStatement)
+	ps.touch()
 
-	ac, release, err := s.acquireConn(ctx, "")
+	ac, release, err := s.resolveConn(ctx, ps)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	// Redundant BEGIN/COMMIT/ROLLBACK against the connection's current
 	// transaction state → no-op (see [shouldSkipTxnControl]).
-	if skip, _ := shouldSkipTxnControl(ctx, ac, ps.query); skip {
+	skip, err := shouldSkipTxnControl(ctx, ac, ps.query)
+	if err != nil {
+		release()
+		queryCountAdd(ctx, "error")
+		return nil, nil, err
+	}
+	if skip {
 		release()
 		schema := arrow.NewSchema([]arrow.Field{}, nil)
 		ch := make(chan flight.StreamChunk)
 		close(ch)
+		queryCountAdd(ctx, "ok")
 		return schema, ch, nil
 	}
 
-	// Build args from first parameter row (if any).
+	// Bind the most recently pushed parameter row, if any.
 	var args []any
-	if len(ps.params) > 0 {
-		args = ps.params[0]
+	if params := ps.getParams(); len(params) > 0 {
+		args = params[len(params)-1]
 	}
 
-	rdr, err := ac.Arrow.QueryContext(ctx, ps.query, args...)
+	// Prepared statements carry the bulk of real ADBC/JDBC/SQLAlchemy traffic,
+	// so the configured query timeout and result-size cap have to apply here
+	// exactly as they do to ad-hoc statements.
+	var (
+		queryCtx    context.Context
+		queryCancel context.CancelFunc
+	)
+	if s.queryTimeout > 0 {
+		queryCtx, queryCancel = context.WithTimeout(ctx, s.queryTimeout)
+	} else {
+		queryCtx, queryCancel = context.WithCancel(ctx)
+	}
+
+	rdr, err := ac.Arrow.QueryContext(queryCtx, ps.query, args...)
 	if err != nil {
+		ctxErr := queryCtx.Err()
+		queryCancel()
 		release()
-		return nil, nil, status.Errorf(codes.Internal, "query execution error: %s", err)
+		switch ctxErr {
+		case context.Canceled:
+			queryCountAdd(ctx, "canceled")
+			return nil, nil, status.Error(codes.Canceled, "query canceled")
+		case context.DeadlineExceeded:
+			queryCountAdd(ctx, "timeout")
+			return nil, nil, status.Error(codes.DeadlineExceeded, "query exceeded time limit")
+		}
+		return nil, nil, status.Errorf(duckDBToGRPCCode(err), "query execution error: %s", err)
 	}
 
-	schema := rdr.Schema()
+	metered := newMeteredReader(ctx, rdr, s.maxResultBytes)
+	schema := metered.Schema()
 	ch := make(chan flight.StreamChunk)
+
+	start := time.Now()
+	activeQueries.Add(ctx, 1)
 
 	go func() {
 		defer close(ch)
-		defer rdr.Release()
+		defer metered.Release()
+		defer queryCancel()
 		defer release()
+		defer func() {
+			activeQueries.Add(ctx, -1)
+			queryDuration.Record(ctx, time.Since(start).Seconds())
+		}()
 
-		for rdr.Next() {
-			rec := rdr.RecordBatch()
+		for metered.Next() {
+			rec := metered.RecordBatch()
 			rec.Retain()
 			select {
 			case ch <- flight.StreamChunk{Data: rec}:
-			case <-ctx.Done():
+			case <-queryCtx.Done():
+				rec.Release()
+				if queryCtx.Err() == context.Canceled {
+					queryCountAdd(ctx, "canceled")
+				} else {
+					queryCountAdd(ctx, "timeout")
+				}
 				return
 			}
 		}
-		if err := rdr.Err(); err != nil {
+		if err := metered.Err(); err != nil {
+			queryCountAdd(ctx, "error")
 			select {
 			case ch <- flight.StreamChunk{Err: err}:
-			case <-ctx.Done():
+			case <-queryCtx.Done():
 			}
+			return
 		}
+		queryCountAdd(ctx, "ok")
 	}()
 
 	return schema, ch, nil
@@ -243,14 +353,14 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementQuery(
 		return nil, status.Error(codes.InvalidArgument, "prepared statement not found")
 	}
 
-	ps := val.(preparedStatement)
+	ps := val.(*preparedStatement)
 	params, err := extractParams(rdr)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "error extracting parameters: %s", err)
 	}
 
-	ps.params = params
-	s.preparedStmts.Store(string(handle), ps)
+	ps.setParams(params)
+	ps.touch()
 	return handle, nil
 }
 
@@ -265,7 +375,8 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 	if !ok {
 		return 0, status.Error(codes.InvalidArgument, "prepared statement not found")
 	}
-	ps := val.(preparedStatement)
+	ps := val.(*preparedStatement)
+	ps.touch()
 
 	// Extract params from the reader (DoPut sends them inline).
 	args, err := extractParams(rdr)
@@ -274,16 +385,20 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 	}
 	// Merge: prefer inline params, fall back to previously stored params.
 	if len(args) == 0 {
-		args = ps.params
+		args = ps.getParams()
 	}
 
-	ac, release, err := s.acquireConn(ctx, "")
+	ac, release, err := s.resolveConn(ctx, ps)
 	if err != nil {
 		return 0, err
 	}
 	defer release()
 
-	if skip, _ := shouldSkipTxnControl(ctx, ac, ps.query); skip {
+	skip, err := shouldSkipTxnControl(ctx, ac, ps.query)
+	if err != nil {
+		return 0, err
+	}
+	if skip {
 		return 0, nil
 	}
 

@@ -12,6 +12,16 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 )
 
+// fkBaseQuery flattens duckdb_constraints() into the Flight SQL
+// imported/exported-keys shape.
+//
+// The primary-key side reuses the foreign-key side's catalog and schema
+// because DuckDB only supports foreign keys between tables in the same schema,
+// and duckdb_constraints() exposes just the referenced table name — there is
+// no separate referenced catalog/schema to report.
+//
+// update_rule and delete_rule are reported as 3 (importedKeyNoAction) because
+// DuckDB neither implements nor exposes referential actions.
 const fkBaseQuery = `
 WITH fks AS (
 	SELECT
@@ -89,8 +99,14 @@ func (s *DuckFlightSQLServer) DoGetCrossReference(
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
 	pk := cmd.PKRef
 	fk := cmd.FKRef
+	// Both refs constrain the same row: DuckDB keeps a foreign key and the
+	// table it references in one schema, so the catalog/schema given on either
+	// side has to match. Applying only the PK ref's would silently ignore a
+	// client that qualified the FK side instead.
 	query := fkBaseQuery + " WHERE " + catalogFilter("fk_catalog", pk.Catalog) +
 		" AND " + schemaFilter("fk_schema", pk.DBSchema) +
+		" AND " + catalogFilter("fk_catalog", fk.Catalog) +
+		" AND " + schemaFilter("fk_schema", fk.DBSchema) +
 		fmt.Sprintf(" AND pk_table = '%s' AND fk_table = '%s' ORDER BY key_seq",
 			escapeSQLString(pk.Table), escapeSQLString(fk.Table))
 	return s.streamMetadata(ctx, query, schema_ref.ImportedExportedKeysAndCrossReference)

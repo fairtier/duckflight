@@ -23,19 +23,32 @@ import (
 	"go.opentelemetry.io/otel/trace"
 )
 
+const (
+	// minResourceTTL is the floor for how long an idle session, transaction or
+	// prepared statement is kept alive.
+	minResourceTTL = 10 * time.Minute
+	// minTicketTTL is the floor for how long a statement handle stays
+	// resolvable. It is deliberately much shorter than minResourceTTL: a
+	// handle only has to outlive a DoGet retry, and every GetFlightInfo
+	// creates one, so tying it to the resource lifetime would grow the tracker
+	// for ten minutes' worth of traffic.
+	minTicketTTL = time.Minute
+)
+
 // DuckFlightSQLServer implements the FlightSQL server interface backed by DuckDB.
 type DuckFlightSQLServer struct {
 	flightsql.BaseServer
 
 	engine           *engine.Engine
 	sessions         *session.Manager
-	preparedStmts    sync.Map // handle string -> preparedStatement
+	preparedStmts    sync.Map // handle string -> *preparedStatement
 	openTransactions sync.Map // handle string -> *txnState
 	queryTimeout     time.Duration
 	maxResultBytes   int64
 	tracker          *queryTracker
 	resourceTTL      time.Duration
 	stopCleanup      context.CancelFunc
+	closeOnce        sync.Once
 	tracer           trace.Tracer
 }
 
@@ -57,9 +70,21 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 		}
 	}
 
-	resourceTTL := 30 * time.Minute
-	if timeout > 0 {
-		resourceTTL = 2 * timeout
+	// Idle lifetime for sessions, open transactions and prepared statements.
+	// It scales with the query timeout so a long-running-query deployment
+	// doesn't collect resources out from under itself, but never drops below
+	// the floor: reaping a client's session after a minute of think time
+	// destroys its temp tables and invalidates its open transactions.
+	resourceTTL := 2 * timeout
+	if resourceTTL < minResourceTTL {
+		resourceTTL = minResourceTTL
+	}
+
+	// Statement handles are short-lived by comparison: they only need to
+	// outlive a DoGet retry, not a client's whole idle window.
+	ticketTTL := 2 * timeout
+	if ticketTTL < minTicketTTL {
+		ticketTTL = minTicketTTL
 	}
 
 	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
@@ -69,7 +94,7 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 		sessions:       session.NewManager(eng.Pool, resourceTTL),
 		queryTimeout:   timeout,
 		maxResultBytes: cfg.MaxResultBytes,
-		tracker:        &queryTracker{ttl: resourceTTL},
+		tracker:        &queryTracker{ttl: ticketTTL},
 		resourceTTL:    resourceTTL,
 		stopCleanup:    stopCleanup,
 		tracer:         otel.Tracer("duckflight"),
@@ -133,14 +158,27 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 	reg(flightsql.SqlInfoSystemFunctions, []string{})
 	reg(flightsql.SqlInfoDateTimeFunctions, []string{})
 
-	// Cancellation & timeout
+	// Cancellation & timeout. Both are advertised in seconds; 0 means "no
+	// limit", so reporting 0 while QUERY_TIMEOUT is set would promise clients
+	// their statements never expire and then hand them DeadlineExceeded.
 	reg(flightsql.SqlInfoFlightSqlServerCancel, true)
-	reg(flightsql.SqlInfoFlightSqlServerStatementTimeout, int32(0))
-	reg(flightsql.SqlInfoFlightSqlServerTransactionTimeout, int32(0))
+	reg(flightsql.SqlInfoFlightSqlServerStatementTimeout, timeoutSeconds(srv.queryTimeout))
+	reg(flightsql.SqlInfoFlightSqlServerTransactionTimeout, timeoutSeconds(srv.resourceTTL))
 
 	// Bulk ingestion
 	reg(flightsql.SqlInfoFlightSqlServerBulkIngestion, true)
 	reg(flightsql.SqlInfoFlightSqlServerIngestTransactionsSupported, true)
+}
+
+// timeoutSeconds renders a duration for the SqlInfo timeout fields, which are
+// expressed in whole seconds with 0 meaning "no timeout". A sub-second timeout
+// rounds up to 1 rather than down to "unlimited".
+func timeoutSeconds(d time.Duration) int32 {
+	if d <= 0 {
+		return 0
+	}
+	secs := (d + time.Second - 1) / time.Second
+	return int32(secs)
 }
 
 // buildConvertMap returns a SqlInfoSupportsConvert map describing which SQL
@@ -275,8 +313,8 @@ func (s *DuckFlightSQLServer) CloseSession(ctx context.Context, _ *flight.CloseS
 	return &flight.CloseSessionResult{Status: flight.CloseSessionResultClosed}, nil
 }
 
-// startResourceCleanup runs a background goroutine that reaps stale prepared
-// statements and abandoned transactions that clients failed to close.
+// startResourceCleanup runs a background goroutine that reaps prepared
+// statements and transactions that clients abandoned without closing.
 func (s *DuckFlightSQLServer) startResourceCleanup(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -286,37 +324,78 @@ func (s *DuckFlightSQLServer) startResourceCleanup(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				now := time.Now()
-				s.preparedStmts.Range(func(key, value any) bool {
-					ps := value.(preparedStatement)
-					if now.Sub(ps.createdAt) > s.resourceTTL {
-						s.preparedStmts.Delete(key)
-						slog.Warn("reaped stale prepared statement",
-							"handle", key, "age", now.Sub(ps.createdAt))
-					}
-					return true
-				})
-				s.openTransactions.Range(func(key, value any) bool {
-					ts := value.(*txnState)
-					if now.Sub(ts.createdAt) > s.resourceTTL {
-						s.openTransactions.Delete(key)
-						// Session-bound txns share the session's pinned conn — its
-						// rollback (and conn release) is handled when the session
-						// is reaped or the session-pinned conn is reused. For
-						// anonymous txns we own the pool conn and must roll back
-						// + return it ourselves.
-						if ts.conn != nil {
-							_, _ = ts.conn.ExecContext(context.Background(), "ROLLBACK")
-							s.engine.Pool.Release(ts.conn)
-						}
-						slog.Warn("reaped stale transaction",
-							"handle", key, "age", now.Sub(ts.createdAt))
-					}
-					return true
-				})
+				s.reapResources(time.Now())
 			}
 		}
 	}()
+}
+
+// reapResources collects prepared statements and transactions that have gone
+// untouched for longer than resourceTTL. Idleness, not age, is what makes a
+// resource collectable: a client working steadily inside a long transaction
+// has not abandoned anything.
+func (s *DuckFlightSQLServer) reapResources(now time.Time) {
+	s.preparedStmts.Range(func(key, value any) bool {
+		ps := value.(*preparedStatement)
+		if idle := ps.idleFor(now); idle > s.resourceTTL {
+			s.preparedStmts.Delete(key)
+			slog.Warn("reaped stale prepared statement", "handle", key, "idle", idle)
+		}
+		return true
+	})
+
+	s.openTransactions.Range(func(key, value any) bool {
+		ts := value.(*txnState)
+		if ts.idleFor(now) <= s.resourceTTL {
+			return true
+		}
+		// TryLock, so an in-flight DoGet still streaming on this connection is
+		// never torn out from under it — rolling back and repooling the
+		// connection mid-stream would hand a live DuckDB connection to a
+		// second borrower.
+		if !ts.mu.TryLock() {
+			return true
+		}
+		idle := ts.idleFor(now)
+		if idle <= s.resourceTTL {
+			ts.mu.Unlock()
+			return true
+		}
+		// LoadAndDelete decides ownership: if EndTransaction already claimed
+		// this handle it is finalizing the transaction and releasing the
+		// connection, and doing it here too would put the same connection in
+		// the pool twice.
+		if _, loaded := s.openTransactions.LoadAndDelete(key); !loaded {
+			ts.mu.Unlock()
+			return true
+		}
+		conn := ts.conn
+		ts.conn = nil
+		ts.mu.Unlock()
+
+		// Session-bound txns share the session's pinned conn, which the
+		// session manager owns. Only an anonymous txn's pool conn is ours.
+		if conn != nil {
+			// Release rolls back whatever the client left open and recycles
+			// the connection rather than pooling its leftover state.
+			s.engine.Pool.Release(conn)
+		}
+		slog.Warn("reaped stale transaction", "handle", key, "idle", idle)
+		return true
+	})
+}
+
+// Close stops the background reapers, drops every session, and shuts down the
+// DuckDB engine. Safe to call more than once. Callers should stop serving
+// gRPC first so no request is using a connection when it closes.
+func (s *DuckFlightSQLServer) Close() error {
+	var err error
+	s.closeOnce.Do(func() {
+		s.stopCleanup()
+		s.sessions.CloseAll()
+		err = s.engine.Close()
+	})
+	return err
 }
 
 // Engine returns the underlying engine for direct access.

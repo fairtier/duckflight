@@ -35,7 +35,7 @@ internal/
   engine/
     engine.go                DuckDB connector lifecycle, boot SQL, Iceberg ATTACH
     pool.go                  Bounded channel-based ArrowConn pool
-  auth/middleware.go         Bearer token flight.ServerMiddleware; stamps a sid into Handshake-issued JWTs
+  auth/middleware.go         Bearer token flight.ServerMiddleware (own header parsing, not arrow-go's); derives a per-connection sid
   auth/jwt.go                HS256 token mint/verify with sid (session id) claim
   ratelimit/middleware.go    Token-bucket rate limit flight.ServerMiddleware
   session/manager.go         Pins one DuckDB connection per Flight session, idle reaper
@@ -48,7 +48,8 @@ internal/
     primarykeys.go           DoGetPrimaryKeys via duckdb_constraints()
     foreignkeys.go           DoGetImportedKeys, DoGetExportedKeys, DoGetCrossReference
     xdbctypeinfo.go          DoGetXdbcTypeInfo (23 DuckDB types mapped to JDBC types)
-    metering.go              Prometheus metrics + meteredReader (byte counting, max limit)
+    metering.go              Prometheus metrics + meteredReader (byte counting incl. nested/dictionary data, max limit)
+    recovery.go              Panic-recovery flight.ServerMiddleware (outermost)
     logging.go               loggingServer wrapper, GRPCLoggingMiddleware
 test/
   iceberg_integration_test.go  Full-stack tests with testcontainers (Postgres, MinIO, Lakekeeper)
@@ -59,12 +60,21 @@ test/
 **Per-client sessions.** When a request carries an authenticated session id
 (`auth.SessionIDFromContext`), every RPC for that client routes to a single
 DuckDB connection pinned by `session.Manager`. Handshake-issued JWTs stamp a
-fresh UUID into the `sid` claim; OIDC/static tokens derive a stable sid from
-`sha256(token)`. This makes DuckDB-native `BEGIN`/`COMMIT`/`ROLLBACK`, `CREATE
-TEMP TABLE`, `SET`, `PRAGMA`, `ATTACH`, and prepared statements behave the
-way standard SQL clients (SQLAlchemy, ADBC DBAPI with `autocommit=False`,
-JDBC) expect. Anonymous (no-auth) requests fall back to one-shot pool
-borrowing. Idle sessions are reaped on a 1-minute tick. See
+fresh UUID into the `sid` claim; OIDC/static tokens derive a sid from
+`sha256(token + peer address)` — per *connection*, not per token, so two
+clients sharing one API key don't share a DuckDB connection (and its temp
+tables, settings and transactions). The peer address is the *immediate* peer,
+so behind an L7 proxy that pools upstream connections (the shipped Envoy
+GRPCRoute does), clients sharing a token can still land on one session — give
+each client its own token, or use the Handshake flow, whose sid is per
+handshake. This makes DuckDB-native
+`BEGIN`/`COMMIT`/`ROLLBACK`, `CREATE TEMP TABLE`, `SET`, `PRAGMA`, `ATTACH`,
+and prepared statements behave the way standard SQL clients (SQLAlchemy, ADBC
+DBAPI with `autocommit=False`, JDBC) expect. Anonymous (no-auth) requests fall
+back to one-shot pool borrowing. Sessions idle longer than the resource TTL
+(`max(10m, 2 × QUERY_TIMEOUT)`) are reaped on a 1-minute tick; an RPC arriving
+on a reaped session gets a fresh one, but an open transaction bound to it fails
+with `FailedPrecondition` rather than silently continuing in autocommit. See
 [internal/session/manager.go](internal/session/manager.go).
 
 **`acquireConn` precedence** (`internal/server/statements.go`):
@@ -73,34 +83,65 @@ borrowing. Idle sessions are reaped on a 1-minute tick. See
 3. otherwise → one-shot pool conn.
 
 **Query execution flow.** `GetFlightInfoStatement` caches the query under a
-random handle. `DoGetStatement` executes it (load-and-delete from cache),
-streams Arrow batches via channel.
+random handle. `DoGetStatement` looks it up (the entry stays, so a
+single-endpoint DoGet retry works), claims it for execution via
+`tracker.Start` — which refuses a handle a `CancelFlightInfo` already
+cancelled — and streams Arrow batches via a channel.
 
 **Transaction snapshot.** `BeginTransaction` forces snapshot initialization with
 `SELECT 0 FROM duckdb_tables() LIMIT 0` immediately after `BEGIN`, because
 DuckDB defers snapshot to first statement otherwise.
 
-**Prepared statements.** Query-string-based with bind parameters applied at
-execute time (`DoGetPreparedStatement`/`DoPutPreparedStatementUpdate` pass the
-last parameter row through DuckDB's positional bind).
+**Connections are never pooled dirty.** Every statement run on a client's
+behalf is classified by DuckDB's parser first (`ArrowConn.ClassifyStatement`);
+anything that leaves connection-local state behind — `BEGIN`, `SET`, `PRAGMA`,
+`ATTACH`, DDL — marks the connection dirty, and `ArrowPool.Release` destroys a
+dirty connection and boots a replacement instead of reusing it. Closing is what
+makes it airtight: DuckDB rolls back the open transaction and drops temp
+objects and setting overrides when the connection goes away. Without this, a
+client that vanishes mid-transaction hands the next borrower a connection still
+inside its transaction — `shouldSkipTxnControl` then skips that client's
+`BEGIN` as redundant and the two silently share one transaction. Plain
+SELECT/INSERT/UPDATE/DELETE never marks a connection dirty, so the hot path
+still costs nothing.
 
-**Metadata queries.** Use `information_schema` and `duckdb_constraints()`. When
-catalog filter is unset, defaults to `current_database()`. When schema filter is
-unset, defaults to `current_schema()`.
+**Prepared statements.** Query-string-based with bind parameters applied at
+execute time (`DoGetPreparedStatement` binds the last parameter row through
+DuckDB's positional bind; `DoPutPreparedStatementUpdate` loops all rows). A
+statement created inside a Flight transaction records its `transaction_id` and
+executes on that transaction's connection, so a rollback actually undoes it.
+The schema probe wraps the query in `SELECT * FROM (…) LIMIT 0` rather than
+appending `LIMIT 0`, which would land inside a trailing line comment and
+execute the statement at prepare time.
+
+**Metadata queries.** Use `information_schema` and `duckdb_constraints()`, and
+route through `acquireConn` like every other statement so a session's temp
+tables and a transaction's snapshot are visible. Per the Flight SQL spec, an
+omitted catalog/schema filter does *not* narrow the result — narrowing to
+`current_database()` would hide ATTACHed catalogs, so the Iceberg lake would
+never appear in a client's schema tree.
 
 **Write serialization.** `Engine.WriteMu` mutex exists but is currently unused
 in shipping code. DuckDB handles single-writer semantics per connection.
+
+**Middleware order** (`cmd/server/main.go`): recovery (outer) → logging → rate
+limit → auth (inner). Recovery is outermost because gRPC does not recover
+handler panics — one panic anywhere below it would otherwise kill the process
+and every in-flight query with it. Rate limiting sits *above* auth so that
+signature verification and JWKS lookups are themselves rate limited. Health
+RPCs bypass both auth and the rate limiter: probes can't carry tokens, and
+shedding a probe turns a load spike into a restart loop.
 
 ## Key Dependencies
 
 | Package                                       | Version | Purpose                                  |
 |-----------------------------------------------|---------|------------------------------------------|
-| `github.com/apache/arrow-go/v18`              | v18.5.2 | Arrow types, Flight SQL server framework |
-| `github.com/duckdb/duckdb-go/v2`              | v2.5.5  | DuckDB driver with Arrow interface       |
+| `github.com/apache/arrow-go/v18`              | v18.6.0 | Arrow types, Flight SQL server framework |
+| `github.com/duckdb/duckdb-go/v2`              | v2.10500.0 | DuckDB driver with Arrow interface    |
 | `github.com/prometheus/client_golang`         | v1.23.2 | Prometheus metrics                       |
-| `google.golang.org/grpc`                      | v1.79.2 | gRPC framework                           |
+| `google.golang.org/grpc`                      | v1.81.1 | gRPC framework                           |
 | `github.com/apache/arrow-adbc/go/adbc`        | v1.10.0 | ADBC driver (used in tests)              |
-| `github.com/testcontainers/testcontainers-go` | v0.40.0 | Docker containers for integration tests  |
+| `github.com/testcontainers/testcontainers-go` | v0.42.0 | Docker containers for integration tests  |
 
 ## Prometheus Metrics
 

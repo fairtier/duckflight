@@ -30,26 +30,21 @@ type Config struct {
 	// Extensions
 	ExtensionDir string // custom extension_directory for pre-installed extensions
 
-	// Server
-	ListenAddr string
-
-	// Metrics
-	MetricAddr string
-
-	// Auth
-	AuthTokens []string
-
 	// Metering
 	MaxResultBytes int64
 }
 
 // DefaultConfig returns a Config with sensible defaults for development.
+//
+// Listen addresses, auth and rate limiting are deliberately absent: they are
+// read from the environment in cmd/server and never travel through Config.
+// Fields that look like they configure something but are read nowhere are a
+// trap — setting AuthTokens here once looked like it would gate access.
 func DefaultConfig() *Config {
 	return &Config{
 		MemoryLimit:  "512MB",
 		MaxThreads:   4,
 		QueryTimeout: "30s",
 		PoolSize:     4,
-		ListenAddr:   "localhost:0",
 	}
 }

@@ -10,6 +10,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -75,6 +77,7 @@ type meteredReader struct {
 	bytes    int64
 	maxBytes int64
 	closed   bool
+	limitErr error
 }
 
 func newMeteredReader(ctx context.Context, rdr array.RecordReader, maxBytes int64) *meteredReader {
@@ -86,29 +89,75 @@ func newMeteredReader(ctx context.Context, rdr array.RecordReader, maxBytes int6
 }
 
 func (r *meteredReader) Next() bool {
+	if r.limitErr != nil {
+		return false
+	}
 	if !r.RecordReader.Next() {
 		r.finish()
 		return false
 	}
 	rec := r.RecordBatch()
 	for i := 0; i < int(rec.NumCols()); i++ {
-		r.bytes += r.arrayBytes(rec.Column(i))
+		r.bytes += arrayBytes(rec.Column(i))
 	}
 	if r.maxBytes > 0 && r.bytes > r.maxBytes {
+		// Stopping silently would hand the client a truncated result that is
+		// indistinguishable from a complete one, with a gRPC OK on top. Fail
+		// the stream instead; Err surfaces it to the caller.
+		r.limitErr = status.Errorf(codes.ResourceExhausted,
+			"result set exceeded MAX_RESULT_BYTES (%d bytes); result is incomplete", r.maxBytes)
 		r.finish()
 		return false
 	}
 	return true
 }
 
-func (r *meteredReader) arrayBytes(a arrow.Array) int64 {
+// Err reports the limit breach ahead of the underlying reader's own error, so
+// a truncated stream can never be reported as a successful one.
+func (r *meteredReader) Err() error {
+	if r.limitErr != nil {
+		return r.limitErr
+	}
+	return r.RecordReader.Err()
+}
+
+// arrayBytes totals the memory backing an array, including the child arrays of
+// nested types (LIST/STRUCT/MAP/union) and dictionary values. Counting only
+// the top-level buffers would see just validity bitmaps and offsets for those
+// types, letting a `SELECT list(payload)` stream gigabytes past a cap that
+// never trips and bill for a few kilobytes.
+func arrayBytes(a arrow.Array) int64 {
+	if a == nil {
+		return 0
+	}
+	return dataBytes(a.Data())
+}
+
+func dataBytes(d arrow.ArrayData) int64 {
+	if isNilData(d) {
+		return 0
+	}
 	var n int64
-	for _, buf := range a.Data().Buffers() {
+	for _, buf := range d.Buffers() {
 		if buf != nil {
 			n += int64(buf.Len())
 		}
 	}
+	for _, child := range d.Children() {
+		n += dataBytes(child)
+	}
+	n += dataBytes(d.Dictionary())
 	return n
+}
+
+// isNilData also catches a non-nil arrow.ArrayData interface wrapping a nil
+// *array.Data, which is what Dictionary() returns for a non-dictionary array.
+func isNilData(d arrow.ArrayData) bool {
+	if d == nil {
+		return true
+	}
+	concrete, ok := d.(*array.Data)
+	return ok && concrete == nil
 }
 
 func (r *meteredReader) finish() {

@@ -34,10 +34,22 @@ func newOIDCVerifier(ctx context.Context, issuer, audience string) (*oidcVerifie
 	return &oidcVerifier{issuer: issuer, audience: audience, jwks: k}, nil
 }
 
+// oidcSigningMethods is the allowlist of asymmetric algorithms accepted for
+// IdP-issued tokens. Pinning them keeps the algorithm out of the attacker's
+// control — no "alg": "none", and no chance of an HMAC token being verified
+// against a public key that the JWKS publishes.
+var oidcSigningMethods = []string{
+	"RS256", "RS384", "RS512",
+	"PS256", "PS384", "PS512",
+	"ES256", "ES384", "ES512",
+	"EdDSA",
+}
+
 func (v *oidcVerifier) verify(token string) (string, error) {
 	opts := []jwt.ParserOption{
 		jwt.WithIssuer(v.issuer),
 		jwt.WithExpirationRequired(),
+		jwt.WithValidMethods(oidcSigningMethods),
 	}
 	if v.audience != "" {
 		opts = append(opts, jwt.WithAudience(v.audience))

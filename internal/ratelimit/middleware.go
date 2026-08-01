@@ -6,6 +6,7 @@ import (
 	"context"
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
+	"github.com/fairtier/duckflight/internal/grpcutil"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/metric/noop"
 	"golang.org/x/time/rate"
@@ -37,6 +38,13 @@ func initMetrics(meter metric.Meter) {
 
 // Middleware returns a flight.ServerMiddleware that enforces a global
 // token-bucket rate limit. Returns nil if rps <= 0 (disabled).
+//
+// It is installed *outside* the auth middleware so that the expensive part of
+// authentication — JWT parsing, JWKS lookup, RSA signature verification —
+// is itself rate limited. Behind auth, a flood of syntactically valid but
+// bogus RS256 tokens would each cost a full signature verification (and an
+// attacker-chosen `kid` would drive a JWKS refresh against the IdP) while
+// consuming no tokens at all.
 func Middleware(rps float64, burst int) *flight.ServerMiddleware {
 	if rps <= 0 {
 		return nil
@@ -47,7 +55,12 @@ func Middleware(rps float64, burst int) *flight.ServerMiddleware {
 
 	limiter := rate.NewLimiter(rate.Limit(rps), burst)
 
-	check := func(ctx context.Context) error {
+	check := func(ctx context.Context, fullMethod string) error {
+		// Health probes are exempt: shedding them turns a load spike into a
+		// failed liveness probe and a restarted-but-healthy pod.
+		if grpcutil.IsHealthMethod(fullMethod) {
+			return nil
+		}
 		if !limiter.Allow() {
 			rejected.Add(ctx, 1)
 			return status.Error(codes.ResourceExhausted, "rate limit exceeded")
@@ -57,13 +70,13 @@ func Middleware(rps float64, burst int) *flight.ServerMiddleware {
 
 	return &flight.ServerMiddleware{
 		Unary: func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-			if err := check(ctx); err != nil {
+			if err := check(ctx, info.FullMethod); err != nil {
 				return nil, err
 			}
 			return handler(ctx, req)
 		},
 		Stream: func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-			if err := check(ss.Context()); err != nil {
+			if err := check(ss.Context(), info.FullMethod); err != nil {
 				return err
 			}
 			return handler(srv, ss)

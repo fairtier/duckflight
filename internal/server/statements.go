@@ -18,7 +18,6 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/engine"
-	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -45,19 +44,26 @@ func duckDBToGRPCCode(err error) codes.Code {
 // the redundant call but, for BEGIN-in-BEGIN, leaves the existing
 // transaction in an aborted state that breaks every subsequent statement.
 //
-// Returns (true, "") when the statement should be skipped. Otherwise
-// returns (false, "") and the caller should execute the statement normally.
-// All classification uses DuckDB's own parser ([ArrowConn.ClassifyTxnStatement])
-// and an explicit transaction-state probe ([ArrowConn.InExplicitTransaction]);
-// no SQL-string or error-message substring matching is involved.
+// As a side effect the classification marks the connection dirty when the
+// statement would leave connection-local state behind, so the pool recycles
+// it instead of handing that state to the next borrower.
+//
+// Returns true when the statement should be skipped; otherwise the caller
+// should execute it normally. All classification uses DuckDB's own parser
+// ([engine.ArrowConn.ClassifyStatement]) and an explicit transaction-state
+// probe ([engine.ArrowConn.InExplicitTransaction]); no SQL-string or
+// error-message substring matching is involved.
+//
+// An error here must not be swallowed: executing a BEGIN we failed to check
+// recreates exactly the BEGIN-in-BEGIN abort this exists to prevent.
 func shouldSkipTxnControl(ctx context.Context, ac *engine.ArrowConn, query string) (bool, error) {
-	intent := ac.ClassifyTxnStatement(ctx, query)
+	intent := ac.ClassifyStatement(ctx, query)
 	if intent == engine.TxnIntentNone {
 		return false, nil
 	}
 	inTxn, err := ac.InExplicitTransaction(ctx)
 	if err != nil {
-		return false, err
+		return false, status.Errorf(codes.Internal, "failed to probe transaction state: %s", err)
 	}
 	switch intent {
 	case engine.TxnIntentBegin:
@@ -88,11 +94,11 @@ func (s *DuckFlightSQLServer) acquirePoolConn(ctx context.Context) (*engine.Arro
 // callers MUST invoke when done. Routing precedence:
 //
 //  1. txnID set      → the txn's pinned conn (held by the open Flight txn).
-//                       The session lock (if any) is held until release().
+//     The session lock (if any) is held until release().
 //  2. session in ctx → the session's pinned conn, with the session lock held
-//                       for the lifetime of the call. Lets DuckDB-native
-//                       BEGIN/COMMIT/ROLLBACK, TEMP tables, SET, PRAGMA, and
-//                       prepared statements work the way clients expect.
+//     for the lifetime of the call. Lets DuckDB-native
+//     BEGIN/COMMIT/ROLLBACK, TEMP tables, SET, PRAGMA, and
+//     prepared statements work the way clients expect.
 //  3. otherwise      → a one-shot pool conn returned to the pool on release.
 func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*engine.ArrowConn, func(), error) {
 	if txnID != "" {
@@ -100,17 +106,10 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 		if !ok {
 			return nil, nil, status.Error(codes.InvalidArgument, "invalid transaction handle")
 		}
-		ts := val.(*txnState)
-		// If the txn is bound to a session, lock the session for this call so
-		// concurrent RPCs on the same session serialize correctly.
-		if ts.sid != "" {
-			sess, release, err := s.sessions.Acquire(ctx, ts.sid)
-			if err != nil {
-				return nil, nil, err
-			}
-			return sess.Conn(), release, nil
-		}
-		return ts.conn, func() {}, nil
+		// Locks either the session (for session-bound transactions) or the
+		// transaction's own mutex, so two RPCs carrying the same transaction
+		// id can never touch the DuckDB connection concurrently.
+		return val.(*txnState).acquire(ctx)
 	}
 
 	if sid := auth.SessionIDFromContext(ctx); sid != "" {
@@ -184,7 +183,14 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	// COMMIT/ROLLBACK outside one), skip it. Letting it through would either
 	// abort an in-progress txn (BEGIN-in-BEGIN) or surface a confusing error
 	// for a client whose intent is already satisfied.
-	if skip, _ := shouldSkipTxnControl(ctx, ac, query); skip {
+	skip, err := shouldSkipTxnControl(ctx, ac, query)
+	if err != nil {
+		release()
+		s.tracker.Complete(handle)
+		queryCountAdd(ctx, "error")
+		return nil, nil, err
+	}
+	if skip {
 		release()
 		s.tracker.Complete(handle)
 		schema := arrow.NewSchema([]arrow.Field{}, nil)
@@ -194,14 +200,28 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		return schema, ch, nil
 	}
 
-	queryCtx, queryCancel := context.WithCancel(ctx)
+	var (
+		queryCtx    context.Context
+		queryCancel context.CancelFunc
+	)
 	if s.queryTimeout > 0 {
 		queryCtx, queryCancel = context.WithTimeout(ctx, s.queryTimeout)
+	} else {
+		queryCtx, queryCancel = context.WithCancel(ctx)
 	}
-	s.tracker.SetCancel(handle, queryCancel)
+	// Claim the handle before executing. A CancelFlightInfo that arrived
+	// while we were acquiring the connection makes this fail, so the query
+	// never starts instead of running to completion behind a "canceled"
+	// answer already given to the client.
+	if !s.tracker.Start(handle, queryCancel) {
+		queryCancel()
+		release()
+		queryCountAdd(ctx, "canceled")
+		return nil, nil, status.Error(codes.Canceled, "query canceled")
+	}
 
 	execCtx, execSpan := s.tracer.Start(queryCtx, "execute",
-		trace.WithAttributes(attribute.String("db.statement", query)))
+		trace.WithAttributes(statementAttr(ctx, query)))
 	rdr, err := ac.Arrow.QueryContext(execCtx, query)
 	if err != nil {
 		execSpan.RecordError(err)
@@ -248,6 +268,9 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 			select {
 			case ch <- flight.StreamChunk{Data: rec}:
 			case <-queryCtx.Done():
+				// The consumer will never take this batch, so this goroutine
+				// still owns the retain it just took.
+				rec.Release()
 				if queryCtx.Err() == context.Canceled {
 					queryCountAdd(ctx, "canceled")
 				} else {
@@ -284,7 +307,11 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
 	defer release()
 
 	query := cmd.GetQuery()
-	if skip, _ := shouldSkipTxnControl(ctx, ac, query); skip {
+	skip, err := shouldSkipTxnControl(ctx, ac, query)
+	if err != nil {
+		return 0, err
+	}
+	if skip {
 		return 0, nil
 	}
 	n, err := ac.ExecContext(ctx, query)

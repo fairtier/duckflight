@@ -81,17 +81,17 @@ All configuration is via environment variables:
 | `MAX_THREADS`           | `4`             | DuckDB thread count                                                                                                    |
 | `QUERY_TIMEOUT`         | `30s`           | DuckDB statement timeout                                                                                               |
 | `POOL_SIZE`             | `8`             | Arrow connection pool size                                                                                             |
-| `MAX_RESULT_BYTES`      | `0`             | Max bytes per query result (0 = unlimited)                                                                             |
+| `MAX_RESULT_BYTES`      | `0`             | Max bytes per query result, counting nested/dictionary data (0 = unlimited). Exceeding it fails the stream with `ResourceExhausted` |
 | `AUTH_TOKENS`           |                 | Comma-separated opaque bearer tokens (long-lived API keys)                                                             |
 | `AUTH_USERS`            |                 | Comma-separated `user:password` pairs for the Flight Handshake basic-auth flow                                         |
-| `AUTH_JWT_SECRET`       |                 | HMAC secret signing handshake-issued JWTs (required when `AUTH_USERS` is set; auto-generated otherwise with a warning) |
+| `AUTH_JWT_SECRET`       |                 | HMAC secret signing handshake-issued JWTs (used when `AUTH_USERS` is set; min 32 bytes; auto-generated with a warning if unset) |
 | `AUTH_JWT_TTL`          | `1h`            | Lifetime of handshake-issued JWTs                                                                                      |
 | `OIDC_ISSUER`           |                 | OIDC issuer URL; enables JWT validation against its JWKS                                                               |
 | `OIDC_AUDIENCE`         |                 | Optional; if set, JWT `aud` claim must contain this value                                                              |
 | `RATE_LIMIT_RPS`        | `0`             | Max requests per second (0 = disabled)                                                                                 |
 | `RATE_LIMIT_BURST`      | `0`             | Burst size (0 = defaults to RPS value)                                                                                 |
-| `TLS_CERT`              |                 | Path to TLS certificate file (PEM)                                                                                     |
-| `TLS_KEY`               |                 | Path to TLS private key file (PEM)                                                                                     |
+| `TLS_CERT`              |                 | Path to TLS certificate file (PEM). Must be set together with `TLS_KEY`                                                |
+| `TLS_KEY`               |                 | Path to TLS private key file (PEM). Must be set together with `TLS_CERT`                                               |
 | `TLS_CA`                |                 | Path to CA cert for client verification (mTLS)                                                                         |
 | `ICEBERG_ENDPOINT`      |                 | Iceberg REST Catalog URL                                                                                               |
 | `ICEBERG_WAREHOUSE`     |                 | Warehouse name to ATTACH                                                                                               |
@@ -137,7 +137,21 @@ databow --driver flightsql --uri grpc+tcp://localhost:31337 \
   --username alice --password secret123 --query "SELECT 1"
 ```
 
-`AUTH_JWT_SECRET` must be set explicitly for multi-replica deployments so any pod can verify any pod's tokens.
+`AUTH_JWT_SECRET` must be at least 32 bytes, and must be set explicitly for
+multi-replica deployments so any pod can verify any pod's tokens.
+
+The server refuses to start on a malformed value rather than falling back to a
+default: a typo in `AUTH_USERS`, `RATE_LIMIT_RPS` or `MAX_RESULT_BYTES` would
+otherwise silently disable authentication, rate limiting or the result cap. It
+logs one explicit line at startup saying which auth backends are active, or
+`AUTH DISABLED` when none are.
+
+Each client connection gets its own server-side session, and with it a
+dedicated DuckDB connection holding its temp tables, `SET` overrides and
+transactions. Session identity comes from the handshake for `AUTH_USERS`, and
+from the token plus the peer address for `AUTH_TOKENS`/OIDC — so behind a proxy
+that pools upstream connections, clients sharing a single token may still share
+a session. Give each client its own token when they need isolation.
 
 **OIDC** (`OIDC_ISSUER`) — clients fetch JWTs directly from your IdP; the server validates against its JWKS. ADBC's FlightSQL driver handles the OAuth2 flow including refresh:
 

@@ -100,6 +100,7 @@ func (s *DuckFlightSQLSuite) SetupTest() {
 }
 
 func (s *DuckFlightSQLSuite) TearDownTest() {
+	waitQuiescent(s.T(), s.srv)
 	s.Assert().Equal(0, s.srv.OpenTransactionCount(), "leaked transactions")
 	s.Assert().Equal(0, s.srv.PreparedStatementCount(), "leaked prepared statements")
 	s.Assert().Equal(0, s.srv.ActiveQueryCount(), "leaked active queries")
@@ -108,6 +109,32 @@ func (s *DuckFlightSQLSuite) TearDownTest() {
 
 	s.srv.Alloc = memory.DefaultAllocator
 	s.mem.AssertSize(s.T(), 0)
+}
+
+// waitQuiescent waits for the server to finish tearing down whatever the test
+// just did, up to a short deadline.
+//
+// A DoGet stream is served from a goroutine that outlives the client call: a
+// client that stops reading early (or simply releases its reader) returns
+// before the server has completed the batch, released its connection and
+// marked the query done. Sampling the counters the instant the last client
+// call returns therefore races with normal teardown. Waiting makes the
+// assertions test what they mean — that nothing leaks — instead of how fast
+// the server unwinds. A real leak never settles, so it still fails, just a
+// couple of seconds later.
+func waitQuiescent(t *testing.T, srv *server.DuckFlightSQLServer) {
+	t.Helper()
+	pool := srv.Engine().Pool
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if srv.OpenTransactionCount() == 0 &&
+			srv.PreparedStatementCount() == 0 &&
+			srv.ActiveQueryCount() == 0 &&
+			pool.Len() == pool.Cap() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -293,6 +320,10 @@ func (s *DuckFlightSQLSuite) TestCommandGetCatalogs() {
 	s.False(rdr.Next())
 }
 
+// TestCommandGetDbSchemas checks the unfiltered listing. Per the Flight SQL
+// spec an omitted catalog must not narrow the result; defaulting to the
+// current database instead would hide every ATTACHed catalog, so an Iceberg
+// lake would never show up in a client's schema tree.
 func (s *DuckFlightSQLSuite) TestCommandGetDbSchemas() {
 	ctx := context.Background()
 	info, err := s.client.GetDBSchemas(ctx, &flightsql.GetDBSchemasOpts{})
@@ -302,6 +333,31 @@ func (s *DuckFlightSQLSuite) TestCommandGetDbSchemas() {
 	defer rdr.Release()
 
 	s.True(rdr.Schema().Equal(schema_ref.DBSchemas), rdr.Schema().String())
+
+	got := make(map[string]bool)
+	for rdr.Next() {
+		rec := rdr.RecordBatch()
+		catalogs := rec.Column(0).(*array.String)
+		schemas := rec.Column(1).(*array.String)
+		for i := 0; i < int(rec.NumRows()); i++ {
+			got[catalogs.Value(i)+"."+schemas.Value(i)] = true
+		}
+	}
+	s.NoError(rdr.Err())
+
+	s.True(got["memory.main"], "expected memory.main, got %v", got)
+	s.True(got["temp.main"], "expected temp.main to be listed, got %v", got)
+}
+
+// TestCommandGetDbSchemasFiltered checks that an explicit catalog still
+// narrows the result.
+func (s *DuckFlightSQLSuite) TestCommandGetDbSchemasFiltered() {
+	ctx := context.Background()
+	info, err := s.client.GetDBSchemas(ctx, &flightsql.GetDBSchemasOpts{Catalog: new("memory")})
+	s.NoError(err)
+	rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+	s.NoError(err)
+	defer rdr.Release()
 
 	catalog := s.fromJSON(arrow.BinaryTypes.String, `["memory"]`)
 	defer catalog.Release()
