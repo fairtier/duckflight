@@ -191,9 +191,10 @@ func (e *loadEnv) waitClean(t testing.TB, timeout time.Duration) {
 // ---------------------------------------------------------------------------
 
 type latencyCollector struct {
-	mu      sync.Mutex
-	samples []time.Duration
-	errors  atomic.Int64
+	mu       sync.Mutex
+	samples  []time.Duration
+	errors   atomic.Int64
+	firstErr error
 }
 
 func (lc *latencyCollector) Record(d time.Duration) {
@@ -202,8 +203,25 @@ func (lc *latencyCollector) Record(d time.Duration) {
 	lc.mu.Unlock()
 }
 
-func (lc *latencyCollector) RecordError() {
+// RecordError counts a failed operation and keeps the first error seen. The
+// error itself is kept because a bare count cannot be diagnosed: a stage that
+// reports "58 errors" and nothing else gives no way to tell a saturated pool
+// from a broken query, and these failures reproduce only under the full
+// package's load.
+func (lc *latencyCollector) RecordError(err error) {
 	lc.errors.Add(1)
+	lc.mu.Lock()
+	if lc.firstErr == nil {
+		lc.firstErr = err
+	}
+	lc.mu.Unlock()
+}
+
+// FirstError returns the first error recorded, or nil if there were none.
+func (lc *latencyCollector) FirstError() error {
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	return lc.firstErr
 }
 
 func (lc *latencyCollector) Snapshot() (sorted []time.Duration, errors int64) {
@@ -252,6 +270,7 @@ type stageResult struct {
 	p95         time.Duration
 	p99         time.Duration
 	opsPerSec   float64
+	firstErr    error
 }
 
 func collectStageResult(concurrency int, wall time.Duration, lc *latencyCollector) stageResult {
@@ -261,6 +280,7 @@ func collectStageResult(concurrency int, wall time.Duration, lc *latencyCollecto
 		duration:    wall,
 		ops:         len(s),
 		errors:      errs,
+		firstErr:    lc.FirstError(),
 	}
 	if len(s) > 0 {
 		res.p50 = percentile(s, 50)
@@ -381,7 +401,7 @@ func runStage(
 					if stageCtx.Err() != nil {
 						return
 					}
-					lc.RecordError()
+					lc.RecordError(err)
 					continue
 				}
 				lc.Record(time.Since(start))
@@ -467,7 +487,8 @@ func TestLoadRampUpSelect(t *testing.T) {
 	reportStageTable(t, "SELECT ramp-up", results)
 
 	// Verify no errors at low concurrency (first stage).
-	require.Equal(t, int64(0), results[0].errors, "errors at concurrency=1")
+	require.Equal(t, int64(0), results[0].errors,
+		"errors at concurrency=1; first: %v", results[0].firstErr)
 
 	env.waitClean(t, 5*time.Second)
 }
@@ -529,7 +550,8 @@ func TestLoadRampUpMetadata(t *testing.T) {
 	}
 
 	reportStageTable(t, "metadata ramp-up", results)
-	require.Equal(t, int64(0), results[0].errors, "errors at concurrency=1")
+	require.Equal(t, int64(0), results[0].errors,
+		"errors at concurrency=1; first: %v", results[0].firstErr)
 	env.waitClean(t, 5*time.Second)
 }
 
@@ -589,7 +611,8 @@ func TestLoadRampUpTransactions(t *testing.T) {
 	}
 
 	reportStageTable(t, "transaction ramp-up", results)
-	require.Equal(t, int64(0), results[0].errors, "errors at concurrency=1")
+	require.Equal(t, int64(0), results[0].errors,
+		"errors at concurrency=1; first: %v", results[0].firstErr)
 	env.waitClean(t, 5*time.Second)
 }
 
@@ -644,7 +667,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 					if stageCtx.Err() != nil {
 						return
 					}
-					readLC.RecordError()
+					readLC.RecordError(err)
 					intervalErrors.Add(1)
 					continue
 				}
@@ -684,7 +707,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 					if stageCtx.Err() != nil {
 						return
 					}
-					writeLC.RecordError()
+					writeLC.RecordError(err)
 					intervalErrors.Add(1)
 					continue
 				}
@@ -695,7 +718,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 					if stageCtx.Err() != nil {
 						return
 					}
-					writeLC.RecordError()
+					writeLC.RecordError(err)
 					intervalErrors.Add(1)
 					continue
 				}
@@ -704,7 +727,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 					if stageCtx.Err() != nil {
 						return
 					}
-					writeLC.RecordError()
+					writeLC.RecordError(err)
 					intervalErrors.Add(1)
 					continue
 				}
@@ -787,18 +810,18 @@ func TestLoadConcurrentSelect(t *testing.T) {
 						query := fmt.Sprintf("SELECT * FROM load_data WHERE id %% 1000 = %d LIMIT 100", modVal+j%10)
 						info, err := cl.Execute(gCtx, query)
 						if err != nil {
-							lc.RecordError()
+							lc.RecordError(err)
 							continue
 						}
 						rdr, err := cl.DoGet(gCtx, info.Endpoint[0].Ticket)
 						if err != nil {
-							lc.RecordError()
+							lc.RecordError(err)
 							continue
 						}
 						for rdr.Next() {
 						}
 						if err := rdr.Err(); err != nil {
-							lc.RecordError()
+							lc.RecordError(err)
 							rdr.Release()
 							continue
 						}
@@ -862,18 +885,18 @@ func TestLoadMixedReadWrite(t *testing.T) {
 				start := time.Now()
 				info, err := cl.Execute(gCtx, "SELECT count(*) FROM load_rw")
 				if err != nil {
-					readLC.RecordError()
+					readLC.RecordError(err)
 					continue
 				}
 				rdr, err := cl.DoGet(gCtx, info.Endpoint[0].Ticket)
 				if err != nil {
-					readLC.RecordError()
+					readLC.RecordError(err)
 					continue
 				}
 				for rdr.Next() {
 				}
 				if err := rdr.Err(); err != nil {
-					readLC.RecordError()
+					readLC.RecordError(err)
 					rdr.Release()
 					continue
 				}
@@ -895,19 +918,19 @@ func TestLoadMixedReadWrite(t *testing.T) {
 				start := time.Now()
 				tx, err := cl.BeginTransaction(gCtx)
 				if err != nil {
-					writeLC.RecordError()
+					writeLC.RecordError(err)
 					continue
 				}
 				_, err = tx.ExecuteUpdate(gCtx,
 					fmt.Sprintf("INSERT INTO load_rw VALUES (%d, 'w%d_iter%d')", 1000+writerID*writeIters+j, writerID, j))
 				if err != nil {
 					_ = tx.Rollback(context.Background())
-					writeLC.RecordError()
+					writeLC.RecordError(err)
 					continue
 				}
 				if err := tx.Commit(gCtx); err != nil {
 					_ = tx.Rollback(context.Background())
-					writeLC.RecordError()
+					writeLC.RecordError(err)
 					continue
 				}
 				writeLC.Record(time.Since(start))
@@ -984,12 +1007,12 @@ func TestLoadLargeResultStreaming(t *testing.T) {
 				start := time.Now()
 				info, err := cl.Execute(gCtx, "SELECT * FROM load_wide")
 				if err != nil {
-					lc.RecordError()
+					lc.RecordError(err)
 					continue
 				}
 				rdr, err := cl.DoGet(gCtx, info.Endpoint[0].Ticket)
 				if err != nil {
-					lc.RecordError()
+					lc.RecordError(err)
 					continue
 				}
 				for rdr.Next() {
@@ -1004,7 +1027,7 @@ func TestLoadLargeResultStreaming(t *testing.T) {
 					}
 				}
 				if err := rdr.Err(); err != nil {
-					lc.RecordError()
+					lc.RecordError(err)
 					rdr.Release()
 					continue
 				}
@@ -1067,7 +1090,7 @@ func TestLoadTransactionContention(t *testing.T) {
 				tx, err := cl.BeginTransaction(opCtx)
 				if err != nil {
 					opCancel()
-					lc.RecordError()
+					lc.RecordError(err)
 					continue
 				}
 				_, err = tx.ExecuteUpdate(opCtx,
@@ -1075,14 +1098,14 @@ func TestLoadTransactionContention(t *testing.T) {
 				if err != nil {
 					_ = tx.Rollback(context.Background())
 					opCancel()
-					lc.RecordError()
+					lc.RecordError(err)
 					continue
 				}
 				err = tx.Commit(opCtx)
 				opCancel()
 				if err != nil {
 					_ = tx.Rollback(context.Background())
-					lc.RecordError()
+					lc.RecordError(err)
 					continue
 				}
 				lc.Record(time.Since(start))

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -95,7 +96,48 @@ func rssKB() int64 {
 	return 0
 }
 
+// soakChildEnv marks the re-executed child process that actually runs the
+// memory soak. See [runSoakInChild].
+const soakChildEnv = "DUCKFLIGHT_SOAK_CHILD"
+
+// runSoakInChild re-executes this test binary so that the named test runs
+// alone in a fresh process, and fails t with the child's output if it did not
+// pass. The child inherits the binary it is spawned from, so it runs with the
+// same build tags and the same -race setting as the parent.
+func runSoakInChild(t *testing.T, name string) {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0],
+		"-test.run=^"+name+"$", "-test.v", "-test.count=1", "-test.timeout=5m")
+	cmd.Env = append(os.Environ(), soakChildEnv+"=1")
+
+	out, err := cmd.CombinedOutput()
+	t.Logf("soak child output:\n%s", out)
+	require.NoError(t, err, "soak child process failed")
+}
+
+// TestSoakQueryExecution checks that a long run of query/DoGet cycles neither
+// grows the Go heap nor leaks native memory underneath it — the latter being
+// the point, since a leaked DuckDB result is invisible to runtime.MemStats.
+//
+// Both numbers are process-global, which makes them meaningless inside the
+// shared test binary: by the time this test runs, a minute and a half of
+// earlier suites has left the heap holding hundreds of megabytes that the
+// scavenger returns on its own schedule, and under -race the detector maps
+// shadow memory for every newly touched address and never unmaps it. Measured
+// in-package, this same unchanged loop swings between -145MB and +133MB of RSS
+// — noise two orders of magnitude above the ~3MB the loop actually costs, in
+// both directions, so no threshold can separate them. It also makes the heap
+// bound vacuous: 3x a 245MB warmup reading asserts nothing.
+//
+// So the loop runs in a process of its own, where a 250MB baseline becomes a
+// 4MB one and the growth figures are repeatable to within a megabyte.
 func TestSoakQueryExecution(t *testing.T) {
+	if os.Getenv(soakChildEnv) == "" {
+		runSoakInChild(t, "TestSoakQueryExecution")
+		return
+	}
+
 	env := newSoakEnv(t)
 	defer env.close(t)
 
@@ -144,6 +186,11 @@ func TestSoakQueryExecution(t *testing.T) {
 	if warmupRSS > 0 && finalRSS > 0 {
 		growthKB := finalRSS - warmupRSS
 		t.Logf("RSS: warmup=%dKB final=%dKB growth=%dKB", warmupRSS, finalRSS, growthKB)
+		// Alone in a process the 450 measured iterations cost ~3MB of RSS, or
+		// ~15MB under -race, where the detector maps shadow memory for newly
+		// touched addresses and never gives it back. 50MB leaves room for that
+		// without leaving room for a per-query native leak, which at this
+		// iteration count would run to hundreds of megabytes.
 		require.LessOrEqual(t, growthKB, int64(50*1024), "RSS grew more than 50MB")
 	}
 }
