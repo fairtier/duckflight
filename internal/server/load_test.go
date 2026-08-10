@@ -4,6 +4,7 @@ package server_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -23,7 +24,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // ---------------------------------------------------------------------------
@@ -244,12 +247,17 @@ func (lc *latencyCollector) Report(t testing.TB, label string) {
 	s, errs := lc.Snapshot()
 	total := int64(len(s)) + errs
 	if len(s) == 0 {
-		t.Logf("%s: no successful samples (%d errors)", label, errs)
+		t.Logf("%s: no successful samples (%d errors, first: %v)", label, errs, lc.FirstError())
 		return
 	}
 	t.Logf("%s: n=%d errors=%d (%.1f%%) p50=%v p95=%v p99=%v",
 		label, total, errs, float64(errs)/float64(total)*100,
 		percentile(s, 50), percentile(s, 95), percentile(s, 99))
+	// Only interesting when something failed, but then it is the whole story:
+	// an error rate on its own says a threshold was crossed, not why.
+	if err := lc.FirstError(); err != nil {
+		t.Logf("%s: first error: %v", label, err)
+	}
 }
 
 func percentile(sorted []time.Duration, pct int) time.Duration {
@@ -379,6 +387,30 @@ func seedLoadTxn(t testing.TB) func() {
 // It should perform one unit of work and return its latency.
 type workloadFunc func(ctx context.Context, cl *flightsql.Client) error
 
+// stageOver reports whether err is the stage's own deadline or cancellation
+// surfacing through the RPC rather than a server-side failure.
+//
+// Workers get no per-operation timeout: each RPC inherits whatever is left of
+// the stage, so an operation started near the end is given milliseconds and
+// fails on the clock. Testing stageCtx.Err() alone does not catch that — the
+// context is not formally expired yet, so the loop counts the failure and
+// immediately tries again with even less time, spinning through dozens of
+// doomed RPCs in the last few milliseconds. That is how a stage at
+// concurrency=1, where only one operation can straddle the boundary, was seen
+// reporting 58 errors. Under load the operations are slower, the deadline is
+// reached earlier, and the spin window grows — which is why this surfaced as
+// an intermittent failure of an assertion that expects exactly zero errors.
+func stageOver(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	switch status.Code(err) {
+	case codes.DeadlineExceeded, codes.Canceled:
+		return true
+	}
+	return false
+}
+
 func runStage(
 	ctx context.Context,
 	clients []*flightsql.Client,
@@ -403,8 +435,11 @@ func runStage(
 				}
 				start := time.Now()
 				if err := work(stageCtx, cl); err != nil {
-					// Don't count context cancellation as errors — stage just ended.
-					if stageCtx.Err() != nil {
+					// Don't count context cancellation as errors — stage just
+					// ended. Returning rather than continuing also stops the
+					// worker from spinning out the rest of the stage on RPCs
+					// that cannot possibly complete in the time left.
+					if stageCtx.Err() != nil || stageOver(err) {
 						return
 					}
 					lc.RecordError(err)
@@ -670,7 +705,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 				start := time.Now()
 				err := selectWorkload("SELECT * FROM load_data WHERE id % 1000 < 5 LIMIT 50")(stageCtx, cl)
 				if err != nil {
-					if stageCtx.Err() != nil {
+					if stageCtx.Err() != nil || stageOver(err) {
 						return
 					}
 					readLC.RecordError(err)
@@ -710,7 +745,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 				id := writeID.Add(1)
 				tx, err := cl.BeginTransaction(stageCtx)
 				if err != nil {
-					if stageCtx.Err() != nil {
+					if stageCtx.Err() != nil || stageOver(err) {
 						return
 					}
 					writeLC.RecordError(err)
@@ -721,7 +756,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 					fmt.Sprintf("INSERT INTO load_sustained_txn VALUES (%d, 'sustained')", id))
 				if err != nil {
 					_ = tx.Rollback(context.Background())
-					if stageCtx.Err() != nil {
+					if stageCtx.Err() != nil || stageOver(err) {
 						return
 					}
 					writeLC.RecordError(err)
@@ -730,7 +765,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 				}
 				if err := tx.Commit(stageCtx); err != nil {
 					_ = tx.Rollback(context.Background())
-					if stageCtx.Err() != nil {
+					if stageCtx.Err() != nil || stageOver(err) {
 						return
 					}
 					writeLC.RecordError(err)
@@ -765,7 +800,8 @@ func TestLoadSustainedMixed(t *testing.T) {
 	if totalErrors > 0 {
 		errorRate := float64(totalErrors) / math.Max(float64(int64(totalOps)+totalErrors), 1)
 		require.Less(t, errorRate, 0.01,
-			"error rate %.2f%% exceeds 1%%", errorRate*100)
+			"error rate %.2f%% exceeds 1%% (first read: %v; first write: %v)",
+			errorRate*100, readLC.FirstError(), writeLC.FirstError())
 	}
 
 	env.waitClean(t, 5*time.Second)
@@ -842,8 +878,14 @@ func TestLoadConcurrentSelect(t *testing.T) {
 			lc.Report(t, tc.name)
 
 			errorRate := float64(lc.errors.Load()) / float64(int64(tc.numClients*iterations))
-			require.Less(t, errorRate, 0.01, "error rate %.1f%% exceeds 1%%", errorRate*100)
+			require.Less(t, errorRate, 0.01, "error rate %.1f%% exceeds 1%% (first: %v)",
+				errorRate*100, lc.FirstError())
 
+			// The server releases its connection and decrements the active
+			// query count in the streaming goroutine's defer, which runs after
+			// the client has taken the last batch. Asserting the instant the
+			// clients return races that bookkeeping.
+			env.waitClean(t, 5*time.Second)
 			env.assertNoLeaks(t)
 		})
 	}
@@ -962,7 +1004,6 @@ func TestLoadMixedReadWrite(t *testing.T) {
 	require.NoError(t, err)
 	rdr, err := env.clients[0].DoGet(ctx, info.Endpoint[0].Ticket)
 	require.NoError(t, err)
-	defer rdr.Release()
 
 	require.True(t, rdr.Next())
 	rec := rdr.RecordBatch()
@@ -970,7 +1011,11 @@ func TestLoadMixedReadWrite(t *testing.T) {
 	expectedMin := int64(1000 + numWriters*writeIters - int(writeErrors))
 	t.Logf("final row count: %d (expected >= %d)", finalCount, expectedMin)
 	require.GreaterOrEqual(t, finalCount, expectedMin)
+	// Released here rather than deferred: the leak check below counts active
+	// queries, and this reader's own query is one of them until it is closed.
+	rdr.Release()
 
+	env.waitClean(t, 5*time.Second)
 	env.assertNoLeaks(t)
 }
 
@@ -1051,6 +1096,7 @@ func TestLoadLargeResultStreaming(t *testing.T) {
 	tb := totalBytes.Load()
 	t.Logf("total bytes streamed: %d (%.1f MB)", tb, float64(tb)/(1024*1024))
 
+	env.waitClean(t, 5*time.Second)
 	env.assertNoLeaks(t)
 }
 
@@ -1130,6 +1176,7 @@ func TestLoadTransactionContention(t *testing.T) {
 	t.Logf("completed transactions: %d/%d", completed, expected)
 	require.Equal(t, expected, completed, "not all transactions completed — possible deadlock")
 
+	env.waitClean(t, 5*time.Second)
 	env.assertNoLeaks(t)
 }
 
