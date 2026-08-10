@@ -71,6 +71,11 @@ func (s *DuckFlightSQLSuite) TearDownSuite() {
 	if s.server != nil {
 		s.server.Shutdown()
 	}
+	// Shutting the Flight server down leaves the DuckDB engine, its pooled
+	// connections and its reapers running; only Close releases them.
+	if s.srv != nil {
+		_ = s.srv.Close()
+	}
 }
 
 func (s *DuckFlightSQLSuite) SetupTest() {

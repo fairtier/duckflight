@@ -87,6 +87,9 @@ func (s *ADBCSuite) TearDownSuite() {
 	if s.server != nil {
 		s.server.Shutdown()
 	}
+	if s.srv != nil {
+		_ = s.srv.Close()
+	}
 }
 
 func (s *ADBCSuite) SetupTest() {

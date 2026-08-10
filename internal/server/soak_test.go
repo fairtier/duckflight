@@ -66,6 +66,10 @@ func (e *soakEnv) close(t *testing.T) {
 	_ = e.client.Close()
 	e.fs.Shutdown()
 	e.srv.Alloc = memory.DefaultAllocator
+	// Closing the server is what releases the DuckDB engine; a Flight shutdown
+	// alone leaves it, its pooled connections and its reapers running for the
+	// rest of the package.
+	_ = e.srv.Close()
 	e.mem.AssertSize(t, 0)
 }
 

@@ -43,6 +43,10 @@ func TestSIGSEGV_IngestThenGetTablesWithSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
+	// Registered before the Flight shutdown below so it runs after it: closing
+	// the engine is what releases the DuckDB connections and reaper goroutines,
+	// and it must not happen while the server is still serving.
+	defer func() { _ = srv.Close() }()
 
 	flightSrv := flight.NewServerWithMiddleware(nil)
 	flightSrv.RegisterFlightService(flightsql.NewFlightServer(srv))

@@ -151,6 +151,12 @@ func (e *loadEnv) close(t testing.TB) {
 		_ = cl.Close()
 	}
 	e.fs.Shutdown()
+	// Shutting down the Flight server only stops it serving; the DuckDB engine
+	// behind it, its pool of connections and its reaper goroutines outlive the
+	// test unless the server is closed. This package builds a dozen of them,
+	// and every one left running competes for memory and threads with whatever
+	// runs next.
+	_ = e.srv.Close()
 }
 
 func (e *loadEnv) assertNoLeaks(t testing.TB) {
