@@ -66,7 +66,7 @@ func (s *DuckFlightSQLServer) DoGetImportedKeys(
 	query := fkBaseQuery + " WHERE " + catalogFilter("fk_catalog", cmd.Catalog) +
 		" AND " + schemaFilter("fk_schema", cmd.DBSchema) +
 		fmt.Sprintf(" AND fk_table = '%s' ORDER BY pk_table, key_seq", escapeSQLString(cmd.Table))
-	return s.streamMetadata(ctx, query, schema_ref.ImportedExportedKeysAndCrossReference)
+	return s.streamMetadata(ctx, "imported_keys", query, schema_ref.ImportedExportedKeysAndCrossReference)
 }
 
 // --- Exported Keys (PK table → which FK tables reference it?) ---
@@ -83,7 +83,7 @@ func (s *DuckFlightSQLServer) DoGetExportedKeys(
 	query := fkBaseQuery + " WHERE " + catalogFilter("fk_catalog", cmd.Catalog) +
 		" AND " + schemaFilter("fk_schema", cmd.DBSchema) +
 		fmt.Sprintf(" AND pk_table = '%s' ORDER BY fk_table, key_seq", escapeSQLString(cmd.Table))
-	return s.streamMetadata(ctx, query, schema_ref.ImportedExportedKeysAndCrossReference)
+	return s.streamMetadata(ctx, "exported_keys", query, schema_ref.ImportedExportedKeysAndCrossReference)
 }
 
 // --- Cross Reference (specific PK table + FK table pair) ---
@@ -109,5 +109,5 @@ func (s *DuckFlightSQLServer) DoGetCrossReference(
 		" AND " + schemaFilter("fk_schema", fk.DBSchema) +
 		fmt.Sprintf(" AND pk_table = '%s' AND fk_table = '%s' ORDER BY key_seq",
 			escapeSQLString(pk.Table), escapeSQLString(fk.Table))
-	return s.streamMetadata(ctx, query, schema_ref.ImportedExportedKeysAndCrossReference)
+	return s.streamMetadata(ctx, "cross_reference", query, schema_ref.ImportedExportedKeysAndCrossReference)
 }

@@ -12,6 +12,7 @@ import (
 	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/ctxlock"
 	"github.com/fairtier/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/otelutil"
 	"github.com/fairtier/duckflight/internal/session"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -101,7 +102,10 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	ctx context.Context,
 	_ flightsql.ActionBeginTransactionRequest,
 ) ([]byte, error) {
-	ctx, span := s.tracer.Start(ctx, "transaction.begin")
+	ctx, span := s.tracer.Start(ctx, "transaction.begin", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "begin"),
+	))
 	defer span.End()
 
 	sid := auth.SessionIDFromContext(ctx)
@@ -112,17 +116,20 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 		release func()
 	)
 	if sid != "" {
+		span.SetAttributes(
+			attribute.String(attrConnSource, connSourceSession),
+			attribute.String(attrSessionID, sid),
+		)
 		sw, rel, err := s.sessions.Acquire(ctx, sid)
 		if err != nil {
-			span.RecordError(err)
-			return nil, err
+			return nil, otelutil.Failed(span, err)
 		}
 		sess, ac, release = sw, sw.Conn(), rel
 	} else {
+		span.SetAttributes(attribute.String(attrConnSource, connSourcePool))
 		c, err := s.acquirePoolConn(ctx)
 		if err != nil {
-			span.RecordError(err)
-			return nil, err
+			return nil, otelutil.Failed(span, err)
 		}
 		ac, release = c, func() { s.engine.Pool.Release(c) }
 	}
@@ -133,9 +140,9 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	// DuckDB's txn in an aborted state, breaking every subsequent statement.
 	alreadyInTxn, probeErr := ac.InExplicitTransaction(ctx)
 	if probeErr != nil {
-		span.RecordError(probeErr)
 		release()
-		return nil, status.Errorf(codes.Internal, "failed to probe transaction state: %s", probeErr)
+		return nil, otelutil.Failed(span,
+			status.Errorf(codes.Internal, "failed to probe transaction state: %s", probeErr))
 	}
 
 	if !alreadyInTxn {
@@ -144,24 +151,28 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 		// borrower, and that has to hold even if the call below fails midway.
 		ac.MarkDirty()
 		if _, err := ac.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {
-			span.RecordError(err)
 			release()
-			return nil, status.Errorf(codes.Internal, "failed to begin transaction: %s", err)
+			return nil, otelutil.Failed(span,
+				status.Errorf(codes.Internal, "failed to begin transaction: %s", err))
 		}
 		// Force DuckDB to take a snapshot immediately by reading from a real
 		// table. Without this, the snapshot is deferred to the first actual
 		// statement, which breaks snapshot isolation guarantees for the client.
 		rdr, err := ac.Arrow.QueryContext(ctx, "SELECT 0 FROM duckdb_tables() LIMIT 0")
 		if err != nil {
-			span.RecordError(err)
 			_, _ = ac.ExecContext(ctx, "ROLLBACK")
 			release()
-			return nil, status.Errorf(codes.Internal, "failed to initialize transaction snapshot: %s", err)
+			return nil, otelutil.Failed(span,
+				status.Errorf(codes.Internal, "failed to initialize transaction snapshot: %s", err))
 		}
 		rdr.Release()
+	} else {
+		// Attach the new Flight handle to the existing DuckDB txn, which took
+		// its snapshot when it opened. Recorded as an event because it changes
+		// what the client's eventual COMMIT covers: writes another layer made
+		// before this handle existed.
+		span.AddEvent("transaction.attached_to_existing")
 	}
-	// else: attach the new Flight handle to the existing DuckDB txn. The
-	// existing txn already took its snapshot when it opened.
 
 	state := newTxnState()
 	if sess != nil {
@@ -175,6 +186,8 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 
 	handle := genHandle()
 	s.openTransactions.Store(string(handle), state)
+	span.SetAttributes(attribute.String(attrTransactionID, string(handle)))
+	txnCountAdd(ctx, "begin")
 	return handle, nil
 }
 
@@ -199,11 +212,15 @@ func (s *DuckFlightSQLServer) EndTransaction(
 		op, endSQL = "rollback", "ROLLBACK"
 	}
 
-	_, span := s.tracer.Start(ctx, "transaction.end",
-		trace.WithAttributes(attribute.String("db.operation", op)))
+	handle := string(req.GetTransactionId())
+
+	ctx, span := s.tracer.Start(ctx, "transaction.end", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, op),
+		attribute.String(attrTransactionID, handle),
+	))
 	defer span.End()
 
-	handle := string(req.GetTransactionId())
 	// LoadAndDelete makes this the single owner of the transaction: the
 	// resource reaper uses the same call, so exactly one of the two ever gets
 	// to finalize the transaction and hand its connection back.
@@ -222,8 +239,7 @@ func (s *DuckFlightSQLServer) EndTransaction(
 		// lets a retry see the same explanation (a reaped session reports
 		// FailedPrecondition) instead of "transaction id not found".
 		s.openTransactions.Store(handle, ts)
-		span.RecordError(err)
-		return err
+		return otelutil.Failed(span, err)
 	}
 	// For an anonymous transaction the pool connection is ours to give back.
 	defer func() {
@@ -241,16 +257,22 @@ func (s *DuckFlightSQLServer) EndTransaction(
 	// active". Skip it.
 	inTxn, probeErr := ac.InExplicitTransaction(ctx)
 	if probeErr != nil {
-		span.RecordError(probeErr)
-		return status.Errorf(codes.Internal, "failed to probe transaction state: %s", probeErr)
+		return otelutil.Failed(span,
+			status.Errorf(codes.Internal, "failed to probe transaction state: %s", probeErr))
 	}
 	if !inTxn {
+		// Another client layer already finalized the DuckDB transaction via raw
+		// SQL, so there is nothing to commit or roll back here. Still counted:
+		// from the client's point of view the transaction ended.
+		span.AddEvent("transaction.already_finalized")
+		txnCountAdd(ctx, op)
 		return nil
 	}
 
 	if _, err := ac.ExecContext(ctx, endSQL); err != nil {
-		span.RecordError(err)
-		return status.Errorf(codes.Internal, "failed to %s: %s", op, err)
+		return otelutil.Failed(span,
+			status.Errorf(codes.Internal, "failed to %s: %s", op, err))
 	}
+	txnCountAdd(ctx, op)
 	return nil
 }

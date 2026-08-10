@@ -38,5 +38,5 @@ func (s *DuckFlightSQLServer) DoGetPrimaryKeys(
 		fmt.Sprintf(" AND table_name = '%s'", escapeSQLString(cmd.Table)) +
 		" ORDER BY catalog_name, db_schema_name, table_name, key_sequence"
 
-	return s.streamMetadata(ctx, query, schema_ref.PrimaryKeys)
+	return s.streamMetadata(ctx, "primary_keys", query, schema_ref.PrimaryKeys)
 }

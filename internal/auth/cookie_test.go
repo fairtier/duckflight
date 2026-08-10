@@ -44,10 +44,10 @@ func TestCookieMintVerifyRoundTrip(t *testing.T) {
 	for _, bad := range []string{
 		"",
 		"not-base64!!",
-		val[:len(val)-4],                   // truncated
-		"A" + val[1:],                      // flipped id byte
+		val[:len(val)-4],                         // truncated
+		"A" + val[1:],                            // flipped id byte
 		val[:len(val)-1] + flip(val[len(val)-1]), // flipped tag byte
-		val + val,                          // wrong length
+		val + val,                                // wrong length
 	} {
 		_, ok := ca.verify(bad)
 		require.False(t, ok, "verify(%q) must fail", bad)
@@ -102,9 +102,10 @@ func TestSessionForTokenPrecedence(t *testing.T) {
 
 	t.Run("no cookie falls back to peer and mints", func(t *testing.T) {
 		ctx := cookieCtx("10.0.0.1:1")
-		sid, setCookie := v.sessionForToken(ctx, token, token)
+		sid, setCookie, src := v.sessionForToken(ctx, token, token)
 		require.Equal(t, deriveSessionID(ctx, token), sid)
 		require.NotEmpty(t, setCookie)
+		require.Equal(t, SessionSourcePeer, src)
 
 		sc, err := http.ParseSetCookie(setCookie)
 		require.NoError(t, err)
@@ -114,33 +115,36 @@ func TestSessionForTokenPrecedence(t *testing.T) {
 	})
 
 	t.Run("valid cookie wins over peer address", func(t *testing.T) {
-		sidA, scA := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, token)
-		sidB, scB := v.sessionForToken(cookieCtx("10.9.9.9:1", cookie), token, token)
+		sidA, scA, srcA := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, token)
+		sidB, scB, srcB := v.sessionForToken(cookieCtx("10.9.9.9:1", cookie), token, token)
 		require.Equal(t, sidA, sidB, "same cookie must map to one session regardless of peer")
 		require.Empty(t, scA)
 		require.Empty(t, scB)
+		require.Equal(t, SessionSourceCookie, srcA)
+		require.Equal(t, SessionSourceCookie, srcB)
 	})
 
 	t.Run("forged cookie reads as absent", func(t *testing.T) {
 		ctx := cookieCtx("10.0.0.1:1", sessionCookieName+"=forged-garbage")
-		sid, setCookie := v.sessionForToken(ctx, token, token)
+		sid, setCookie, src := v.sessionForToken(ctx, token, token)
 		require.Equal(t, deriveSessionID(ctx, token), sid)
 		require.NotEmpty(t, setCookie)
+		require.Equal(t, SessionSourcePeer, src)
 	})
 
 	t.Run("same cookie with different bindings diverges", func(t *testing.T) {
-		sidA, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, "binding-a")
-		sidB, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, "binding-b")
+		sidA, _, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, "binding-a")
+		sidB, _, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, "binding-b")
 		require.NotEqual(t, sidA, sidB)
 	})
 
 	t.Run("packed and split cookie headers parse", func(t *testing.T) {
-		want, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, token)
+		want, _, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", cookie), token, token)
 
-		packed, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", "foo=bar; "+cookie), token, token)
+		packed, _, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", "foo=bar; "+cookie), token, token)
 		require.Equal(t, want, packed)
 
-		split, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", "foo=bar", cookie), token, token)
+		split, _, _ := v.sessionForToken(cookieCtx("10.0.0.1:1", "foo=bar", cookie), token, token)
 		require.Equal(t, want, split)
 	})
 }

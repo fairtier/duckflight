@@ -18,6 +18,8 @@ import (
 	duckdb "github.com/duckdb/duckdb-go/v2"
 	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/otelutil"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -101,7 +103,17 @@ func (s *DuckFlightSQLServer) acquirePoolConn(ctx context.Context) (*engine.Arro
 //     prepared statements work the way clients expect.
 //  3. otherwise      → a one-shot pool conn returned to the pool on release.
 func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*engine.ArrowConn, func(), error) {
+	// Which rung served the call is recorded on the caller's span rather than
+	// in a span of its own: routing is a property of the request, and it is
+	// the first thing to look at when a client reports that its temp table or
+	// its open transaction went missing.
+	reqSpan := trace.SpanFromContext(ctx)
+
 	if txnID != "" {
+		reqSpan.SetAttributes(
+			attribute.String(attrConnSource, connSourceTransaction),
+			attribute.String(attrTransactionID, txnID),
+		)
 		val, ok := s.openTransactions.Load(txnID)
 		if !ok {
 			return nil, nil, status.Error(codes.InvalidArgument, "invalid transaction handle")
@@ -113,6 +125,10 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 	}
 
 	if sid := auth.SessionIDFromContext(ctx); sid != "" {
+		reqSpan.SetAttributes(
+			attribute.String(attrConnSource, connSourceSession),
+			attribute.String(attrSessionID, sid),
+		)
 		sess, release, err := s.sessions.Acquire(ctx, sid)
 		if err != nil {
 			return nil, nil, err
@@ -120,13 +136,14 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 		return sess.Conn(), release, nil
 	}
 
+	reqSpan.SetAttributes(attribute.String(attrConnSource, connSourcePool))
+
 	ctx, span := s.tracer.Start(ctx, "pool.acquire")
 	defer span.End()
 
 	ac, err := s.acquirePoolConn(ctx)
 	if err != nil {
-		span.RecordError(err)
-		return nil, nil, err
+		return nil, nil, otelutil.Failed(span, err)
 	}
 	return ac, func() { s.engine.Pool.Release(ac) }, nil
 }
@@ -134,7 +151,7 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 // GetFlightInfoStatement stores the query for later execution by DoGetStatement.
 // Errors (syntax, missing tables) surface at DoGet time.
 func (s *DuckFlightSQLServer) GetFlightInfoStatement(
-	_ context.Context,
+	ctx context.Context,
 	cmd flightsql.StatementQuery,
 	desc *flight.FlightDescriptor,
 ) (*flight.FlightInfo, error) {
@@ -143,6 +160,14 @@ func (s *DuckFlightSQLServer) GetFlightInfoStatement(
 
 	handle := genHandle()
 	s.tracker.Register(string(handle), query, txnID)
+
+	// The handle is what ties this call to the DoGet that executes the query,
+	// which arrives as a separate RPC in its own trace. Stamping it on both
+	// spans is what makes the two joinable at all.
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(attrStatementHandle, string(handle)),
+		statementAttr(ctx, query),
+	)
 
 	tkt, err := flightsql.CreateStatementQueryTicket(handle)
 	if err != nil {
@@ -173,6 +198,9 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		return nil, nil, status.Error(codes.NotFound, fmt.Sprintf("statement handle not found: %q", handle))
 	}
 
+	reqSpan := trace.SpanFromContext(ctx)
+	reqSpan.SetAttributes(attribute.String(attrStatementHandle, handle))
+
 	ac, release, err := s.acquireConn(ctx, txnID)
 	if err != nil {
 		return nil, nil, err
@@ -193,6 +221,10 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	if skip {
 		release()
 		s.tracker.Complete(handle)
+		// No span for a statement that is deliberately not executed — but
+		// silently answering an empty result to a client's BEGIN or COMMIT is
+		// surprising enough that the trace should say it happened.
+		reqSpan.AddEvent("txn.control.skipped", trace.WithAttributes(statementAttr(ctx, query)))
 		schema := arrow.NewSchema([]arrow.Field{}, nil)
 		ch := make(chan flight.StreamChunk)
 		close(ch)
@@ -220,11 +252,19 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 		return nil, nil, status.Error(codes.Canceled, "query canceled")
 	}
 
-	execCtx, execSpan := s.tracer.Start(queryCtx, "execute",
-		trace.WithAttributes(statementAttr(ctx, query)))
+	execCtx, execSpan := s.tracer.Start(queryCtx, "statement.execute", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "query"),
+		attribute.String(attrStatementHandle, handle),
+		// Set after classification, so it reflects DuckDB's own verdict on the
+		// statement: a true here is why the connection will be recycled rather
+		// than pooled again.
+		attribute.Bool(attrConnDirty, ac.IsDirty()),
+		statementAttr(ctx, query),
+	))
 	rdr, err := ac.Arrow.QueryContext(execCtx, query)
 	if err != nil {
-		execSpan.RecordError(err)
+		otelutil.RecordError(execSpan, err)
 		execSpan.End()
 		// Check context state before canceling, so we can distinguish
 		// external cancellation from our own cleanup cancel.
@@ -244,7 +284,16 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	}
 	execSpan.End()
 
-	metered := newMeteredReader(ctx, rdr, s.maxResultBytes)
+	// Delivery gets its own span: the batches are produced by the goroutine
+	// below and consumed by the Flight server as it writes them to the wire,
+	// so for a large result most of the wall clock a client sees is spent
+	// here — after statement.execute has already ended.
+	streamCtx, streamSpan := s.tracer.Start(ctx, "statement.stream", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrStatementHandle, handle),
+	))
+
+	metered := newMeteredReader(streamCtx, rdr, s.maxResultBytes)
 	schema := metered.Schema()
 	ch := make(chan flight.StreamChunk)
 
@@ -260,6 +309,11 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 			s.tracker.Complete(handle)
 			activeQueries.Add(ctx, -1)
 			queryDuration.Record(ctx, time.Since(start).Seconds())
+			streamSpan.SetAttributes(
+				attribute.Int64(attrRows, metered.rows),
+				attribute.Int64(attrBytes, metered.bytes),
+			)
+			streamSpan.End()
 		}()
 
 		for metered.Next() {
@@ -273,14 +327,19 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 				rec.Release()
 				if queryCtx.Err() == context.Canceled {
 					queryCountAdd(ctx, "canceled")
+					// A client hanging up mid-stream is normal, so it is an
+					// event on an otherwise-successful span, not an error.
+					streamSpan.AddEvent("stream.canceled")
 				} else {
 					queryCountAdd(ctx, "timeout")
+					otelutil.RecordError(streamSpan, queryCtx.Err())
 				}
 				return
 			}
 		}
 		if err := metered.Err(); err != nil {
 			queryCountAdd(ctx, "error")
+			otelutil.RecordError(streamSpan, err)
 			select {
 			case ch <- flight.StreamChunk{Err: err}:
 			case <-queryCtx.Done():
@@ -312,12 +371,25 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
 		return 0, err
 	}
 	if skip {
+		trace.SpanFromContext(ctx).AddEvent("txn.control.skipped",
+			trace.WithAttributes(statementAttr(ctx, query)))
 		return 0, nil
 	}
+
+	ctx, span := s.tracer.Start(ctx, "statement.update", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "update"),
+		attribute.Bool(attrConnDirty, ac.IsDirty()),
+		statementAttr(ctx, query),
+	))
+	defer span.End()
+
 	n, err := ac.ExecContext(ctx, query)
 	if err != nil {
-		return 0, status.Errorf(codes.Internal, "update error: %s", err)
+		return 0, otelutil.Failed(span, status.Errorf(codes.Internal, "update error: %s", err))
 	}
+	span.SetAttributes(attribute.Int64(attrRows, n))
+	rowsAffectedAdd(ctx, opUpdate, n)
 	return n, nil
 }
 
@@ -338,10 +410,17 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 	}
 	defer release()
 
+	ctx, span := s.tracer.Start(ctx, "schema.probe", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "schema"),
+		statementAttr(ctx, query),
+	))
+	defer span.End()
+
 	// Execute with LIMIT 0 to get schema without results.
 	rdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query))
 	if err != nil {
-		return nil, status.Errorf(duckDBToGRPCCode(err), "query error: %s", err)
+		return nil, otelutil.Failed(span, status.Errorf(duckDBToGRPCCode(err), "query error: %s", err))
 	}
 	defer rdr.Release()
 
@@ -353,7 +432,7 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 
 // CancelFlightInfo cancels a running or pending query.
 func (s *DuckFlightSQLServer) CancelFlightInfo(
-	_ context.Context,
+	ctx context.Context,
 	req *flight.CancelFlightInfoRequest,
 ) (flight.CancelFlightInfoResult, error) {
 	handle, err := extractStatementHandle(req)
@@ -362,6 +441,12 @@ func (s *DuckFlightSQLServer) CancelFlightInfo(
 	}
 
 	cs := s.tracker.Cancel(handle)
+	// The cancellation lands on a *different* trace than the query it kills —
+	// this handle is the only thing that joins the two.
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(attrStatementHandle, handle),
+		attribute.String("flight.cancel_status", cs.String()),
+	)
 	return flight.CancelFlightInfoResult{Status: cs}, nil
 }
 
@@ -383,7 +468,7 @@ func extractStatementHandle(req *flight.CancelFlightInfoRequest) (string, error)
 // PollFlightInfoStatement registers the query and returns a ready-to-consume PollInfo.
 // Since DuckFlight uses synchronous execution, the query is immediately ready for DoGet.
 func (s *DuckFlightSQLServer) PollFlightInfoStatement(
-	_ context.Context,
+	ctx context.Context,
 	cmd flightsql.StatementQuery,
 	desc *flight.FlightDescriptor,
 ) (*flight.PollInfo, error) {
@@ -392,6 +477,11 @@ func (s *DuckFlightSQLServer) PollFlightInfoStatement(
 
 	handle := genHandle()
 	s.tracker.Register(string(handle), query, txnID)
+
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String(attrStatementHandle, string(handle)),
+		statementAttr(ctx, query),
+	)
 
 	tkt, err := flightsql.CreateStatementQueryTicket(handle)
 	if err != nil {
@@ -473,7 +563,7 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementIngest(
 	ctx context.Context,
 	cmd flightsql.StatementIngest,
 	rdr flight.MessageReader,
-) (int64, error) {
+) (ingested int64, err error) {
 	table := cmd.GetTable()
 	if table == "" {
 		return 0, status.Error(codes.InvalidArgument, "table name is required for ingestion")
@@ -492,6 +582,24 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementIngest(
 
 	target := qualifiedTableName(cmd.GetCatalog(), cmd.GetSchema(), table)
 	insertSQL := fmt.Sprintf("INSERT INTO %s SELECT * FROM __ingest_view", target)
+
+	// Ingestion is the one path whose duration is driven by the client's
+	// upload rate rather than by DuckDB, so it is worth separating from the
+	// enclosing RPC span. The target table is a schema name, not user data.
+	ctx, span := s.tracer.Start(ctx, "statement.ingest", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "ingest"),
+		attribute.String("db.collection.name", target),
+	))
+	// Named results, so the rows are recorded even on the partial-failure
+	// paths: ingestAll returns what it managed to write alongside its error,
+	// and those rows are committed whether or not the stream finished.
+	defer func() {
+		span.SetAttributes(attribute.Int64(attrRows, ingested))
+		rowsAffectedAdd(ctx, opIngest, ingested)
+		otelutil.RecordError(span, err)
+		span.End()
+	}()
 
 	ifNotExist := opts.GetIfNotExist()
 	ifExists := opts.GetIfExists()

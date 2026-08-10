@@ -35,11 +35,15 @@ internal/
   engine/
     engine.go                DuckDB connector lifecycle, boot SQL, Iceberg ATTACH
     pool.go                  Bounded channel-based ArrowConn pool
+    metrics.go               Per-pool instruments (idle/max gauges, acquire duration, recycle counters)
+  otelutil/otelutil.go       Shared OTel scope name, Tracer()/Meter(), span error recording
+  telemetry/telemetry.go     OTel SDK setup: OTLP traces/logs, Prometheus metrics, stderr logs
   auth/middleware.go         Bearer token flight.ServerMiddleware (own header parsing, not arrow-go's); resolves the sid (JWT claim → cookie → peer)
   auth/jwt.go                HS256 token mint/verify with sid (session id) claim
   auth/cookie.go             HMAC-signed session cookie mint/verify/parse (Flight arrow_flight_session_id)
   ratelimit/middleware.go    Token-bucket rate limit flight.ServerMiddleware
   session/manager.go         Pins one DuckDB connection per Flight session, idle reaper
+  session/metrics.go         Per-manager instruments (active gauge, created/evicted counters)
   server/
     server.go                DuckFlightSQLServer (embeds flightsql.BaseServer), SqlInfo registration, CloseSession → session.Manager.Close
     statements.go            GetFlightInfoStatement, DoGetStatement, DoPutCommandStatementUpdate, GetSchemaStatement; acquireConn routing
@@ -49,7 +53,8 @@ internal/
     primarykeys.go           DoGetPrimaryKeys via duckdb_constraints()
     foreignkeys.go           DoGetImportedKeys, DoGetExportedKeys, DoGetCrossReference
     xdbctypeinfo.go          DoGetXdbcTypeInfo (23 DuckDB types mapped to JDBC types)
-    metering.go              Prometheus metrics + meteredReader (byte counting incl. nested/dictionary data, max limit)
+    metering.go              OTel instruments + meteredReader (row/byte counting incl. nested/dictionary data, max limit)
+    tracing.go               Span attribute keys and their conventions
     recovery.go              Panic-recovery flight.ServerMiddleware (outermost)
     logging.go               loggingServer wrapper, GRPCLoggingMiddleware
 test/
@@ -153,15 +158,87 @@ shedding a probe turns a load spike into a restart loop.
 | `github.com/apache/arrow-adbc/go/adbc`        | v1.10.0 | ADBC driver (used in tests)              |
 | `github.com/testcontainers/testcontainers-go` | v0.42.0 | Docker containers for integration tests  |
 
-## Prometheus Metrics
+## Observability
 
-| Metric                             | Type      | Labels                      |
-|------------------------------------|-----------|-----------------------------|
-| `flightsql_queries_total`          | Counter   | `status` (ok/error/timeout) |
-| `flightsql_query_duration_seconds` | Histogram | —                           |
-| `flightsql_bytes_streamed_total`   | Counter   | —                           |
-| `flightsql_active_queries`         | Gauge     | —                           |
-| `flightsql_ratelimit_rejected`     | Counter   | —                           |
+Everything goes through OpenTelemetry
+([internal/telemetry/telemetry.go](internal/telemetry/telemetry.go)): metrics
+are always exported to Prometheus on `METRIC_ADDR`, and traces plus logs go to
+an OTLP collector when `OTEL_EXPORTER_OTLP_ENDPOINT` is set (logs also always go
+to stderr via the `otelslog` bridge). Every package reports under one
+instrumentation scope, `duckflight` ([internal/otelutil](internal/otelutil)).
+
+### Metrics
+
+Names below are the exported Prometheus names; the OTel instrument names are
+the dotted equivalents. `flightsql.*` is protocol-level, `duckflight.*` is the
+infrastructure underneath it.
+
+| Metric                                    | Type      | Labels                                        |
+|-------------------------------------------|-----------|-----------------------------------------------|
+| `flightsql_queries_total`                 | Counter   | `status` (ok/error/timeout/canceled)          |
+| `flightsql_query_duration_seconds`        | Histogram | —                                             |
+| `flightsql_bytes_streamed_total`          | Counter   | —                                             |
+| `flightsql_result_size_bytes`             | Histogram | — (per-result size, not a total)              |
+| `flightsql_rows_streamed_total`           | Counter   | —                                             |
+| `flightsql_rows_affected_total`           | Counter   | `operation` (update/prepared_update/ingest)   |
+| `flightsql_active_queries`                | Gauge     | —                                             |
+| `flightsql_transactions_total`            | Counter   | `action` (begin/commit/rollback/reaped)       |
+| `flightsql_transactions_active`           | Gauge     | —                                             |
+| `flightsql_prepared_statements_active`    | Gauge     | —                                             |
+| `flightsql_ratelimit_rejected`            | Counter   | —                                             |
+| `duckflight_pool_connections_idle`        | Gauge     | —                                             |
+| `duckflight_pool_connections_max`         | Gauge     | —                                             |
+| `duckflight_pool_acquire_duration_seconds`| Histogram | —                                             |
+| `duckflight_pool_connections_recycled_total` | Counter | `reason` (dirty/discarded)                   |
+| `duckflight_pool_connections_lost_total`  | Counter   | — (replacement failed to boot; pool shrank)   |
+| `duckflight_sessions_active`              | Gauge     | —                                             |
+| `duckflight_sessions_created_total`       | Counter   | —                                             |
+| `duckflight_sessions_evicted_total`       | Counter   | `reason` (closed/reaped/reclaimed/shutdown)   |
+
+The gauges are OTel observable instruments whose callbacks read live server
+state; each is unregistered when its pool/manager/server closes, so a shut-down
+component stops reporting instead of reporting stale numbers.
+
+### Spans
+
+gRPC server spans come from `otelgrpc` (health checks filtered out). Below them:
+
+| Span                | Where                                        |
+|---------------------|----------------------------------------------|
+| `session.acquire`   | per-RPC session lookup incl. lock wait       |
+| `pool.acquire`      | one-shot pool borrow (anonymous requests)    |
+| `statement.execute` | DuckDB execution of an ad-hoc statement      |
+| `statement.stream`  | delivery of result batches to the client     |
+| `statement.update`  | DoPut update                                 |
+| `statement.ingest`  | bulk ingestion                               |
+| `schema.probe`      | GetSchema `LIMIT 0` probe                    |
+| `prepared.create` / `prepared.execute` / `prepared.stream` / `prepared.update` | prepared statement lifecycle |
+| `metadata.query`    | catalog/schema/table/keys endpoints (`flight.metadata_kind`) |
+| `transaction.begin` / `transaction.end` | Flight transaction RPCs  |
+
+`statement.execute` ends when DuckDB returns; `statement.stream` covers the
+goroutine that feeds batches to the client, which is where most of the wall
+clock of a large result goes.
+
+**Attributes, not spans, for facts about a call.** `db.connection.source`
+(transaction/session/pool) records which rung of `acquireConn`'s precedence
+served the request — the first thing to check when a client reports a missing
+temp table. `auth.method` and `session.source` (jwt/cookie/peer) record how the
+session id was derived. `db.connection.dirty` says whether the statement will
+force the connection to be recycled. Deliberately absent: the authenticated
+subject — a username or OIDC `sub` is a user identifier and spans go to the
+collector. SQL text (`db.statement`) is DEBUG-gated for the same reason logs
+are (see `statementAttr` in [internal/server/logging.go](internal/server/logging.go)):
+statements carry credentials in `CREATE SECRET`/`ATTACH` and PII in literals.
+
+**Events, not spans, for instants.** `pool.exhausted` (the caller had to wait
+for a connection), `session.reclaimed_idle` (a live session lost its connection
+to pool pressure), `result.limit_exceeded` (`MAX_RESULT_BYTES` tripped, with
+bytes/rows already sent), `txn.control.skipped` (a redundant BEGIN/COMMIT was
+no-oped), `transaction.attached_to_existing`, `stream.canceled`.
+
+None of the unbounded identifiers — session id, statement handle, transaction
+id — are ever used as metric attributes; they live on spans only.
 
 ## Configuration
 

@@ -16,6 +16,8 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/fairtier/duckflight/internal/grpcutil"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
@@ -56,7 +58,33 @@ type Identity struct {
 	// issue time; for OIDC and static tokens it is derived per client
 	// connection so that two clients sharing a token don't share a session.
 	SessionID string
+	// Method is which backend accepted the credential, and SessionSource which
+	// rung of the session-id precedence produced SessionID. Both are recorded
+	// on the request span: when a client reports that its temp tables vanished
+	// or that two clients collided on one session, these two labels are the
+	// answer, and they are cheap, bounded and free of user identifiers.
+	Method        string
+	SessionSource string
 }
+
+// Values for [Identity.Method].
+const (
+	MethodStatic = "static"
+	MethodJWT    = "jwt"
+	MethodOIDC   = "oidc"
+)
+
+// Values for [Identity.SessionSource], in precedence order.
+const (
+	// SessionSourceJWT is a sid claim stamped into a handshake-issued JWT.
+	SessionSourceJWT = "jwt"
+	// SessionSourceCookie is a valid echoed session cookie — the rung that
+	// survives an L7 proxy pooling upstream connections.
+	SessionSourceCookie = "cookie"
+	// SessionSourcePeer is the fallback derivation from token + peer address,
+	// which is what clients that do not echo cookies get.
+	SessionSourcePeer = "peer"
+)
 
 // Config bundles every auth backend the server can be wired with. Any nil/zero
 // field disables that backend; if all are zero, Middleware returns nil and
@@ -223,6 +251,16 @@ func (v *validator) authenticate(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	// Attributes on the RPC's existing span rather than a span of their own:
+	// authentication is a step inside the call, not a unit of work worth its
+	// own timing. Deliberately absent is the subject — a username or an OIDC
+	// `sub` is a user identifier, and spans travel to the collector.
+	trace.SpanFromContext(ctx).SetAttributes(
+		attribute.String("auth.method", id.Method),
+		attribute.String("session.source", id.SessionSource),
+		attribute.String("session.id", id.SessionID),
+	)
 	if setCookie != "" {
 		// Best effort: a client without a cookie jar ignores it, and a
 		// SetHeader failure only means this request keeps its peer-derived
@@ -304,8 +342,13 @@ func (v *validator) identify(ctx context.Context, token string) (Identity, strin
 		// Bind to the raw token: every static token shares the "static"
 		// subject, so binding to the subject would merge distinct tokens
 		// that happen to present the same cookie.
-		sid, setCookie := v.sessionForToken(ctx, token, token)
-		return Identity{Subject: "static", SessionID: sid}, setCookie, nil
+		sid, setCookie, src := v.sessionForToken(ctx, token, token)
+		return Identity{
+			Subject:       "static",
+			SessionID:     sid,
+			Method:        MethodStatic,
+			SessionSource: src,
+		}, setCookie, nil
 	}
 
 	iss, err := tokenIssuer(token)
@@ -324,8 +367,13 @@ func (v *validator) identify(ctx context.Context, token string) (Identity, strin
 		// Bind to issuer+subject rather than the raw token: OAuth refresh
 		// rotates the token mid-session, and rebinding on every rotation
 		// would orphan the client's temp tables and open transactions.
-		sid, setCookie := v.sessionForToken(ctx, token, "oidc\x00"+v.oidc.issuer+"\x00"+sub)
-		return Identity{Subject: sub, SessionID: sid}, setCookie, nil
+		sid, setCookie, src := v.sessionForToken(ctx, token, "oidc\x00"+v.oidc.issuer+"\x00"+sub)
+		return Identity{
+			Subject:       sub,
+			SessionID:     sid,
+			Method:        MethodOIDC,
+			SessionSource: src,
+		}, setCookie, nil
 	case v.local != nil && iss == localJWTIssuer:
 		sub, sid, err := v.local.verify(token)
 		if err != nil {
@@ -335,10 +383,20 @@ func (v *validator) identify(ctx context.Context, token string) (Identity, strin
 		// minted before the sid claim existed is exactly the "no stamped
 		// sid" case the cookie exists for.
 		if sid != "" {
-			return Identity{Subject: sub, SessionID: sid}, "", nil
+			return Identity{
+				Subject:       sub,
+				SessionID:     sid,
+				Method:        MethodJWT,
+				SessionSource: SessionSourceJWT,
+			}, "", nil
 		}
-		sid, setCookie := v.sessionForToken(ctx, token, token)
-		return Identity{Subject: sub, SessionID: sid}, setCookie, nil
+		sid, setCookie, src := v.sessionForToken(ctx, token, token)
+		return Identity{
+			Subject:       sub,
+			SessionID:     sid,
+			Method:        MethodJWT,
+			SessionSource: src,
+		}, setCookie, nil
 	default:
 		return Identity{}, "", status.Error(codes.Unauthenticated, "unknown token issuer")
 	}
@@ -350,19 +408,19 @@ func (v *validator) identify(ctx context.Context, token string) (Identity, strin
 // the request arrived on. Otherwise this request keeps the peer-derived id
 // and a fresh cookie is minted for the next one; clients that never echo
 // cookies therefore keep the peer-derived behavior exactly.
-func (v *validator) sessionForToken(ctx context.Context, token, binding string) (sid, setCookie string) {
+func (v *validator) sessionForToken(ctx context.Context, token, binding string) (sid, setCookie, source string) {
 	if val, ok := incomingSessionCookie(ctx); ok {
 		if id, ok := v.cookies.verify(val); ok {
-			return cookieSessionID(id, binding), ""
+			return cookieSessionID(id, binding), "", SessionSourceCookie
 		}
 	}
 	sid = deriveSessionID(ctx, token)
 	mv, err := v.cookies.mint()
 	if err != nil {
 		slog.Warn("session cookie mint failed; using peer-derived session id", slog.String("error", err.Error()))
-		return sid, ""
+		return sid, "", SessionSourcePeer
 	}
-	return sid, (&http.Cookie{Name: sessionCookieName, Value: mv}).String()
+	return sid, (&http.Cookie{Name: sessionCookieName, Value: mv}).String(), SessionSourcePeer
 }
 
 // deriveSessionID builds a stable, opaque session id for a bearer token that

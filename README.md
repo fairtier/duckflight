@@ -103,7 +103,10 @@ All configuration is via environment variables:
 | `S3_SECRET_KEY`         |                 | S3 secret key                                                                                                          |
 | `S3_REGION`             |                 | S3 region                                                                                                              |
 | `S3_URL_STYLE`          |                 | `path` for MinIO, `vhost` for AWS                                                                                      |
-| `LOG_LEVEL`             | `INFO`          | Log level: DEBUG, INFO, WARN, ERROR                                                                                    |
+| `LOG_LEVEL`             | `INFO`          | Log level: DEBUG, INFO, WARN, ERROR. `DEBUG` also puts SQL text on logs and spans                                      |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` |           | OTLP collector (`host:port`, scheme optional). Enables trace and log export; empty = traces off, logs to stderr only    |
+| `OTEL_EXPORTER_OTLP_INSECURE` | `false`   | `true`/`1` to talk to the collector without TLS                                                                        |
+| `OTEL_SERVICE_NAME`     | `duckflight`    | `service.name` on exported telemetry                                                                                   |
 
 ## Connecting
 
@@ -182,6 +185,31 @@ databow --driver flightsql --uri grpc+tls://duckflight.example.com:443 \
   --query "SELECT 1"
 ```
 
+## Observability
+
+DuckFlight is instrumented with OpenTelemetry end to end.
+
+**Metrics** are always on, in Prometheus format at `METRIC_ADDR` (`:9090/metrics`
+by default). Beyond query counts, durations and bytes there are per-result size
+and row counters, transaction and prepared-statement gauges, and the numbers
+that explain saturation: pool idle/capacity, how long acquiring a connection
+took, how many connections were recycled or lost, and how many sessions were
+created or evicted (and why — `closed`, `reaped`, `reclaimed`, `shutdown`).
+
+**Traces and logs** are exported when `OTEL_EXPORTER_OTLP_ENDPOINT` is set; logs
+also always go to stderr. Spans cover the DuckDB execution and the result
+streaming separately — for a large result most of the time a client waits is
+delivery, after execution has already finished — plus session acquisition,
+prepared statements, transactions and metadata endpoints. Spans carry the facts
+you need to explain surprising behaviour: which connection a request was routed
+to (`db.connection.source`: transaction, session or pool), how the session id
+was derived (`auth.method`, `session.source`), rows and bytes delivered, and
+events for pool exhaustion, idle-session reclamation and result-size cutoffs.
+
+SQL text is attached to logs and spans only at `LOG_LEVEL=DEBUG`: statements
+routinely carry credentials (`CREATE SECRET`, `ATTACH … (TOKEN …)`) and PII in
+literals. Authenticated usernames and OIDC subjects are never put on spans.
+
 ## Kubernetes deployment
 
 A Helm chart is included at `helm/duckflight/`:
@@ -221,8 +249,11 @@ internal/
     primarykeys.go     Primary key metadata
     foreignkeys.go     Imported/exported keys, cross-reference
     xdbctypeinfo.go    JDBC type info metadata
-    metering.go        Prometheus metrics, metered reader
+    metering.go        OpenTelemetry instruments, metered reader
+    tracing.go         Span attribute keys and conventions
     logging.go         Structured Flight SQL + gRPC logging
+  otelutil/          Shared instrumentation scope and span helpers
+  telemetry/         OpenTelemetry SDK setup (OTLP traces/logs, Prometheus metrics)
 helm/duckflight/     Helm chart for Kubernetes deployment
 test/                Iceberg integration tests (testcontainers)
 docs/                Design documents for planned features

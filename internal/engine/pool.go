@@ -11,8 +11,10 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/duckdb/duckdb-go/v2"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ArrowConn wraps a raw DuckDB connection and its Arrow interface.
@@ -258,6 +260,7 @@ type ArrowPool struct {
 	// newConn boots a replacement connection (running the connector's boot
 	// SQL, so replacements start from the same state as the originals).
 	newConn func() (*ArrowConn, error)
+	metrics *poolMetrics
 
 	mu     sync.Mutex
 	closed bool
@@ -275,6 +278,9 @@ func NewArrowPool(connector *duckdb.Connector, size int) (*ArrowPool, error) {
 		pool: make(chan *ArrowConn, size),
 		live: make(map[*ArrowConn]struct{}, size),
 	}
+	// Before the boot loop below: a failure there calls Close, which stops the
+	// metrics registration.
+	p.metrics = newPoolMetrics(p)
 	p.newConn = func() (*ArrowConn, error) {
 		conn, err := connector.Connect(context.Background())
 		if err != nil {
@@ -308,6 +314,24 @@ func (p *ArrowPool) track(ac *ArrowConn) {
 
 // Acquire blocks until an ArrowConn is available or ctx is canceled.
 func (p *ArrowPool) Acquire(ctx context.Context) (*ArrowConn, error) {
+	start := time.Now()
+	// The wait is measured on every path, failed ones included: an acquire that
+	// ends in a deadline is precisely the saturation signal worth keeping.
+	defer func() { p.metrics.acquireDuration.Record(ctx, time.Since(start).Seconds()) }()
+
+	select {
+	case ac, ok := <-p.pool:
+		if !ok {
+			return nil, ErrPoolClosed
+		}
+		return ac, nil
+	default:
+	}
+
+	// Nothing idle. An event rather than a span: the wait is one moment in the
+	// caller's span, and it says why that span is about to look slow.
+	trace.SpanFromContext(ctx).AddEvent("pool.exhausted")
+
 	select {
 	case ac, ok := <-p.pool:
 		if !ok {
@@ -350,7 +374,7 @@ func (p *ArrowPool) Release(ac *ArrowConn) {
 		return
 	}
 	if ac.IsDirty() {
-		p.Discard(ac)
+		p.discard(ac, recycleDirty)
 		return
 	}
 	p.put(ac)
@@ -366,9 +390,14 @@ func (p *ArrowPool) Release(ac *ArrowConn) {
 // boot SQL, so it starts from exactly the same state as the originals.
 // Callers must not touch ac afterwards.
 func (p *ArrowPool) Discard(ac *ArrowConn) {
+	p.discard(ac, recycleDiscarded)
+}
+
+func (p *ArrowPool) discard(ac *ArrowConn, reason string) {
 	if ac == nil {
 		return
 	}
+	p.metrics.recordRecycled(reason)
 	p.mu.Lock()
 	closed := p.closed
 	delete(p.live, ac)
@@ -383,6 +412,7 @@ func (p *ArrowPool) Discard(ac *ArrowConn) {
 		// Losing a connection shrinks the pool but keeps the server serving;
 		// a permanently smaller pool is far better than handing out a dirty
 		// or closed connection.
+		p.metrics.lost.Add(context.Background(), 1)
 		slog.Error("failed to replace pooled connection", slog.String("error", err.Error()))
 		return
 	}
@@ -427,6 +457,7 @@ func (p *ArrowPool) Close() {
 		return
 	}
 	p.closed = true
+	p.metrics.stop()
 	conns := make([]*ArrowConn, 0, len(p.live))
 	for ac := range p.live {
 		conns = append(conns, ac)

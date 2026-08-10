@@ -13,6 +13,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql/schema_ref"
 	"github.com/fairtier/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/otelutil"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -31,21 +34,39 @@ func (s *DuckFlightSQLServer) flightInfoForCommand(desc *flight.FlightDescriptor
 // the given schema stamped on. The SQL must produce columns whose types match
 // the target schema exactly — only schema-level metadata (field names,
 // nullability) is overwritten. No data is copied.
+//
+// The kind argument names the Flight SQL metadata endpoint being served; it is
+// a fixed, low-cardinality label, so it is safe as a span attribute.
 func (s *DuckFlightSQLServer) streamMetadata(
-	ctx context.Context, query string, schema *arrow.Schema,
+	ctx context.Context, kind, query string, schema *arrow.Schema,
 ) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	// One span for the whole endpoint rather than one per phase: metadata
+	// results are small, and what matters is that a client's schema-tree
+	// expansion is slow, not which of the two lines below it was slow in.
+	ctx, span := s.tracer.Start(ctx, "metadata.query", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "metadata"),
+		attribute.String(attrMetadataKind, kind),
+		statementAttr(ctx, query),
+	))
+
 	// Routed through acquireConn, like every other statement path: metadata
 	// asked for inside a session has to see that session's temp tables and
 	// its transaction's snapshot, not an unrelated pool connection's view.
 	ac, release, err := s.acquireConn(ctx, "")
 	if err != nil {
+		otelutil.RecordError(span, err)
+		span.End()
 		return nil, nil, err
 	}
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
 	if err != nil {
 		release()
-		return nil, nil, status.Errorf(codes.Internal, "query error: %s", err)
+		err = status.Errorf(codes.Internal, "query error: %s", err)
+		otelutil.RecordError(span, err)
+		span.End()
+		return nil, nil, err
 	}
 
 	ch := make(chan flight.StreamChunk)
@@ -53,6 +74,13 @@ func (s *DuckFlightSQLServer) streamMetadata(
 		defer close(ch)
 		defer rdr.Release()
 		defer release()
+
+		var rows int64
+		defer func() {
+			span.SetAttributes(attribute.Int64(attrRows, rows))
+			span.End()
+		}()
+
 		for rdr.Next() {
 			rec := rdr.RecordBatch()
 			cols := make([]arrow.Array, rec.NumCols())
@@ -62,12 +90,14 @@ func (s *DuckFlightSQLServer) streamMetadata(
 			out := array.NewRecordBatch(schema, cols, rec.NumRows())
 			select {
 			case ch <- flight.StreamChunk{Data: out}:
+				rows += rec.NumRows()
 			case <-ctx.Done():
 				out.Release()
 				return
 			}
 		}
 		if err := rdr.Err(); err != nil {
+			otelutil.RecordError(span, err)
 			select {
 			case ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}:
 			case <-ctx.Done():
@@ -84,7 +114,7 @@ func (s *DuckFlightSQLServer) GetFlightInfoCatalogs(_ context.Context, desc *fli
 }
 
 func (s *DuckFlightSQLServer) DoGetCatalogs(ctx context.Context) (*arrow.Schema, <-chan flight.StreamChunk, error) {
-	return s.streamMetadata(ctx,
+	return s.streamMetadata(ctx, "catalogs",
 		"SELECT DISTINCT catalog_name FROM information_schema.schemata ORDER BY catalog_name",
 		schema_ref.Catalogs)
 }
@@ -103,7 +133,7 @@ func (s *DuckFlightSQLServer) DoGetDBSchemas(ctx context.Context, cmd flightsql.
 	}
 	query += " ORDER BY catalog_name, db_schema_name"
 
-	return s.streamMetadata(ctx, query, schema_ref.DBSchemas)
+	return s.streamMetadata(ctx, "db_schemas", query, schema_ref.DBSchemas)
 }
 
 // --- GetTables ---
@@ -140,19 +170,34 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 	query := s.doGetTablesQuery(cmd)
 
 	if !cmd.GetIncludeSchema() {
-		return s.streamMetadata(ctx, query, schema_ref.Tables)
+		return s.streamMetadata(ctx, "tables", query, schema_ref.Tables)
 	}
 
-	// With include_schema we need to append a binary column per batch.
+	// With include_schema we need to append a binary column per batch. This is
+	// by far the most expensive metadata endpoint — it runs a column lookup per
+	// batch of tables — so it gets its own span rather than sharing the one
+	// above.
+	ctx, span := s.tracer.Start(ctx, "metadata.query", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "metadata"),
+		attribute.String(attrMetadataKind, "tables_with_schema"),
+		statementAttr(ctx, query),
+	))
+
 	ac, release, err := s.acquireConn(ctx, "")
 	if err != nil {
+		otelutil.RecordError(span, err)
+		span.End()
 		return nil, nil, err
 	}
 
 	rdr, err := ac.Arrow.QueryContext(ctx, query)
 	if err != nil {
 		release()
-		return nil, nil, status.Errorf(codes.Internal, "query error: %s", err)
+		err = status.Errorf(codes.Internal, "query error: %s", err)
+		otelutil.RecordError(span, err)
+		span.End()
+		return nil, nil, err
 	}
 
 	ch := make(chan flight.StreamChunk)
@@ -160,6 +205,13 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 		defer close(ch)
 		defer rdr.Release()
 		defer release()
+
+		var rows int64
+		defer func() {
+			span.SetAttributes(attribute.Int64(attrRows, rows))
+			span.End()
+		}()
+
 		for rdr.Next() {
 			rec := rdr.RecordBatch()
 			nrows := rec.NumRows()
@@ -202,12 +254,14 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 
 			select {
 			case ch <- flight.StreamChunk{Data: out}:
+				rows += nrows
 			case <-ctx.Done():
 				out.Release()
 				return
 			}
 		}
 		if err := rdr.Err(); err != nil {
+			otelutil.RecordError(span, err)
 			select {
 			case ch <- flight.StreamChunk{Err: status.Errorf(codes.Internal, "reader error: %s", err)}:
 			case <-ctx.Done():

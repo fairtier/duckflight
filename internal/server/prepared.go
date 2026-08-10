@@ -15,6 +15,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/scalar"
 	"github.com/fairtier/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/otelutil"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -166,11 +169,20 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	ps.touch()
 	s.preparedStmts.Store(string(handle), ps)
 
+	ctx, span := s.tracer.Start(ctx, "prepared.create", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "prepare"),
+		attribute.String(attrPreparedHandle, string(handle)),
+		statementAttr(ctx, query),
+	))
+	defer span.End()
+
 	// Schema probe. Routed through acquireConn so the transaction's or
 	// session's connection-local state (attached catalogs, search_path,
 	// uncommitted rows) is in scope.
 	ac, release, err := s.acquireConn(ctx, txnID)
 	if err != nil {
+		otelutil.RecordError(span, err)
 		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
 	}
 	defer release()
@@ -184,7 +196,9 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 		// Return handle without schema if schema detection fails. This covers
 		// statements that aren't queries (DML, DDL, bare BEGIN/COMMIT) —
 		// DoGet/DoPut will execute the original query on the right connection
-		// where it works naturally.
+		// where it works naturally. An event, not an error: this is the
+		// expected outcome for every prepared non-query statement.
+		span.AddEvent("prepared.schema_unavailable")
 		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
 	}
 	defer rdr.Release()
@@ -237,6 +251,9 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 	ps := val.(*preparedStatement)
 	ps.touch()
 
+	reqSpan := trace.SpanFromContext(ctx)
+	reqSpan.SetAttributes(attribute.String(attrPreparedHandle, handle))
+
 	ac, release, err := s.resolveConn(ctx, ps)
 	if err != nil {
 		return nil, nil, err
@@ -252,6 +269,7 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 	}
 	if skip {
 		release()
+		reqSpan.AddEvent("txn.control.skipped", trace.WithAttributes(statementAttr(ctx, ps.query)))
 		schema := arrow.NewSchema([]arrow.Field{}, nil)
 		ch := make(chan flight.StreamChunk)
 		close(ch)
@@ -278,8 +296,18 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 		queryCtx, queryCancel = context.WithCancel(ctx)
 	}
 
-	rdr, err := ac.Arrow.QueryContext(queryCtx, ps.query, args...)
+	execCtx, execSpan := s.tracer.Start(queryCtx, "prepared.execute", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "query"),
+		attribute.String(attrPreparedHandle, handle),
+		attribute.Int("flight.bound_parameters", len(args)),
+		attribute.Bool(attrConnDirty, ac.IsDirty()),
+		statementAttr(ctx, ps.query),
+	))
+	rdr, err := ac.Arrow.QueryContext(execCtx, ps.query, args...)
 	if err != nil {
+		otelutil.RecordError(execSpan, err)
+		execSpan.End()
 		ctxErr := queryCtx.Err()
 		queryCancel()
 		release()
@@ -293,8 +321,14 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 		}
 		return nil, nil, status.Errorf(duckDBToGRPCCode(err), "query execution error: %s", err)
 	}
+	execSpan.End()
 
-	metered := newMeteredReader(ctx, rdr, s.maxResultBytes)
+	streamCtx, streamSpan := s.tracer.Start(ctx, "prepared.stream", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrPreparedHandle, handle),
+	))
+
+	metered := newMeteredReader(streamCtx, rdr, s.maxResultBytes)
 	schema := metered.Schema()
 	ch := make(chan flight.StreamChunk)
 
@@ -309,6 +343,11 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 		defer func() {
 			activeQueries.Add(ctx, -1)
 			queryDuration.Record(ctx, time.Since(start).Seconds())
+			streamSpan.SetAttributes(
+				attribute.Int64(attrRows, metered.rows),
+				attribute.Int64(attrBytes, metered.bytes),
+			)
+			streamSpan.End()
 		}()
 
 		for metered.Next() {
@@ -320,14 +359,17 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 				rec.Release()
 				if queryCtx.Err() == context.Canceled {
 					queryCountAdd(ctx, "canceled")
+					streamSpan.AddEvent("stream.canceled")
 				} else {
 					queryCountAdd(ctx, "timeout")
+					otelutil.RecordError(streamSpan, queryCtx.Err())
 				}
 				return
 			}
 		}
 		if err := metered.Err(); err != nil {
 			queryCountAdd(ctx, "error")
+			otelutil.RecordError(streamSpan, err)
 			select {
 			case ch <- flight.StreamChunk{Err: err}:
 			case <-queryCtx.Done():
@@ -399,22 +441,42 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 		return 0, err
 	}
 	if skip {
+		trace.SpanFromContext(ctx).AddEvent("txn.control.skipped",
+			trace.WithAttributes(statementAttr(ctx, ps.query)))
 		return 0, nil
 	}
 
-	if len(args) == 0 {
-		n, err := ac.ExecContext(ctx, ps.query)
-		if err != nil {
-			return 0, status.Errorf(codes.Internal, "update error: %s", err)
-		}
-		return n, nil
-	}
+	ctx, span := s.tracer.Start(ctx, "prepared.update", trace.WithAttributes(
+		dbSystem,
+		attribute.String(attrDBOperation, "update"),
+		attribute.String(attrPreparedHandle, handle),
+		// One RPC can execute the statement once per parameter row, so a slow
+		// span here is often batch size rather than a slow statement.
+		attribute.Int("flight.parameter_rows", len(args)),
+		attribute.Bool(attrConnDirty, ac.IsDirty()),
+		statementAttr(ctx, ps.query),
+	))
+	defer span.End()
 
 	var total int64
+	defer func() {
+		span.SetAttributes(attribute.Int64(attrRows, total))
+		rowsAffectedAdd(ctx, opPreparedUpdate, total)
+	}()
+
+	if len(args) == 0 {
+		total, err = ac.ExecContext(ctx, ps.query)
+		if err != nil {
+			total = 0
+			return 0, otelutil.Failed(span, status.Errorf(codes.Internal, "update error: %s", err))
+		}
+		return total, nil
+	}
+
 	for _, row := range args {
 		n, err := ac.ExecContext(ctx, ps.query, row...)
 		if err != nil {
-			return total, status.Errorf(codes.Internal, "update error: %s", err)
+			return total, otelutil.Failed(span, status.Errorf(codes.Internal, "update error: %s", err))
 		}
 		total += n
 	}

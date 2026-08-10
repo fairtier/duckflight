@@ -18,8 +18,8 @@ import (
 	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/config"
 	"github.com/fairtier/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/otelutil"
 	"github.com/fairtier/duckflight/internal/session"
-	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -50,6 +50,7 @@ type DuckFlightSQLServer struct {
 	stopCleanup      context.CancelFunc
 	closeOnce        sync.Once
 	tracer           trace.Tracer
+	gauges           *serverGauges
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
@@ -97,8 +98,9 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 		tracker:        &queryTracker{ttl: ticketTTL},
 		resourceTTL:    resourceTTL,
 		stopCleanup:    stopCleanup,
-		tracer:         otel.Tracer("duckflight"),
+		tracer:         otelutil.Tracer(),
 	}
+	srv.gauges = registerServerGauges(srv)
 	srv.Alloc = memory.DefaultAllocator
 	srv.tracker.StartCleanup(cleanupCtx)
 	srv.startResourceCleanup(cleanupCtx)
@@ -380,6 +382,7 @@ func (s *DuckFlightSQLServer) reapResources(now time.Time) {
 			// the connection rather than pooling its leftover state.
 			s.engine.Pool.Release(conn)
 		}
+		txnCountAdd(context.Background(), "reaped")
 		slog.Warn("reaped stale transaction", "handle", key, "idle", idle)
 		return true
 	})
@@ -391,6 +394,7 @@ func (s *DuckFlightSQLServer) reapResources(now time.Time) {
 func (s *DuckFlightSQLServer) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
+		s.gauges.stop()
 		s.stopCleanup()
 		s.sessions.CloseAll()
 		err = s.engine.Close()

@@ -17,6 +17,9 @@ import (
 
 	"github.com/fairtier/duckflight/internal/ctxlock"
 	"github.com/fairtier/duckflight/internal/engine"
+	"github.com/fairtier/duckflight/internal/otelutil"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -71,6 +74,8 @@ func (s *Session) Lock(ctx context.Context) (func(), error) {
 type Manager struct {
 	pool    *engine.ArrowPool
 	idleTTL time.Duration
+	tracer  trace.Tracer
+	metrics *sessionMetrics
 
 	mu       sync.Mutex
 	sessions map[string]*Session
@@ -80,11 +85,14 @@ type Manager struct {
 // session that has been idle longer than idleTTL is reaped and its connection
 // returned to the pool.
 func NewManager(pool *engine.ArrowPool, idleTTL time.Duration) *Manager {
-	return &Manager{
+	m := &Manager{
 		pool:     pool,
 		idleTTL:  idleTTL,
+		tracer:   otelutil.Tracer(),
 		sessions: make(map[string]*Session),
 	}
+	m.metrics = newSessionMetrics(m)
+	return m
 }
 
 // Acquire returns the session for sid, lazily pinning a pool connection on
@@ -95,6 +103,14 @@ func (m *Manager) Acquire(ctx context.Context, sid string) (*Session, func(), er
 	if sid == "" {
 		return nil, nil, status.Error(codes.Internal, "session.Acquire called with empty sid")
 	}
+
+	// The span covers the wait for the session lock as well as the connection
+	// pinning: every RPC of one session runs strictly serially, so time spent
+	// here is another request of the same client still holding the connection —
+	// a latency source that is invisible in the RPC span alone.
+	ctx, span := m.tracer.Start(ctx, "session.acquire",
+		trace.WithAttributes(attribute.String("session.id", sid)))
+	defer span.End()
 
 	for {
 		now := time.Now().UnixNano()
@@ -115,7 +131,7 @@ func (m *Manager) Acquire(ctx context.Context, sid string) (*Session, func(), er
 		// across that would stall the reaper — the only thing that could free
 		// a connection — along with every other session.
 		if err := lockWithCtx(ctx, &sess.mu); err != nil {
-			return nil, nil, err
+			return nil, nil, otelutil.Failed(span, err)
 		}
 		if sess.evicted {
 			// Reaped between our map lookup and taking the lock. Drop it and
@@ -125,16 +141,19 @@ func (m *Manager) Acquire(ctx context.Context, sid string) (*Session, func(), er
 		}
 		sess.lastUsed.Store(time.Now().UnixNano())
 
-		if sess.conn == nil {
-			ac, err := m.pinConn(ctx)
+		fresh := sess.conn == nil
+		if fresh {
+			ac, err := m.pinConn(ctx, span)
 			if err != nil {
 				sess.mu.Unlock()
 				m.dropIfEmpty(sess)
-				return nil, nil, status.Errorf(codes.ResourceExhausted,
-					"no pool connection available for new session: %s", err)
+				return nil, nil, otelutil.Failed(span, status.Errorf(codes.ResourceExhausted,
+					"no pool connection available for new session: %s", err))
 			}
 			sess.conn = ac
+			m.metrics.created.Add(ctx, 1)
 		}
+		span.SetAttributes(attribute.Bool("session.new", fresh))
 
 		release := func() {
 			sess.lastUsed.Store(time.Now().UnixNano())
@@ -153,11 +172,14 @@ func (m *Manager) Acquire(ctx context.Context, sid string) (*Session, func(), er
 // their deadline behind sessions nobody is using; taking the least recently
 // used one instead costs that session its connection-local state but keeps the
 // server answering.
-func (m *Manager) pinConn(ctx context.Context) (*engine.ArrowConn, error) {
+func (m *Manager) pinConn(ctx context.Context, span trace.Span) (*engine.ArrowConn, error) {
 	if ac, ok := m.pool.TryAcquire(); ok {
 		return ac, nil
 	}
 	if m.reclaimIdle() {
+		// An event, not a span: it is a single instant, but it explains why
+		// some other client's temp tables just vanished.
+		span.AddEvent("session.reclaimed_idle")
 		slog.Warn("pool exhausted; reclaimed the least recently used idle session")
 	}
 	return m.pool.Acquire(ctx)
@@ -188,7 +210,7 @@ func (m *Manager) reclaimIdle() bool {
 			sess.mu.Unlock()
 			continue
 		}
-		conn := m.evict(sess)
+		conn := m.evict(sess, evictReclaimed)
 		sess.mu.Unlock()
 		m.pool.Discard(conn)
 		return true
@@ -222,11 +244,19 @@ func (m *Manager) unlink(sess *Session) {
 // Caller must hold sess.mu. The map entry is removed before the session lock
 // is dropped, so a concurrent Acquire can never adopt a session that is on its
 // way out and pin a second connection to it.
-func (m *Manager) evict(sess *Session) *engine.ArrowConn {
+//
+// The eviction is counted here, on the transition rather than at each call
+// site: Close can race a reaper that already took the session, and counting at
+// the call site would report that one session twice.
+func (m *Manager) evict(sess *Session, reason string) *engine.ArrowConn {
+	if sess.evicted {
+		return nil
+	}
 	m.unlink(sess)
 	conn := sess.conn
 	sess.conn = nil
 	sess.evicted = true
+	m.metrics.recordEvicted(reason)
 	return conn
 }
 
@@ -243,7 +273,7 @@ func (m *Manager) Close(sid string) {
 	}
 
 	sess.mu.Lock()
-	conn := m.evict(sess)
+	conn := m.evict(sess, evictClosed)
 	sess.mu.Unlock()
 
 	if conn != nil {
@@ -254,8 +284,11 @@ func (m *Manager) Close(sid string) {
 }
 
 // CloseAll evicts every session, returning all pinned connections to the pool.
-// Used during shutdown.
+// Used during shutdown, so it also drops the metric callback — a manager that
+// has been shut down should stop reporting an active-session count.
 func (m *Manager) CloseAll() {
+	m.metrics.stop()
+
 	m.mu.Lock()
 	sessions := make([]*Session, 0, len(m.sessions))
 	for _, sess := range m.sessions {
@@ -265,7 +298,7 @@ func (m *Manager) CloseAll() {
 
 	for _, sess := range sessions {
 		sess.mu.Lock()
-		conn := m.evict(sess)
+		conn := m.evict(sess, evictShutdown)
 		sess.mu.Unlock()
 		if conn != nil {
 			m.pool.Discard(conn)
@@ -316,7 +349,7 @@ func (m *Manager) reap(now time.Time) {
 			sess.mu.Unlock()
 			continue
 		}
-		conn := m.evict(sess)
+		conn := m.evict(sess, evictReaped)
 		sess.mu.Unlock()
 
 		if conn != nil {
