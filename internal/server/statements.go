@@ -58,8 +58,19 @@ func duckDBToGRPCCode(err error) codes.Code {
 //
 // An error here must not be swallowed: executing a BEGIN we failed to check
 // recreates exactly the BEGIN-in-BEGIN abort this exists to prevent.
-func shouldSkipTxnControl(ctx context.Context, ac *engine.ArrowConn, query string) (bool, error) {
-	intent := ac.ClassifyStatement(ctx, query)
+//
+// When RejectClientExtensions is configured, the same classification pass also
+// refuses INSTALL/LOAD statements (both surface as STATEMENT_TYPE_LOAD in
+// DuckDB's parser): extensions are then managed exclusively by the operator
+// through boot/reconcile SQL. Statement paths that never see arbitrary SQL —
+// GetSchemaStatement wraps the query in a subselect where LOAD cannot parse,
+// and ingest builds its own INSERT server-side — need no equivalent check.
+func (s *DuckFlightSQLServer) shouldSkipTxnControl(ctx context.Context, ac *engine.ArrowConn, query string) (bool, error) {
+	intent, stmtType := ac.ClassifyStatement(ctx, query)
+	if s.rejectClientExtensions && stmtType == duckdb.STATEMENT_TYPE_LOAD {
+		return false, status.Error(codes.PermissionDenied,
+			"INSTALL/LOAD statements are managed by the server and cannot be issued by clients")
+	}
 	if intent == engine.TxnIntentNone {
 		return false, nil
 	}
@@ -211,7 +222,7 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 	// COMMIT/ROLLBACK outside one), skip it. Letting it through would either
 	// abort an in-progress txn (BEGIN-in-BEGIN) or surface a confusing error
 	// for a client whose intent is already satisfied.
-	skip, err := shouldSkipTxnControl(ctx, ac, query)
+	skip, err := s.shouldSkipTxnControl(ctx, ac, query)
 	if err != nil {
 		release()
 		s.tracker.Complete(handle)
@@ -366,7 +377,7 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
 	defer release()
 
 	query := cmd.GetQuery()
-	skip, err := shouldSkipTxnControl(ctx, ac, query)
+	skip, err := s.shouldSkipTxnControl(ctx, ac, query)
 	if err != nil {
 		return 0, err
 	}

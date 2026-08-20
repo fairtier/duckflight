@@ -39,10 +39,10 @@ func TestExecSQL(t *testing.T) {
 	eng := newTestEngine(t)
 	ctx := context.Background()
 
-	if err := eng.ExecSQL(ctx, "CREATE TABLE test_exec_sql (id INTEGER)"); err != nil {
+	if err := eng.ExecSQL(ctx, "test create", "CREATE TABLE test_exec_sql (id INTEGER)"); err != nil {
 		t.Fatalf("ExecSQL CREATE: %v", err)
 	}
-	if err := eng.ExecSQL(ctx, "INSERT INTO test_exec_sql VALUES (1), (2), (3)"); err != nil {
+	if err := eng.ExecSQL(ctx, "test insert", "INSERT INTO test_exec_sql VALUES (1), (2), (3)"); err != nil {
 		t.Fatalf("ExecSQL INSERT: %v", err)
 	}
 }

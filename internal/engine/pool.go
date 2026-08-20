@@ -130,32 +130,34 @@ func mutatesConnState(t duckdb.StmtType) bool {
 // ClassifyStatement parses query with DuckDB and, as a side effect, marks the
 // connection dirty when the statement would leave connection-local state
 // behind. It returns the transaction intent so callers can decide whether a
-// redundant BEGIN/COMMIT should be skipped.
+// redundant BEGIN/COMMIT should be skipped, and DuckDB's own statement type
+// so callers can enforce statement-level policy (the server uses it to reject
+// client-issued INSTALL/LOAD — both surface as STATEMENT_TYPE_LOAD).
 //
 // The "begin vs end" decision uses the first SQL keyword, which is safe
 // because DuckDB's parser has already validated the statement is in the
 // TRANSACTION category — within that category only BEGIN/START open a
 // transaction and COMMIT/ROLLBACK/ABORT/END close one.
-func (ac *ArrowConn) ClassifyStatement(ctx context.Context, query string) TxnIntent {
+func (ac *ArrowConn) ClassifyStatement(ctx context.Context, query string) (TxnIntent, duckdb.StmtType) {
 	t := ac.statementType(ctx, query)
 	if mutatesConnState(t) {
 		ac.MarkDirty()
 	}
 	if t != duckdb.STATEMENT_TYPE_TRANSACTION {
-		return TxnIntentNone
+		return TxnIntentNone, t
 	}
 
 	fields := strings.Fields(query)
 	if len(fields) == 0 {
-		return TxnIntentNone
+		return TxnIntentNone, t
 	}
 	switch strings.ToUpper(fields[0]) {
 	case "BEGIN", "START":
-		return TxnIntentBegin
+		return TxnIntentBegin, t
 	case "COMMIT", "ROLLBACK", "ABORT", "END":
-		return TxnIntentEnd
+		return TxnIntentEnd, t
 	}
-	return TxnIntentNone
+	return TxnIntentNone, t
 }
 
 // ClassifyTxnStatement reports the transaction intent of query without

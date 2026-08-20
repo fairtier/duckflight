@@ -261,7 +261,7 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 
 	// Redundant BEGIN/COMMIT/ROLLBACK against the connection's current
 	// transaction state → no-op (see [shouldSkipTxnControl]).
-	skip, err := shouldSkipTxnControl(ctx, ac, ps.query)
+	skip, err := s.shouldSkipTxnControl(ctx, ac, ps.query)
 	if err != nil {
 		release()
 		queryCountAdd(ctx, "error")
@@ -436,7 +436,7 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 	}
 	defer release()
 
-	skip, err := shouldSkipTxnControl(ctx, ac, ps.query)
+	skip, err := s.shouldSkipTxnControl(ctx, ac, ps.query)
 	if err != nil {
 		return 0, err
 	}

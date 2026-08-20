@@ -51,6 +51,9 @@ type DuckFlightSQLServer struct {
 	closeOnce        sync.Once
 	tracer           trace.Tracer
 	gauges           *serverGauges
+	// rejectClientExtensions refuses client-issued INSTALL/LOAD statements;
+	// extensions are then managed exclusively through boot/reconcile SQL.
+	rejectClientExtensions bool
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
@@ -91,20 +94,24 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
 
 	srv := &DuckFlightSQLServer{
-		engine:         eng,
-		sessions:       session.NewManager(eng.Pool, resourceTTL),
-		queryTimeout:   timeout,
-		maxResultBytes: cfg.MaxResultBytes,
-		tracker:        &queryTracker{ttl: ticketTTL},
-		resourceTTL:    resourceTTL,
-		stopCleanup:    stopCleanup,
-		tracer:         otelutil.Tracer(),
+		engine:                 eng,
+		sessions:               session.NewManager(eng.Pool, resourceTTL),
+		queryTimeout:           timeout,
+		maxResultBytes:         cfg.MaxResultBytes,
+		tracker:                &queryTracker{ttl: ticketTTL},
+		resourceTTL:            resourceTTL,
+		stopCleanup:            stopCleanup,
+		tracer:                 otelutil.Tracer(),
+		rejectClientExtensions: cfg.RejectClientExtensions,
 	}
 	srv.gauges = registerServerGauges(srv)
 	srv.Alloc = memory.DefaultAllocator
 	srv.tracker.StartCleanup(cleanupCtx)
 	srv.startResourceCleanup(cleanupCtx)
 	srv.sessions.StartReaper(cleanupCtx)
+	if cfg.ReconcileSQLPath != "" {
+		engine.NewReconciler(eng, cfg.ReconcileSQLPath).Start(cleanupCtx)
+	}
 	registerSqlInfo(srv)
 
 	globalEngine = eng
@@ -445,5 +452,5 @@ func (s *DuckFlightSQLServer) ActiveQueryCount() int {
 
 // SeedSQL executes arbitrary SQL on the global engine for test setup.
 func SeedSQL(ctx context.Context, sql string) error {
-	return globalEngine.ExecSQL(ctx, sql)
+	return globalEngine.ExecSQL(ctx, "seed sql", sql)
 }

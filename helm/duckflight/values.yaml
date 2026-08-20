@@ -11,11 +11,13 @@ logLevel: ""  # DEBUG, INFO, WARN, ERROR (default: INFO)
 automountServiceAccountToken: false
 
 # Restricted-PSA-compliant by default. uid 1000 = the `duckflight` user baked
-# into the image (numeric so the kubelet can verify runAsNonRoot).
+# into the image (numeric so the kubelet can verify runAsNonRoot). fsGroup
+# makes pod volumes (extensions/temp emptyDirs) writable for that uid.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 1000
   runAsGroup: 1000
+  fsGroup: 1000
   seccompProfile:
     type: RuntimeDefault
 
@@ -40,6 +42,38 @@ tls:
   enabled: false
   existingSecret: ""  # Kubernetes TLS secret with tls.crt and tls.key
   caSecret: ""        # Secret with ca.crt for mTLS (optional)
+
+# Optional extensions image: an initContainer that copies its /extensions
+# tree into an emptyDir mounted over the server's extension directory —
+# per-deployment extension sets without a per-deployment server image. Build
+# one from this repo's Dockerfile with `--target extensions` and the
+# CORE_EXTENSIONS/COMMUNITY_EXTENSIONS build args, FROM THE SAME GIT REF as
+# the server image (extension files are tied to the DuckDB version inside the
+# binary). The mount shadows the extensions baked into the server image, so
+# the extensions image must carry the full set, core trio included.
+extensions:
+  image: ""           # e.g. ghcr.io/yourorg/duckdb-extensions:v0.2.0
+  pullPolicy: IfNotPresent
+
+# Optional operator-managed SQL, executed instance-wide at startup and
+# re-executed whenever the mounted content changes (secret rotation without a
+# pod restart). Point it at a Secret holding one SQL file — typically
+# CREATE OR REPLACE SECRET / LOAD statements. The volume is mounted
+# `optional`, so the pod is healthy before the Secret exists.
+reconcileSql:
+  existingSecret: ""
+  key: "reconcile.sql"
+
+# Refuse client-issued INSTALL/LOAD statements; extensions are then managed
+# exclusively through the baked extension directory and reconcile SQL.
+rejectClientExtensions: false
+
+# DuckDB spill directory. Without one, an in-memory engine errors on
+# operations larger than memory instead of degrading to disk. When path is
+# set, an emptyDir is mounted there and TEMP_DIRECTORY is exported.
+tempDir:
+  path: ""            # e.g. /tmp/duckdb
+  sizeLimit: ""       # optional emptyDir sizeLimit, e.g. "2Gi"
 
 auth:
   # Optional Secret containing static bearer tokens, basic-auth users, and the

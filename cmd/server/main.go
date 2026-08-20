@@ -130,6 +130,10 @@ func run() error {
 		S3Region:            os.Getenv("S3_REGION"),
 		S3URLStyle:          os.Getenv("S3_URL_STYLE"),
 		ExtensionDir:        os.Getenv("EXTENSION_DIR"),
+		// Operator-managed runtime SQL (secrets, LOAD) and its enforcement.
+		ReconcileSQLPath:       os.Getenv("RECONCILE_SQL_PATH"),
+		RejectClientExtensions: envBool("REJECT_CLIENT_EXTENSIONS"),
+		TempDirectory:          os.Getenv("TEMP_DIRECTORY"),
 	}
 
 	srv, err := duckserver.New(cfg)

@@ -23,7 +23,7 @@ func TestReleaseDoesNotLeakTransaction(t *testing.T) {
 	}
 	defer func() { _ = eng.Close() }()
 
-	if err := eng.ExecSQL(ctx, "CREATE TABLE leak_probe (id INTEGER)"); err != nil {
+	if err := eng.ExecSQL(ctx, "seed", "CREATE TABLE leak_probe (id INTEGER)"); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
 
@@ -32,7 +32,7 @@ func TestReleaseDoesNotLeakTransaction(t *testing.T) {
 		t.Fatalf("Acquire: %v", err)
 	}
 	// Exactly what a client's raw `BEGIN` does, classification included.
-	if intent := ac.ClassifyStatement(ctx, "BEGIN TRANSACTION"); intent != TxnIntentBegin {
+	if intent, _ := ac.ClassifyStatement(ctx, "BEGIN TRANSACTION"); intent != TxnIntentBegin {
 		t.Fatalf("expected TxnIntentBegin, got %v", intent)
 	}
 	if _, err := ac.ExecContext(ctx, "BEGIN TRANSACTION"); err != nil {

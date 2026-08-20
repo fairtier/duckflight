@@ -49,7 +49,25 @@ The `duckdb_arrow` build tag is required to enable the Arrow interface in go-duc
 docker build -t duckflight .
 ```
 
-The Docker image compiles DuckDB from source with extensions (Iceberg, httpfs, JSON, Parquet) statically linked. No extension downloads happen at runtime — the image works in air-gapped environments. The DuckDB version is derived automatically from the `duckdb-go` module in `go.mod`.
+The Docker image pre-downloads DuckDB extensions at build time into `/extensions` (JSON, Parquet and ICU are already built into the `duckdb-go` binary). No extension downloads happen at runtime — the image works in air-gapped environments. The DuckDB version is derived automatically from the `duckdb-go` module in `go.mod`.
+
+The extension set is build-arg configurable without forking the Dockerfile:
+
+```bash
+# core repo (extensions.duckdb.org) and community repo (community-extensions.duckdb.org)
+docker build \
+  --build-arg CORE_EXTENSIONS="iceberg avro httpfs" \
+  --build-arg COMMUNITY_EXTENSIONS="gsheets" \
+  -t duckflight-custom .
+
+# extensions-only image, meant to run as an initContainer that copies
+# /extensions into an emptyDir mounted over the server's EXTENSION_DIR
+# (see helm values `extensions.image`). Build it from the same git ref as
+# the server image — extension files are tied to the DuckDB version.
+docker build --target extensions \
+  --build-arg COMMUNITY_EXTENSIONS="gsheets" \
+  -t duckdb-extensions .
+```
 
 ### Run locally with Iceberg
 
@@ -103,6 +121,10 @@ All configuration is via environment variables:
 | `S3_SECRET_KEY`         |                 | S3 secret key                                                                                                          |
 | `S3_REGION`             |                 | S3 region                                                                                                              |
 | `S3_URL_STYLE`          |                 | `path` for MinIO, `vhost` for AWS                                                                                      |
+| `EXTENSION_DIR`         | `/extensions` (image) | DuckDB `extension_directory` holding pre-installed extensions                                                    |
+| `RECONCILE_SQL_PATH`    |                 | Path to a SQL file executed instance-wide at startup and re-executed whenever its content changes (~10s poll). Meant for operator-managed `CREATE OR REPLACE SECRET` / `LOAD` statements delivered as a mounted Secret; rotation reaches every pooled connection with no restart. Missing file = nothing to do; a failing file is logged (label only, never the SQL text) and does not stop the server |
+| `REJECT_CLIENT_EXTENSIONS` | `false`      | `true`/`1` to refuse client-issued `INSTALL`/`LOAD` statements (`PermissionDenied`); extensions are then managed exclusively via `EXTENSION_DIR` and reconcile SQL |
+| `TEMP_DIRECTORY`        |                 | DuckDB `temp_directory`. Without it an in-memory engine errors on larger-than-memory operations instead of spilling to disk |
 | `LOG_LEVEL`             | `INFO`          | Log level: DEBUG, INFO, WARN, ERROR. `DEBUG` also puts SQL text on logs and spans                                      |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` |           | OTLP collector (`host:port`, scheme optional). Enables trace and log export; empty = traces off, logs to stderr only    |
 | `OTEL_EXPORTER_OTLP_INSECURE` | `false`   | `true`/`1` to talk to the collector without TLS                                                                        |

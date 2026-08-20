@@ -18,6 +18,22 @@ spec:
       securityContext:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- if .Values.extensions.image }}
+      initContainers:
+        # Copies the curated extension set into an emptyDir that shadows the
+        # server image's baked /extensions — see .Values.extensions.
+        - name: extensions
+          image: {{ .Values.extensions.image | quote }}
+          imagePullPolicy: {{ .Values.extensions.pullPolicy }}
+          command: ["cp", "-a", "/extensions/.", "/target/"]
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: duckdb-extensions
+              mountPath: /target
+      {{- end }}
       containers:
         - name: duckflight
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -57,6 +73,18 @@ spec:
             {{- if .Values.resources.extensionDir }}
             - name: EXTENSION_DIR
               value: {{ .Values.resources.extensionDir | quote }}
+            {{- end }}
+            {{- if .Values.reconcileSql.existingSecret }}
+            - name: RECONCILE_SQL_PATH
+              value: {{ printf "/etc/duckflight/reconcile/%s" .Values.reconcileSql.key | quote }}
+            {{- end }}
+            {{- if .Values.rejectClientExtensions }}
+            - name: REJECT_CLIENT_EXTENSIONS
+              value: "true"
+            {{- end }}
+            {{- if .Values.tempDir.path }}
+            - name: TEMP_DIRECTORY
+              value: {{ .Values.tempDir.path | quote }}
             {{- end }}
             - name: ICEBERG_ENDPOINT
               value: {{ .Values.iceberg.endpoint | quote }}
@@ -164,8 +192,9 @@ spec:
               value: "/etc/tls/ca/ca.crt"
             {{- end }}
             {{- end }}
-          {{- if .Values.tls.enabled }}
+          {{- if or .Values.tls.enabled .Values.extensions.image .Values.reconcileSql.existingSecret .Values.tempDir.path }}
           volumeMounts:
+            {{- if .Values.tls.enabled }}
             - name: tls-certs
               mountPath: /etc/tls
               readOnly: true
@@ -173,6 +202,22 @@ spec:
             - name: tls-ca
               mountPath: /etc/tls/ca
               readOnly: true
+            {{- end }}
+            {{- end }}
+            {{- if .Values.extensions.image }}
+            # Shadows the extensions baked into the server image.
+            - name: duckdb-extensions
+              mountPath: {{ .Values.resources.extensionDir | default "/extensions" | quote }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.reconcileSql.existingSecret }}
+            - name: reconcile-sql
+              mountPath: /etc/duckflight/reconcile
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tempDir.path }}
+            - name: duckdb-temp
+              mountPath: {{ .Values.tempDir.path | quote }}
             {{- end }}
           {{- end }}
           resources:
@@ -192,8 +237,9 @@ spec:
               port: 31337
             initialDelaySeconds: 10
             periodSeconds: 30
-      {{- if .Values.tls.enabled }}
+      {{- if or .Values.tls.enabled .Values.extensions.image .Values.reconcileSql.existingSecret .Values.tempDir.path }}
       volumes:
+        {{- if .Values.tls.enabled }}
         - name: tls-certs
           secret:
             secretName: {{ .Values.tls.existingSecret }}
@@ -201,5 +247,27 @@ spec:
         - name: tls-ca
           secret:
             secretName: {{ .Values.tls.caSecret }}
+        {{- end }}
+        {{- end }}
+        {{- if .Values.extensions.image }}
+        - name: duckdb-extensions
+          emptyDir: {}
+        {{- end }}
+        {{- if .Values.reconcileSql.existingSecret }}
+        # `optional` keeps the pod healthy before the Secret first exists;
+        # the server treats a missing/empty file as "nothing to reconcile".
+        - name: reconcile-sql
+          secret:
+            secretName: {{ .Values.reconcileSql.existingSecret }}
+            optional: true
+        {{- end }}
+        {{- if .Values.tempDir.path }}
+        - name: duckdb-temp
+          emptyDir:
+            {{- if .Values.tempDir.sizeLimit }}
+            sizeLimit: {{ .Values.tempDir.sizeLimit }}
+            {{- else }}
+            {}
+            {{- end }}
         {{- end }}
       {{- end }}

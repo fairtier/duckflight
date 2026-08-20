@@ -30,6 +30,21 @@ type Config struct {
 	// Extensions
 	ExtensionDir string // custom extension_directory for pre-installed extensions
 
+	// RejectClientExtensions makes the server refuse client-issued
+	// INSTALL/LOAD statements. Extensions are then exclusively managed by the
+	// operator (baked into ExtensionDir, loaded via boot or reconcile SQL).
+	RejectClientExtensions bool
+
+	// ReconcileSQLPath points at a SQL file (typically a mounted Kubernetes
+	// Secret) that is executed instance-wide at startup and re-executed
+	// whenever its content changes. Empty disables the watcher.
+	ReconcileSQLPath string
+
+	// TempDirectory enables DuckDB spilling to disk. An in-memory database
+	// has no temp_directory by default, so large operations error instead of
+	// degrading to disk.
+	TempDirectory string
+
 	// Metering
 	MaxResultBytes int64
 }

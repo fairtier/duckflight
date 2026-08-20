@@ -254,6 +254,15 @@ All via environment variables. See README.md for the full table. Key ones:
 - `RATE_LIMIT_RPS`, `RATE_LIMIT_BURST` — global token-bucket rate limiter (0 =
   disabled)
 - `LOG_LEVEL` — slog level (DEBUG, INFO, WARN, ERROR)
+- `RECONCILE_SQL_PATH` — operator-managed SQL file (typically a mounted
+  Secret), executed instance-wide at startup and re-executed on content
+  change (`internal/engine/reconcile.go`). DuckDB temporary secrets and
+  loaded extensions are instance-wide, so rotation reaches every pooled
+  connection without a restart. Errors report a label, never the SQL text.
+- `REJECT_CLIENT_EXTENSIONS` — refuse client-issued `INSTALL`/`LOAD` (both
+  classify as `STATEMENT_TYPE_LOAD`); extensions become operator-only
+- `TEMP_DIRECTORY` — DuckDB spill directory; without it an in-memory engine
+  errors on larger-than-memory operations
 
 ## Testing Patterns
 

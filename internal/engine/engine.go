@@ -56,6 +56,12 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 			})
 		}
 
+		if cfg.TempDirectory != "" {
+			bootSQL = append(bootSQL, bootStatement{
+				"set temp_directory", "SET temp_directory = " + quoteLiteral(cfg.TempDirectory),
+			})
+		}
+
 		if cfg.IcebergEndpoint != "" {
 			if !staticExtensions {
 				bootSQL = append(bootSQL, bootStatement{"install iceberg", "INSTALL iceberg"})
@@ -138,8 +144,15 @@ func (e *Engine) Connector() *duckdb.Connector {
 	return e.connector
 }
 
-// ExecSQL executes a SQL statement using a temporary connection from the connector.
-func (e *Engine) ExecSQL(ctx context.Context, sql string) error {
+// ExecSQL executes SQL using a temporary connection from the connector.
+// DuckDB's temporary (non-PERSISTENT) secrets and loaded extensions are
+// instance-wide, so statements run here are visible to every pooled
+// connection immediately.
+//
+// The error deliberately reports label rather than the statement text: callers
+// pass credential-bearing SQL (CREATE SECRET …) and errors are logged and
+// shipped to the OTLP collector — same rationale as [bootStatement].
+func (e *Engine) ExecSQL(ctx context.Context, label, sql string) error {
 	conn, err := e.connector.Connect(ctx)
 	if err != nil {
 		return fmt.Errorf("connect: %w", err)
@@ -152,7 +165,7 @@ func (e *Engine) ExecSQL(ctx context.Context, sql string) error {
 	}
 
 	if _, err := execer.ExecContext(ctx, sql, nil); err != nil {
-		return fmt.Errorf("exec %q: %w", sql, err)
+		return fmt.Errorf("exec (%s): %w", label, err)
 	}
 	return nil
 }
