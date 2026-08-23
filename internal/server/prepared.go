@@ -133,9 +133,9 @@ func extractParams(rdr flight.MessageReader) ([][]any, error) {
 		nrows := int(rec.NumRows())
 		ncols := int(rec.NumCols())
 
-		for i := 0; i < nrows; i++ {
+		for i := range nrows {
 			row := make([]any, ncols)
-			for c := 0; c < ncols; c++ {
+			for c := range ncols {
 				sc, err := scalar.GetScalar(rec.Column(c), i)
 				if err != nil {
 					return nil, err

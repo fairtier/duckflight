@@ -22,6 +22,12 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
+          # Pinned rather than floating on latest: the config enables the
+          # gofumpt formatter, and a linter bump can add formatting rules that
+          # turn an unrelated PR red. It is also a hard floor — golangci-lint
+          # refuses to run when the Go it was built with is below the module's
+          # `go` directive, so a 1.27 go.mod needs a 1.27-built linter.
+          version: v2.13.1
           args: --timeout=5m
 
   test:

@@ -296,7 +296,7 @@ func NewArrowPool(connector *duckdb.Connector, size int) (*ArrowPool, error) {
 		return &ArrowConn{conn: conn, Arrow: ar}, nil
 	}
 
-	for i := 0; i < size; i++ {
+	for range size {
 		ac, err := p.newConn()
 		if err != nil {
 			p.Close()

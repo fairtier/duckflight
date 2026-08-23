@@ -87,18 +87,17 @@ func (s *IcebergSuite) SetupSuite() {
 
 	// Create bucket via mc sidecar
 	mcC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:    "minio/mc",
-			Networks: []string{nw.Name},
-			Entrypoint: []string{"/bin/sh", "-c",
-				fmt.Sprintf(
-					"mc alias set myminio http://minio:9000 %s %s && mc mb myminio/%s --ignore-existing",
-					minioUser, minioPassword, minioBucket,
-				),
-			},
-			WaitingFor: wait.ForExit().WithExitTimeout(30 * time.Second),
+		Image:    "minio/mc",
+		Networks: []string{nw.Name},
+		Entrypoint: []string{
+			"/bin/sh", "-c",
+			fmt.Sprintf(
+				"mc alias set myminio http://minio:9000 %s %s && mc mb myminio/%s --ignore-existing",
+				minioUser, minioPassword, minioBucket,
+			),
 		},
-		Started: true,
+		WaitingFor: wait.ForExit().WithExitTimeout(30 * time.Second),
+		Started:    true,
 	})
 	s.Require().NoError(err)
 	mcState, err := mcC.State(ctx)
@@ -116,37 +115,33 @@ func (s *IcebergSuite) SetupSuite() {
 	// 4. Lakekeeper migrate (one-shot)
 	pgConnStr := fmt.Sprintf("postgresql://%s:%s@postgres:5432/%s", pgUser, pgPassword, pgDB)
 	s.migrateC, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:    "quay.io/lakekeeper/catalog:latest-main",
-			Networks: []string{nw.Name},
-			Env: map[string]string{
-				"LAKEKEEPER__PG_DATABASE_URL_READ":  pgConnStr,
-				"LAKEKEEPER__PG_DATABASE_URL_WRITE": pgConnStr,
-			},
-			Cmd:        []string{"migrate"},
-			WaitingFor: wait.ForExit().WithExitTimeout(60 * time.Second),
+		Image:    "quay.io/lakekeeper/catalog:latest-main",
+		Networks: []string{nw.Name},
+		Env: map[string]string{
+			"LAKEKEEPER__PG_DATABASE_URL_READ":  pgConnStr,
+			"LAKEKEEPER__PG_DATABASE_URL_WRITE": pgConnStr,
 		},
-		Started: true,
+		Cmd:        []string{"migrate"},
+		WaitingFor: wait.ForExit().WithExitTimeout(60 * time.Second),
+		Started:    true,
 	})
 	s.Require().NoError(err)
 
 	// 5. Lakekeeper serve
 	s.lakekeeperC, err = testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image:        "quay.io/lakekeeper/catalog:latest-main",
-			ExposedPorts: []string{"8181/tcp"},
-			Networks:     []string{nw.Name},
-			NetworkAliases: map[string][]string{
-				nw.Name: {"lakekeeper"},
-			},
-			Env: map[string]string{
-				"LAKEKEEPER__PG_DATABASE_URL_READ":  pgConnStr,
-				"LAKEKEEPER__PG_DATABASE_URL_WRITE": pgConnStr,
-			},
-			Cmd:        []string{"serve"},
-			WaitingFor: wait.ForHTTP("/health").WithPort("8181/tcp").WithStartupTimeout(60 * time.Second),
+		Image:        "quay.io/lakekeeper/catalog:latest-main",
+		ExposedPorts: []string{"8181/tcp"},
+		Networks:     []string{nw.Name},
+		NetworkAliases: map[string][]string{
+			nw.Name: {"lakekeeper"},
 		},
-		Started: true,
+		Env: map[string]string{
+			"LAKEKEEPER__PG_DATABASE_URL_READ":  pgConnStr,
+			"LAKEKEEPER__PG_DATABASE_URL_WRITE": pgConnStr,
+		},
+		Cmd:        []string{"serve"},
+		WaitingFor: wait.ForHTTP("/health").WithPort("8181/tcp").WithStartupTimeout(60 * time.Second),
+		Started:    true,
 	})
 	s.Require().NoError(err)
 
@@ -364,8 +359,8 @@ func (s *IcebergSuite) TestIceberg_TablesAppearInMetadata() {
 
 	// GetTables with catalog filter should show our Iceberg table
 	info, err = s.client.GetTables(ctx, &flightsql.GetTablesOpts{
-		Catalog:                strPtr("lake"),
-		TableNameFilterPattern: strPtr("meta_test"),
+		Catalog:                new("lake"),
+		TableNameFilterPattern: new("meta_test"),
 	})
 	s.Require().NoError(err)
 	rdr2, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
@@ -430,12 +425,6 @@ func (s *IcebergSuite) TestIceberg_TransactionRollback() {
 	}
 	s.EqualValues(0, totalRows, "rolled-back row should not be visible")
 }
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-func strPtr(s string) *string { return &s }
 
 // ---------------------------------------------------------------------------
 // Run

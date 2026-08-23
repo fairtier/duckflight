@@ -244,7 +244,7 @@ func (s *DuckFlightSQLServer) DoGetTables(ctx context.Context, cmd flightsql.Get
 			binaryBldr.Release()
 
 			cols := make([]arrow.Array, 5)
-			for i := 0; i < 4; i++ {
+			for i := range 4 {
 				cols[i] = rec.Column(i)
 			}
 			cols[4] = schemaArr
@@ -293,7 +293,7 @@ func (s *DuckFlightSQLServer) buildBatchTableSchemas(
 		"SELECT table_catalog, table_schema, table_name, " +
 			"column_name, data_type, numeric_precision, numeric_scale " +
 			"FROM information_schema.columns WHERE (table_catalog, table_schema, table_name) IN (")
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if i > 0 {
 			sb.WriteString(", ")
 		}

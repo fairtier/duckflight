@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -238,7 +238,7 @@ func (lc *latencyCollector) Snapshot() (sorted []time.Duration, errors int64) {
 	s := make([]time.Duration, len(lc.samples))
 	copy(s, lc.samples)
 	lc.mu.Unlock()
-	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
+	slices.Sort(s)
 	return s, lc.errors.Load()
 }
 
@@ -426,9 +426,7 @@ func runStage(
 	var wg sync.WaitGroup
 	for i := range concurrency {
 		cl := clients[i%len(clients)]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				if stageCtx.Err() != nil {
 					return
@@ -447,7 +445,7 @@ func runStage(
 				}
 				lc.Record(time.Since(start))
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	return lc
@@ -698,9 +696,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 	// Readers.
 	for i := range numReaders {
 		cl := env.clients[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for stageCtx.Err() == nil {
 				start := time.Now()
 				err := selectWorkload("SELECT * FROM load_data WHERE id % 1000 < 5 LIMIT 50")(stageCtx, cl)
@@ -731,15 +727,13 @@ func TestLoadSustainedMixed(t *testing.T) {
 					}
 				}
 			}
-		}()
+		})
 	}
 
 	// Writers.
 	for i := range numWriters {
 		cl := env.clients[numReaders+i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for stageCtx.Err() == nil {
 				start := time.Now()
 				id := writeID.Add(1)
@@ -775,7 +769,7 @@ func TestLoadSustainedMixed(t *testing.T) {
 				writeLC.Record(time.Since(start))
 				intervalWriteOps.Add(1)
 			}
-		}()
+		})
 	}
 
 	wg.Wait()

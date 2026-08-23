@@ -57,37 +57,35 @@ type xdbcType struct {
 	sqlDataType    int32
 }
 
-func ptr[T any](v T) *T { return &v }
-
 var xdbcTypes = []xdbcType{
-	{typeName: "BIGINT", dataType: xdbcBigInt, columnSize: ptr[int32](19), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), sqlDataType: xdbcBigInt},
-	{typeName: "BIT", dataType: xdbcBit, columnSize: ptr[int32](1), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcBit},
-	{typeName: "BLOB", dataType: xdbcBlob, columnSize: ptr[int32](2147483647), literalPrefix: ptr("X'"), literalSuffix: ptr("'"), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcBlob},
-	{typeName: "BOOLEAN", dataType: xdbcBoolean, columnSize: ptr[int32](1), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcBoolean},
-	{typeName: "DATE", dataType: xdbcDate, columnSize: ptr[int32](10), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcDate},
-	{typeName: "DECIMAL", dataType: xdbcDecimal, columnSize: ptr[int32](38), createParams: []string{"precision", "scale"}, nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), fixedPrecScale: true, sqlDataType: xdbcDecimal},
-	{typeName: "DOUBLE", dataType: xdbcDouble, columnSize: ptr[int32](15), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), sqlDataType: xdbcDouble},
+	{typeName: "BIGINT", dataType: xdbcBigInt, columnSize: new(int32(19)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), sqlDataType: xdbcBigInt},
+	{typeName: "BIT", dataType: xdbcBit, columnSize: new(int32(1)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcBit},
+	{typeName: "BLOB", dataType: xdbcBlob, columnSize: new(int32(2147483647)), literalPrefix: new("X'"), literalSuffix: new("'"), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcBlob},
+	{typeName: "BOOLEAN", dataType: xdbcBoolean, columnSize: new(int32(1)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcBoolean},
+	{typeName: "DATE", dataType: xdbcDate, columnSize: new(int32(10)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcDate},
+	{typeName: "DECIMAL", dataType: xdbcDecimal, columnSize: new(int32(38)), createParams: []string{"precision", "scale"}, nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), fixedPrecScale: true, sqlDataType: xdbcDecimal},
+	{typeName: "DOUBLE", dataType: xdbcDouble, columnSize: new(int32(15)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), sqlDataType: xdbcDouble},
 	// DuckDB's FLOAT is single precision, which is java.sql.Types.REAL (7);
 	// FLOAT (6) denotes double precision.
-	{typeName: "FLOAT", dataType: xdbcReal, columnSize: ptr[int32](7), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), sqlDataType: xdbcReal},
-	{typeName: "HUGEINT", dataType: xdbcDecimal, columnSize: ptr[int32](38), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), sqlDataType: xdbcDecimal},
-	{typeName: "INTEGER", dataType: xdbcInteger, columnSize: ptr[int32](10), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), sqlDataType: xdbcInteger},
-	{typeName: "INTERVAL", dataType: xdbcVarChar, columnSize: ptr[int32](25), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcVarChar},
-	{typeName: "SMALLINT", dataType: xdbcSmallInt, columnSize: ptr[int32](5), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), sqlDataType: xdbcSmallInt},
-	{typeName: "TIME", dataType: xdbcTime, columnSize: ptr[int32](15), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcTime},
-	{typeName: "TIMESTAMP", dataType: xdbcTimestamp, columnSize: ptr[int32](26), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcTimestamp},
-	{typeName: "TIMESTAMP WITH TIME ZONE", dataType: xdbcTimestampTZ, columnSize: ptr[int32](32), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcTimestampTZ},
-	{typeName: "TINYINT", dataType: xdbcTinyInt, columnSize: ptr[int32](3), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(false), sqlDataType: xdbcTinyInt},
+	{typeName: "FLOAT", dataType: xdbcReal, columnSize: new(int32(7)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), sqlDataType: xdbcReal},
+	{typeName: "HUGEINT", dataType: xdbcDecimal, columnSize: new(int32(38)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), sqlDataType: xdbcDecimal},
+	{typeName: "INTEGER", dataType: xdbcInteger, columnSize: new(int32(10)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), sqlDataType: xdbcInteger},
+	{typeName: "INTERVAL", dataType: xdbcVarChar, columnSize: new(int32(25)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcVarChar},
+	{typeName: "SMALLINT", dataType: xdbcSmallInt, columnSize: new(int32(5)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), sqlDataType: xdbcSmallInt},
+	{typeName: "TIME", dataType: xdbcTime, columnSize: new(int32(15)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcTime},
+	{typeName: "TIMESTAMP", dataType: xdbcTimestamp, columnSize: new(int32(26)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcTimestamp},
+	{typeName: "TIMESTAMP WITH TIME ZONE", dataType: xdbcTimestampTZ, columnSize: new(int32(32)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcTimestampTZ},
+	{typeName: "TINYINT", dataType: xdbcTinyInt, columnSize: new(int32(3)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(false), sqlDataType: xdbcTinyInt},
 	// UBIGINT reaches 2^64-1, which does not fit the signed BIGINT that
 	// getLong() returns; DECIMAL(20,0) carries the full range losslessly.
-	{typeName: "UBIGINT", dataType: xdbcDecimal, columnSize: ptr[int32](20), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(true), fixedPrecScale: true, sqlDataType: xdbcDecimal},
-	{typeName: "UHUGEINT", dataType: xdbcDecimal, columnSize: ptr[int32](39), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(true), sqlDataType: xdbcDecimal},
-	{typeName: "UINTEGER", dataType: xdbcInteger, columnSize: ptr[int32](10), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(true), sqlDataType: xdbcInteger},
-	{typeName: "USMALLINT", dataType: xdbcSmallInt, columnSize: ptr[int32](5), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(true), sqlDataType: xdbcSmallInt},
-	{typeName: "UTINYINT", dataType: xdbcTinyInt, columnSize: ptr[int32](3), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: ptr(true), sqlDataType: xdbcTinyInt},
-	{typeName: "UUID", dataType: xdbcVarChar, columnSize: ptr[int32](36), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcVarChar},
-	{typeName: "VARCHAR", dataType: xdbcVarChar, columnSize: ptr[int32](2147483647), literalPrefix: ptr("'"), literalSuffix: ptr("'"), createParams: []string{"length"}, nullable: xdbcNullable, caseSensitive: true, searchable: xdbcSearchable, sqlDataType: xdbcVarChar},
-	{typeName: "VARBINARY", dataType: xdbcVarBinary, columnSize: ptr[int32](2147483647), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcVarBinary},
+	{typeName: "UBIGINT", dataType: xdbcDecimal, columnSize: new(int32(20)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(true), fixedPrecScale: true, sqlDataType: xdbcDecimal},
+	{typeName: "UHUGEINT", dataType: xdbcDecimal, columnSize: new(int32(39)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(true), sqlDataType: xdbcDecimal},
+	{typeName: "UINTEGER", dataType: xdbcInteger, columnSize: new(int32(10)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(true), sqlDataType: xdbcInteger},
+	{typeName: "USMALLINT", dataType: xdbcSmallInt, columnSize: new(int32(5)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(true), sqlDataType: xdbcSmallInt},
+	{typeName: "UTINYINT", dataType: xdbcTinyInt, columnSize: new(int32(3)), nullable: xdbcNullable, searchable: xdbcSearchable, unsigned: new(true), sqlDataType: xdbcTinyInt},
+	{typeName: "UUID", dataType: xdbcVarChar, columnSize: new(int32(36)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcVarChar},
+	{typeName: "VARCHAR", dataType: xdbcVarChar, columnSize: new(int32(2147483647)), literalPrefix: new("'"), literalSuffix: new("'"), createParams: []string{"length"}, nullable: xdbcNullable, caseSensitive: true, searchable: xdbcSearchable, sqlDataType: xdbcVarChar},
+	{typeName: "VARBINARY", dataType: xdbcVarBinary, columnSize: new(int32(2147483647)), nullable: xdbcNullable, searchable: xdbcSearchable, sqlDataType: xdbcVarBinary},
 }
 
 func (s *DuckFlightSQLServer) GetFlightInfoXdbcTypeInfo(

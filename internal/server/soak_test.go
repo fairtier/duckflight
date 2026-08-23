@@ -88,7 +88,7 @@ func rssKB() int64 {
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if strings.HasPrefix(line, "VmRSS:") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 {
@@ -152,7 +152,7 @@ func TestSoakQueryExecution(t *testing.T) {
 	var warmupHeap uint64
 	var warmupRSS int64
 
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		info, err := env.client.Execute(ctx, fmt.Sprintf("SELECT %d AS val, 'hello' AS msg", i))
 		require.NoError(t, err)
 
@@ -211,7 +211,7 @@ func TestSoakMetadata(t *testing.T) {
 
 	const iterations = 200
 
-	for i := 0; i < iterations; i++ {
+	for range iterations {
 		// GetCatalogs
 		info, err := env.client.GetCatalogs(ctx)
 		require.NoError(t, err)
@@ -253,7 +253,7 @@ func TestSoakPreparedStatements(t *testing.T) {
 	ctx := context.Background()
 	const iterations = 200
 
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		prep, err := env.client.Prepare(ctx, fmt.Sprintf("SELECT %d AS val", i))
 		require.NoError(t, err)
 
@@ -286,7 +286,7 @@ func TestSoakTransactions(t *testing.T) {
 	require.NoError(t, server.SeedSQL(ctx, "CREATE TABLE IF NOT EXISTS soak_txn (id INTEGER, val VARCHAR)"))
 	defer func() { _ = server.SeedSQL(ctx, "DROP TABLE IF EXISTS soak_txn") }()
 
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		tx, err := env.client.BeginTransaction(ctx)
 		require.NoError(t, err)
 

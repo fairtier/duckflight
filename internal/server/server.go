@@ -79,17 +79,11 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 	// doesn't collect resources out from under itself, but never drops below
 	// the floor: reaping a client's session after a minute of think time
 	// destroys its temp tables and invalidates its open transactions.
-	resourceTTL := 2 * timeout
-	if resourceTTL < minResourceTTL {
-		resourceTTL = minResourceTTL
-	}
+	resourceTTL := max(2*timeout, minResourceTTL)
 
 	// Statement handles are short-lived by comparison: they only need to
 	// outlive a DoGet retry, not a client's whole idle window.
-	ticketTTL := 2 * timeout
-	if ticketTTL < minTicketTTL {
-		ticketTTL = minTicketTTL
-	}
+	ticketTTL := max(2*timeout, minTicketTTL)
 
 	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
 
@@ -119,7 +113,7 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 }
 
 func registerSqlInfo(srv *DuckFlightSQLServer) {
-	reg := func(id flightsql.SqlInfo, val interface{}) {
+	reg := func(id flightsql.SqlInfo, val any) {
 		_ = srv.RegisterSqlInfo(id, val)
 	}
 

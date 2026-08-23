@@ -1458,7 +1458,7 @@ func buildIngestRecords(mem memory.Allocator, n int) arrow.RecordBatch {
 	defer idBldr.Release()
 	nameBldr := array.NewStringBuilder(mem)
 	defer nameBldr.Release()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		idBldr.Append(int32(i + 1))
 		nameBldr.Append(fmt.Sprintf("row_%d", i+1))
 	}

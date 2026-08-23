@@ -576,7 +576,7 @@ func (s *ADBCSuite) TestADBC_GetObjectsCatalogFilter() {
 	ctx := context.Background()
 
 	// Filter for existing catalog
-	cat := strPtr("memory")
+	cat := new("memory")
 	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthCatalogs, cat, nil, nil, nil, nil)
 	s.Require().NoError(err)
 	defer rdr.Release()
@@ -586,7 +586,7 @@ func (s *ADBCSuite) TestADBC_GetObjectsCatalogFilter() {
 	s.Equal("memory", cats[0].Name)
 
 	// Filter for non-existent catalog
-	cat2 := strPtr("nonexistent_catalog")
+	cat2 := new("nonexistent_catalog")
 	rdr2, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthCatalogs, cat2, nil, nil, nil, nil)
 	s.Require().NoError(err)
 	defer rdr2.Release()
@@ -598,7 +598,7 @@ func (s *ADBCSuite) TestADBC_GetObjectsCatalogFilter() {
 func (s *ADBCSuite) TestADBC_GetObjectsSchemaFilter() {
 	ctx := context.Background()
 
-	schPat := strPtr("main")
+	schPat := new("main")
 	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthDBSchemas, nil, schPat, nil, nil, nil)
 	s.Require().NoError(err)
 	defer rdr.Release()
@@ -617,7 +617,7 @@ func (s *ADBCSuite) TestADBC_GetObjectsTableFilter() {
 	defer s.execDDL("DROP TABLE IF EXISTS go_test_filter_a")
 	defer s.execDDL("DROP TABLE IF EXISTS go_test_filter_b")
 
-	tblPat := strPtr("go_test_filter_a")
+	tblPat := new("go_test_filter_a")
 	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthTables, nil, nil, tblPat, nil, nil)
 	s.Require().NoError(err)
 	defer rdr.Release()
@@ -676,8 +676,8 @@ func (s *ADBCSuite) TestADBC_GetObjectsColumnFilter() {
 	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_colfilt (alpha INTEGER, beta VARCHAR, gamma BIGINT)")
 	defer s.execDDL("DROP TABLE IF EXISTS go_test_colfilt")
 
-	colPat := strPtr("beta")
-	tblPat := strPtr("go_test_colfilt")
+	colPat := new("beta")
+	tblPat := new("go_test_colfilt")
 	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, colPat, nil)
 	s.Require().NoError(err)
 	defer rdr.Release()
@@ -698,7 +698,7 @@ func (s *ADBCSuite) TestADBC_GetObjectsColumnDetails() {
 	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_coldetail (id INTEGER PRIMARY KEY, name VARCHAR, value BIGINT)")
 	defer s.execDDL("DROP TABLE IF EXISTS go_test_coldetail")
 
-	tblPat := strPtr("go_test_coldetail")
+	tblPat := new("go_test_coldetail")
 	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, nil, nil)
 	s.Require().NoError(err)
 	defer rdr.Release()
@@ -733,7 +733,7 @@ func (s *ADBCSuite) TestADBC_GetObjectsConstraints() {
 	s.execDDL("CREATE TABLE IF NOT EXISTS go_test_con_pk (id INTEGER PRIMARY KEY, name VARCHAR)")
 	defer s.execDDL("DROP TABLE IF EXISTS go_test_con_pk")
 
-	tblPat := strPtr("go_test_con_pk")
+	tblPat := new("go_test_con_pk")
 	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, nil, nil)
 	s.Require().NoError(err)
 	defer rdr.Release()
@@ -759,7 +759,7 @@ func (s *ADBCSuite) TestADBC_GetObjectsWithView() {
 	s.execDDL("CREATE OR REPLACE VIEW go_test_view_obj AS SELECT 1 AS x, 'hello' AS y")
 	defer s.execDDL("DROP VIEW IF EXISTS go_test_view_obj")
 
-	tblPat := strPtr("go_test_view_obj")
+	tblPat := new("go_test_view_obj")
 	rdr, err := s.cnxn.GetObjects(ctx, adbc.ObjectDepthAll, nil, nil, tblPat, nil, nil)
 	s.Require().NoError(err)
 	defer rdr.Release()
@@ -817,8 +817,6 @@ func (s *ADBCSuite) TestADBC_GetTableSchemaNotFound() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-func strPtr(s string) *string { return &s }
 
 func (s *ADBCSuite) execDDL(query string) {
 	s.T().Helper()

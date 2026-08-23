@@ -16,19 +16,19 @@ import (
 
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
-	"github.com/moby/moby/api/types/container"
 	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/config"
 	duckserver "github.com/fairtier/duckflight/internal/server"
+	"github.com/moby/moby/api/types/container"
 	"github.com/stretchr/testify/suite"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 const (
-	testAuthUser   = "duckflight"
-	testAuthPass   = "duckflight"
-	testJWTSecret  = "test-secret-not-for-prod-32-bytes!"
+	testAuthUser  = "duckflight"
+	testAuthPass  = "duckflight"
+	testJWTSecret = "test-secret-not-for-prod-32-bytes!"
 )
 
 // ---------------------------------------------------------------------------
@@ -146,43 +146,41 @@ pytest -v --tb=short --color=no` + pytestFilter + `
 `
 
 	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: testcontainers.ContainerRequest{
-			Image: "python:3.12-slim",
-			// Run in the host's network namespace so localhost reaches the
-			// in-process DuckFlight server directly. Linux-only — CI is Linux.
-			HostConfigModifier: func(hc *container.HostConfig) {
-				hc.NetworkMode = "host"
-			},
-			Env: map[string]string{
-				"DUCKFLIGHT_HOST":               "127.0.0.1",
-				"DUCKFLIGHT_PORT":               strconv.Itoa(s.port),
-				"DUCKFLIGHT_USER":               testAuthUser,
-				"DUCKFLIGHT_PASSWORD":           testAuthPass,
-				"PIP_DISABLE_PIP_VERSION_CHECK": "1",
-				"PYTHONDONTWRITEBYTECODE":       "1",
-				"PYTHONUNBUFFERED":              "1",
-			},
-			Files: []testcontainers.ContainerFile{
-				{
-					Reader:            strings.NewReader(pyRequirements),
-					ContainerFilePath: "/tests/requirements.txt",
-					FileMode:          0o644,
-				},
-				{
-					Reader:            strings.NewReader(pyConftest),
-					ContainerFilePath: "/tests/conftest.py",
-					FileMode:          0o644,
-				},
-				{
-					Reader:            strings.NewReader(pyTestSQLAlchemy),
-					ContainerFilePath: "/tests/test_sqlalchemy.py",
-					FileMode:          0o644,
-				},
-			},
-			Entrypoint: []string{"bash", "-c", entrypoint},
-			WaitingFor: wait.ForExit().WithExitTimeout(8 * time.Minute),
+		Image: "python:3.12-slim",
+		// Run in the host's network namespace so localhost reaches the
+		// in-process DuckFlight server directly. Linux-only — CI is Linux.
+		HostConfigModifier: func(hc *container.HostConfig) {
+			hc.NetworkMode = "host"
 		},
-		Started: true,
+		Env: map[string]string{
+			"DUCKFLIGHT_HOST":               "127.0.0.1",
+			"DUCKFLIGHT_PORT":               strconv.Itoa(s.port),
+			"DUCKFLIGHT_USER":               testAuthUser,
+			"DUCKFLIGHT_PASSWORD":           testAuthPass,
+			"PIP_DISABLE_PIP_VERSION_CHECK": "1",
+			"PYTHONDONTWRITEBYTECODE":       "1",
+			"PYTHONUNBUFFERED":              "1",
+		},
+		Files: []testcontainers.ContainerFile{
+			{
+				Reader:            strings.NewReader(pyRequirements),
+				ContainerFilePath: "/tests/requirements.txt",
+				FileMode:          0o644,
+			},
+			{
+				Reader:            strings.NewReader(pyConftest),
+				ContainerFilePath: "/tests/conftest.py",
+				FileMode:          0o644,
+			},
+			{
+				Reader:            strings.NewReader(pyTestSQLAlchemy),
+				ContainerFilePath: "/tests/test_sqlalchemy.py",
+				FileMode:          0o644,
+			},
+		},
+		Entrypoint: []string{"bash", "-c", entrypoint},
+		WaitingFor: wait.ForExit().WithExitTimeout(8 * time.Minute),
+		Started:    true,
 	})
 	s.Require().NoError(err, "start pytest container")
 	defer func() {

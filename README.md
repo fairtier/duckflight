@@ -32,7 +32,7 @@ Flight SQL Client (ADBC/JDBC/Python/Go)
 
 ### Prerequisites
 
-- Go 1.26+ with CGO enabled (`gcc` must be available)
+- Go 1.27+ with CGO enabled (`gcc` must be available)
 - Docker and Docker Compose (for local development with Iceberg)
 
 ### Build

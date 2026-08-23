@@ -1,4 +1,9 @@
-FROM golang:1.26-trixie AS build
+# Minor version on purpose, not a full patch pin: this repo has no Dependabot
+# and the image is only rebuilt on a release tag, so `1.27` resolves to the
+# newest 1.27.x at build time rather than to whatever was current when someone
+# last edited this line. Move it with the `go` directive in go.mod, and keep
+# the ext-download stage below on the same tag.
+FROM golang:1.27-trixie AS build
 RUN apt-get update && \
     apt-get install -y gcc g++ && \
     rm -rf /var/lib/apt/lists/*
@@ -13,7 +18,7 @@ RUN CGO_ENABLED=1 \
 # The lists are build args so a downstream image can bake a different set
 # (e.g. community extensions) without forking this file; the defaults keep
 # this repo's published image unchanged.
-FROM golang:1.26-trixie AS ext-download
+FROM golang:1.27-trixie AS ext-download
 ARG TARGETARCH
 # Space-separated names, fetched from extensions.duckdb.org. iceberg + runtime
 # dependencies not statically linked: json, parquet, icu are already built into

@@ -36,12 +36,10 @@ func (l *localJWT) issue(username string) (string, error) {
 	now := time.Now()
 	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, sessionClaims{
 		SessionID: uuid.NewString(),
-		RegisteredClaims: jwt.RegisteredClaims{
-			Issuer:    localJWTIssuer,
-			Subject:   username,
-			IssuedAt:  jwt.NewNumericDate(now),
-			ExpiresAt: jwt.NewNumericDate(now.Add(l.ttl)),
-		},
+		Issuer:    localJWTIssuer,
+		Subject:   username,
+		IssuedAt:  jwt.NewNumericDate(now),
+		ExpiresAt: jwt.NewNumericDate(now.Add(l.ttl)),
 	})
 	return tok.SignedString(l.secret)
 }

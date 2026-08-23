@@ -120,24 +120,20 @@ func TestCloseSessionConcurrentWithRPC(t *testing.T) {
 	var wg sync.WaitGroup
 	const rounds = 40
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < rounds; i++ {
+	wg.Go(func() {
+		for i := range rounds {
 			// Errors are acceptable here (the session may have just been
 			// closed); a crash or a hang is not.
 			_ = execQuery(ctx, cl, fmt.Sprintf("SELECT %d", i))
 		}
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		for i := 0; i < rounds; i++ {
+	wg.Go(func() {
+		for range rounds {
 			_, _ = cl.CloseSession(ctx, &flight.CloseSessionRequest{})
 			time.Sleep(time.Millisecond)
 		}
-	}()
+	})
 
 	wg.Wait()
 

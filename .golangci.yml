@@ -1,8 +1,13 @@
 version: "2"
 
 run:
+  # Both tags, not just duckdb_arrow: the SQLAlchemy integration test is gated
+  # behind the second one, and a tag the linter does not set is a file the
+  # linter never sees. That file was the only one carrying gofumpt drift when
+  # the formatter was first enabled.
   build-tags:
     - duckdb_arrow
+    - sqlalchemy_integration
 
 linters:
   enable:
@@ -23,3 +28,13 @@ linters:
       locale: US
   exclusions:
     presets: []
+# gofumpt, newly enforced with the Go 1.27 bump. It had never been enabled, so
+# the tree carried drift that no CI job could see; that backlog was flushed in
+# the same commit. Declaring it here makes `golangci-lint run` — and therefore
+# CI — the thing that catches formatting, which also means a golangci-lint bump
+# that adds a gofumpt rule fails the lint job instead of showing up as mystery
+# diff in an unrelated PR. That is why the action's version is pinned. Run
+# `golangci-lint fmt` to apply.
+formatters:
+  enable:
+    - gofumpt

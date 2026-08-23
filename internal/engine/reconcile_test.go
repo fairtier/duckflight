@@ -53,8 +53,7 @@ func waitForCount(t *testing.T, eng *Engine, table, want string) {
 // broken SQL is tolerated (logged, engine keeps serving).
 func TestReconcilerAppliesAndWatches(t *testing.T) {
 	eng := newTestEngine(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	path := filepath.Join(t.TempDir(), "reconcile.sql")
 	r := NewReconciler(eng, path)
@@ -91,8 +90,7 @@ func TestReconcilerAppliesAndWatches(t *testing.T) {
 // instance-wide).
 func TestReconcilerSecretVisibleAcrossPool(t *testing.T) {
 	eng := newTestEngine(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 
 	path := filepath.Join(t.TempDir(), "reconcile.sql")
 	writeFile(t, path, "CREATE OR REPLACE SECRET recon_secret (TYPE http, EXTRA_HTTP_HEADERS MAP {'x-probe': 'v1'});")
