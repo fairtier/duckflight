@@ -43,16 +43,18 @@ tls:
   existingSecret: ""  # Kubernetes TLS secret with tls.crt and tls.key
   caSecret: ""        # Secret with ca.crt for mTLS (optional)
 
-# Optional extensions image: an initContainer that copies its /extensions
-# tree into an emptyDir mounted over the server's extension directory —
-# per-deployment extension sets without a per-deployment server image. Build
-# one from this repo's Dockerfile with `--target extensions` and the
-# CORE_EXTENSIONS/COMMUNITY_EXTENSIONS build args, FROM THE SAME GIT REF as
-# the server image (extension files are tied to the DuckDB version inside the
-# binary). The mount shadows the extensions baked into the server image, so
-# the extensions image must carry the full set, core trio included.
+# Optional EXTRAS image: extension binaries layered on top of the set baked
+# into the server image (iceberg, avro, httpfs — always present, not this
+# image's job). When set, an emptyDir shadows the baked /extensions and two
+# initContainers rebuild it as a union: baked set first (from the server
+# image itself), extras second. Build an extras image from this repo's
+# Dockerfile with `--target extensions` and the CORE_EXTENSIONS=""/
+# COMMUNITY_EXTENSIONS build args, FROM THE SAME GIT REF as the server image
+# (extension files are tied to the DuckDB version inside the binary). Unset
+# — the default — the server runs straight off its baked set, no
+# initContainers, no emptyDir.
 extensions:
-  image: ""           # e.g. ghcr.io/yourorg/duckdb-extensions:v0.2.0
+  image: ""           # e.g. ghcr.io/yourorg/duckdb-extras:v0.2.0
   pullPolicy: IfNotPresent
 
 # Optional operator-managed SQL, executed instance-wide at startup and

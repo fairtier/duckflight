@@ -20,9 +20,25 @@ spec:
       {{- end }}
       {{- if .Values.extensions.image }}
       initContainers:
-        # Copies the curated extension set into an emptyDir that shadows the
-        # server image's baked /extensions — see .Values.extensions.
-        - name: extensions
+        # The extension directory the engine sees is the UNION of the server
+        # image's baked set and the extras image: the emptyDir shadows the
+        # baked /extensions, so it is seeded from the server image first and
+        # the extras image overlays second. An extras image therefore ships
+        # only its extras — the mandatory set (iceberg, avro, httpfs) always
+        # comes from the server image itself and can never be dropped by a
+        # thin or stale extras image.
+        - name: extensions-baked
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["cp", "-a", "/extensions/.", "/target/"]
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: duckdb-extensions
+              mountPath: /target
+        - name: extensions-extra
           image: {{ .Values.extensions.image | quote }}
           imagePullPolicy: {{ .Values.extensions.pullPolicy }}
           command: ["cp", "-a", "/extensions/.", "/target/"]
@@ -205,7 +221,7 @@ spec:
             {{- end }}
             {{- end }}
             {{- if .Values.extensions.image }}
-            # Shadows the extensions baked into the server image.
+            # The union built by the initContainers (baked set + extras).
             - name: duckdb-extensions
               mountPath: {{ .Values.resources.extensionDir | default "/extensions" | quote }}
               readOnly: true
