@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	github.com/MicahParks/keyfunc/v3 v3.8.1
 	github.com/apache/arrow-adbc/go/adbc v1.12.0
-	github.com/apache/arrow-go/v18 v18.7.0
+	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/duckdb/duckdb-go/v2 v2.10505.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
@@ -31,7 +31,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.45.0
 	golang.org/x/sync v0.22.0
 	golang.org/x/time v0.15.0
-	google.golang.org/grpc v1.83.1
+	google.golang.org/grpc v1.83.2
 )
 
 require (
