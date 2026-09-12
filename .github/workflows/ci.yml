@@ -27,7 +27,7 @@ jobs:
           # turn an unrelated PR red. It is also a hard floor — golangci-lint
           # refuses to run when the Go it was built with is below the module's
           # `go` directive, so a 1.27 go.mod needs a 1.27-built linter.
-          version: v2.13.1
+          version: v2.13.2
           args: --timeout=5m
 
   test:
