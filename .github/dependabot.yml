@@ -1,0 +1,24 @@
+version: 2
+# Actions are pinned by commit SHA with a `# vN` comment. Dependabot rewrites
+# both halves, so the pin stays readable without going stale — and unlike a
+# `@vN` tag pin, a SHA pin makes every release visible, not just majors.
+# The default open-PR limit of 5 per ecosystem silently withholds the rest.
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+
