@@ -77,8 +77,14 @@ func (s *IcebergSuite) SetupSuite() {
 	s.Require().NoError(err)
 
 	// 3. MinIO (via module)
+	//
+	// quay.io, not Docker Hub: MinIO restricted `minio/minio` there in
+	// 2026-09 and an anonymous pull scope now answers 401 (not 429 — a
+	// restriction, not throttling), which failed every test in this suite
+	// with "pull access denied for minio/minio". quay.io is MinIO's own
+	// registry and still serves it anonymously.
 	s.minioC, err = minio.Run(ctx,
-		"minio/minio",
+		"quay.io/minio/minio",
 		minio.WithUsername(minioUser),
 		minio.WithPassword(minioPassword),
 		network.WithNetwork([]string{"minio"}, nw),
@@ -87,7 +93,7 @@ func (s *IcebergSuite) SetupSuite() {
 
 	// Create bucket via mc sidecar
 	mcC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		Image:    "minio/mc",
+		Image:    "quay.io/minio/mc", // same Docker Hub restriction as minio/minio above
 		Networks: []string{nw.Name},
 		Entrypoint: []string{
 			"/bin/sh", "-c",

@@ -12,7 +12,7 @@ services:
       retries: 5
 
   minio:
-    image: minio/minio
+    image: quay.io/minio/minio
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minio-root-user
@@ -24,7 +24,7 @@ services:
       retries: 5
 
   minio-init:
-    image: minio/mc
+    image: quay.io/minio/mc
     depends_on:
       minio:
         condition: service_healthy
