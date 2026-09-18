@@ -1,0 +1,36 @@
+name: Claude Code
+
+# Thin caller. The job lives in fairtier/.github/.github/workflows/claude.yml,
+# which is private and shared with this repo through the organization access
+# setting on that repo.
+#
+# `@master` is deliberate rather than a SHA pin: a fix to the shared job should
+# reach all ten repos without ten pull requests. The trade is that this repo
+# does not control when that job changes.
+#
+# Triggers and permissions stay here, not in the shared workflow, so the blast
+# radius of a @claude mention is readable in the repo it applies to.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write # push a branch with the changes it was asked to make
+  pull-requests: write # open a PR and comment on one
+  issues: write # reply on the issue that summoned it
+  actions: read # read the CI logs of a failing run it is asked about
+
+jobs:
+  claude:
+    uses: fairtier/.github/.github/workflows/claude.yml@master
+    # Passed explicitly rather than `secrets: inherit`, which would hand the
+    # shared workflow every org and repo secret this repo can see.
+    secrets:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
