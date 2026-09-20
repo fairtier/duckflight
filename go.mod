@@ -3,7 +3,7 @@ module github.com/fairtier/duckflight
 go 1.27.0
 
 require (
-	github.com/MicahParks/keyfunc/v3 v3.8.1
+	github.com/MicahParks/keyfunc/v3 v3.8.2
 	github.com/apache/arrow-adbc/go/adbc v1.12.0
 	github.com/apache/arrow-go/v18 v18.8.0
 	github.com/duckdb/duckdb-go/v2 v2.10505.0
