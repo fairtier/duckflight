@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -43,6 +44,12 @@ type bootStatement struct {
 // NewEngine creates a new in-memory DuckDB engine with the given config.
 func NewEngine(cfg *config.Config) (*Engine, error) {
 	connector, err := duckdb.NewConnector("", func(execer driver.ExecerContext) error {
+		// bestEffort statements run after bootSQL and log a failure instead
+		// of failing the boot. Boot SQL runs for every connection the pool
+		// ever opens, not only at startup, so a fatal statement that starts
+		// failing mid-life does not crash the server: it silently shrinks the
+		// pool one replacement at a time until nothing answers.
+		var bestEffort []bootStatement
 		bootSQL := []bootStatement{
 			{"set autoinstall_known_extensions", fmt.Sprintf("SET autoinstall_known_extensions = %t", !staticExtensions)},
 			{"set autoload_known_extensions", "SET autoload_known_extensions = true"},
@@ -113,8 +120,21 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 			attachSQL += ")"
 			bootSQL = append(bootSQL, bootStatement{"attach iceberg catalog", attachSQL})
 
-			// Make the Iceberg catalog the default so users can omit the "lake.default." prefix.
-			bootSQL = append(bootSQL, bootStatement{"use lake.default", "USE lake.\"default\""})
+			// The namespace USE points at must exist in the catalog, and nothing
+			// else creates it. DuckDB-Iceberg accepts USE of a namespace it has
+			// never seen without asking the catalog, but the first table lookup
+			// that misses in it (any unqualified typo) makes it ask, and a
+			// "no such namespace" answer is cached instance-wide for the life of
+			// the process — after which USE fails on every new connection.
+			// Best-effort because a read-only catalog client may not create
+			// namespaces; that deployment has to create `default` itself.
+			bestEffort = append(bestEffort,
+				bootStatement{"create schema lake.default", "CREATE SCHEMA IF NOT EXISTS lake.\"default\""},
+				// Make the Iceberg catalog the default so users can omit the
+				// "lake.default." prefix. A connection that cannot USE it still
+				// serves fully qualified queries.
+				bootStatement{"use lake.default", "USE lake.\"default\""},
+			)
 		}
 
 		for _, stmt := range bootSQL {
@@ -122,6 +142,12 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 				// Deliberately reports the label, not stmt.sql: the secret
 				// statements carry credentials in cleartext.
 				return fmt.Errorf("boot SQL failed (%s): %w", stmt.label, err)
+			}
+		}
+		for _, stmt := range bestEffort {
+			if _, err := execer.ExecContext(context.Background(), stmt.sql, nil); err != nil {
+				slog.Error("best-effort boot SQL failed; continuing",
+					slog.String("statement", stmt.label), slog.String("error", err.Error()))
 			}
 		}
 		return nil

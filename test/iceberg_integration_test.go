@@ -38,6 +38,8 @@ const (
 	pgPassword    = "postgres"
 	pgDB          = "lakekeeper"
 	warehouseName = "demo"
+	poolSize      = 4
+	siloImage     = "docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z"
 )
 
 // ---------------------------------------------------------------------------
@@ -76,40 +78,34 @@ func (s *IcebergSuite) SetupSuite() {
 	)
 	s.Require().NoError(err)
 
-	// 3. MinIO (via module)
+	// 3. Object storage: Silo, the community continuation of the MinIO
+	// server on its last Apache-2.0 lineage, run through the MinIO module
+	// (its entrypoint maps the module's `server /data` onto `silo`).
 	//
-	// quay.io, not Docker Hub: MinIO restricted `minio/minio` there in
-	// 2026-09 and an anonymous pull scope now answers 401 (not 429 — a
-	// restriction, not throttling), which failed every test in this suite
-	// with "pull access denied for minio/minio". quay.io is MinIO's own
-	// registry and still serves it anonymously.
+	// Not MinIO itself: `minio/minio` on Docker Hub answers anonymous pulls
+	// with 401 since 2026-09, and quay.io's `quay.io/minio/minio` and
+	// `quay.io/minio/mc` followed, so both images failed every test in this
+	// suite with "unauthorized". Pinned, because an unpinned tag is how a
+	// test starts failing without anything in this repo changing.
 	s.minioC, err = minio.Run(ctx,
-		"quay.io/minio/minio",
+		siloImage,
 		minio.WithUsername(minioUser),
 		minio.WithPassword(minioPassword),
 		network.WithNetwork([]string{"minio"}, nw),
 	)
 	s.Require().NoError(err)
 
-	// Create bucket via mc sidecar
-	mcC, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		Image:    "quay.io/minio/mc", // same Docker Hub restriction as minio/minio above
-		Networks: []string{nw.Name},
-		Entrypoint: []string{
-			"/bin/sh", "-c",
-			fmt.Sprintf(
-				"mc alias set myminio http://minio:9000 %s %s && mc mb myminio/%s --ignore-existing",
-				minioUser, minioPassword, minioBucket,
-			),
-		},
-		WaitingFor: wait.ForExit().WithExitTimeout(30 * time.Second),
-		Started:    true,
-	})
+	// Create the bucket with the client Silo bundles, rather than a separate
+	// client image.
+	code, out, err := s.minioC.Exec(ctx, []string{"sh", "-c", fmt.Sprintf(
+		"mcli alias set local http://127.0.0.1:9000 %s %s && mcli mb --ignore-existing local/%s",
+		minioUser, minioPassword, minioBucket,
+	)})
 	s.Require().NoError(err)
-	mcState, err := mcC.State(ctx)
-	s.Require().NoError(err)
-	s.Require().Equal(0, mcState.ExitCode, "mc bucket creation failed")
-	_ = mcC.Terminate(ctx)
+	if code != 0 {
+		msg, _ := io.ReadAll(out)
+		s.Require().Failf("bucket creation failed", "exit %d: %s", code, msg)
+	}
 
 	// Get MinIO container IP — reachable from both host (Docker bridge) and containers.
 	minioInspect, err := s.minioC.Inspect(ctx)
@@ -191,10 +187,9 @@ func (s *IcebergSuite) SetupSuite() {
 	s.Require().NoError(json.Unmarshal(whResp, &whResult))
 	s.Require().NotEmpty(whResult.WarehouseID, "warehouse-id missing from response")
 
-	// 8. Create default namespace
-	s.httpPost(s.catalogURL+"/v1/"+whResult.WarehouseID+"/namespaces", map[string]any{
-		"namespace": []string{"default"},
-	})
+	// 8. Deliberately no `default` namespace: nothing in a real deployment
+	// creates one, and a suite that pre-created it hid the bug
+	// TestIceberg_MissingTableKeepsPoolAlive guards. DuckFlight creates it.
 
 	// 9. Boot DuckFlight server with Iceberg catalog attached.
 	// S3 credentials are passed so DuckDB can read/write data files in MinIO.
@@ -202,7 +197,7 @@ func (s *IcebergSuite) SetupSuite() {
 		MemoryLimit:      "512MB",
 		MaxThreads:       2,
 		QueryTimeout:     "30s",
-		PoolSize:         4,
+		PoolSize:         poolSize,
 		IcebergEndpoint:  s.catalogURL,
 		IcebergWarehouse: warehouseName,
 		// No OAuth2 — Lakekeeper runs without auth in tests
@@ -430,6 +425,48 @@ func (s *IcebergSuite) TestIceberg_TransactionRollback() {
 		totalRows += rec.NumRows()
 	}
 	s.EqualValues(0, totalRows, "rolled-back row should not be visible")
+}
+
+// TestIceberg_MissingTableKeepsPoolAlive guards the pool against a poisoned
+// default schema. DuckDB-Iceberg answers a table lookup that misses by asking
+// the catalog whether the *schema* exists, and if it does not, marks its
+// instance-wide cache entry non-existent for good. `lake.default` is the
+// current schema, so one unqualified typo against a catalog with no `default`
+// namespace made every later `USE lake."default"` fail — and with it the boot
+// of every replacement connection, until the pool ran dry and every query,
+// `SELECT 1` included, timed out.
+func (s *IcebergSuite) TestIceberg_MissingTableKeepsPoolAlive() {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// The poisoning lookup. The binder may reject it at GetFlightInfo or at
+	// DoGet; either way it must fail.
+	info, err := s.client.Execute(ctx, "SELECT * FROM no_such_table")
+	if err == nil {
+		var rdr *flight.Reader
+		rdr, err = s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+		if err == nil {
+			for rdr.Next() {
+			}
+			err = rdr.Err()
+			rdr.Release()
+		}
+	}
+	s.Require().Error(err, "query against a missing table must fail")
+
+	// Recycle every pooled connection: a SET marks its connection dirty, so
+	// the pool closes it and boots a replacement, which runs the boot SQL
+	// against the (possibly poisoned) catalog.
+	for range 2 * poolSize {
+		_, err := s.client.ExecuteUpdate(ctx, "SET threads = 2")
+		s.Require().NoError(err)
+	}
+
+	recs := s.execQuery("SELECT current_database() || '.' || current_schema()")
+	defer releaseRecs(recs)
+	s.Require().Len(recs, 1)
+	s.Equal("lake.default", recs[0].Column(0).ValueStr(0),
+		"replacement connections should still boot into lake.default")
 }
 
 // ---------------------------------------------------------------------------
