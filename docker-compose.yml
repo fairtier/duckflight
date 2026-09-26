@@ -11,20 +11,22 @@ services:
       timeout: 3s
       retries: 5
 
+  # Silo: the community continuation of the MinIO server on its last
+  # Apache-2.0 lineage. MinIO's own images no longer pull anonymously.
   minio:
-    image: quay.io/minio/minio
+    image: docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: minio-root-user
       MINIO_ROOT_PASSWORD: minio-root-password
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "mcli", "ready", "local"]
       interval: 5s
       timeout: 3s
       retries: 5
 
   minio-init:
-    image: quay.io/minio/mc
+    image: docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z # bundles the client as mcli
     depends_on:
       minio:
         condition: service_healthy
@@ -32,8 +34,8 @@ services:
     command:
       - -c
       - |
-        mc alias set myminio http://minio:9000 minio-root-user minio-root-password
-        mc mb myminio/warehouse --ignore-existing
+        mcli alias set myminio http://minio:9000 minio-root-user minio-root-password
+        mcli mb myminio/warehouse --ignore-existing
 
   lakekeeper-migrate:
     image: quay.io/lakekeeper/catalog:latest-main
