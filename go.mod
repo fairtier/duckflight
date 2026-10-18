@@ -10,7 +10,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/uuid v1.6.0
 	github.com/moby/moby/api v1.56.0
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
 	github.com/stretchr/testify v1.12.1
 	github.com/testcontainers/testcontainers-go v0.44.0
@@ -67,7 +67,7 @@ require (
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0 // indirect
-	github.com/klauspost/compress v1.19.2 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.4.0 // indirect
 	github.com/lufia/plan9stats v0.0.0-20260802145828-341c2f0c90b5 // indirect
 	github.com/magiconair/properties v1.18.11 // indirect
