@@ -1,8 +1,13 @@
-# Minor version on purpose, not a full patch pin: this repo has no Dependabot
-# and the image is only rebuilt on a release tag, so `1.27` resolves to the
-# newest 1.27.x at build time rather than to whatever was current when someone
-# last edited this line. Move it with the `go` directive in go.mod, and keep
-# the ext-download stage below on the same tag.
+# Minor version on purpose, not a full patch pin: the image is only rebuilt on
+# a release tag, so `1.27` resolves to the newest 1.27.x at build time rather
+# than to whatever was current when someone last edited this line. Dependabot
+# bumps the minor, and it moves every golang FROM in this file in one PR.
+#
+# The Debian release (`trixie`) must match the runtime stage at the bottom.
+# The binary is CGO: DuckDB is linked statically, but libc, libstdc++ and
+# libgcc_s are dynamic and carry symbol versions from this builder, so a
+# runtime older than the builder fails at startup with "GLIBC_2.xx not found".
+# Dependabot never changes a codename, so that move is by hand, in all stages.
 FROM golang:1.27-trixie AS build
 RUN apt-get update && \
     apt-get install -y gcc g++ && \
@@ -53,6 +58,7 @@ RUN DUCKDB_VERSION=$(grep -m1 '^DUCKDB_VERSION=' \
 FROM busybox:stable AS extensions
 COPY --from=ext-download /extensions/ /extensions/
 
+# Same Debian release as the build stage — see the note at the top.
 FROM debian:trixie-slim
 RUN apt-get update && \
     apt-get install -y ca-certificates && \
