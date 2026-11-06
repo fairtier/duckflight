@@ -66,8 +66,9 @@ reconcileSql:
   existingSecret: ""
   key: "reconcile.sql"
 
-# Refuse client-issued INSTALL/LOAD statements; extensions are then managed
-# exclusively through the baked extension directory and reconcile SQL.
+# Refuse a client-issued INSTALL/LOAD sent as a single statement. Best-effort,
+# not a security boundary: multi-statement SQL is not inspected. Provision
+# extensions through the baked extension directory and reconcile SQL.
 rejectClientExtensions: false
 
 # DuckDB spill directory. Without one, an in-memory engine errors on

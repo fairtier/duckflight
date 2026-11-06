@@ -50,6 +50,12 @@ func duckDBToGRPCCode(err error) codes.Code {
 // statement would leave connection-local state behind, so the pool recycles
 // it instead of handing that state to the next borrower.
 //
+// A multi-statement script classifies as TxnIntentNone whatever it contains, so
+// it is never skipped: its own BEGIN/COMMIT run as written, on the connection
+// it landed on, and DuckDB decides. `BEGIN; …; COMMIT` works in autocommit.
+// Inside an open transaction it fails loudly, and like any BEGIN-in-BEGIN it
+// leaves that transaction aborted.
+//
 // Returns true when the statement should be skipped; otherwise the caller
 // should execute it normally. All classification uses DuckDB's own parser
 // ([engine.ArrowConn.ClassifyStatement]) and an explicit transaction-state
@@ -60,11 +66,15 @@ func duckDBToGRPCCode(err error) codes.Code {
 // recreates exactly the BEGIN-in-BEGIN abort this exists to prevent.
 //
 // When RejectClientExtensions is configured, the same classification pass also
-// refuses INSTALL/LOAD statements (both surface as STATEMENT_TYPE_LOAD in
-// DuckDB's parser): extensions are then managed exclusively by the operator
-// through boot/reconcile SQL. Statement paths that never see arbitrary SQL —
-// GetSchemaStatement wraps the query in a subselect where LOAD cannot parse,
-// and ingest builds its own INSERT server-side — need no equivalent check.
+// refuses a single INSTALL or LOAD statement (both surface as
+// STATEMENT_TYPE_LOAD in DuckDB's parser). That is all it covers: a
+// multi-statement script classifies as STATEMENT_TYPE_MULTI and passes wherever
+// the LOAD sits in it, so the setting does not make extensions operator-only.
+// TestRejectClientExtensionsCoverage pins this known gap. Ingest builds its own
+// INSERT server-side and needs no check. GetSchemaStatement wraps the query in a
+// subselect where a lone LOAD
+// cannot parse, though SQL crafted to close that subselect isn't
+// covered either.
 func (s *DuckFlightSQLServer) shouldSkipTxnControl(ctx context.Context, ac *engine.ArrowConn, query string) (bool, error) {
 	intent, stmtType := ac.ClassifyStatement(ctx, query)
 	if s.rejectClientExtensions && stmtType == duckdb.STATEMENT_TYPE_LOAD {

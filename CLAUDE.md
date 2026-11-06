@@ -120,6 +120,15 @@ inside its transaction — `shouldSkipTxnControl` then skips that client's
 SELECT/INSERT/UPDATE/DELETE never marks a connection dirty, so the hot path
 still costs nothing.
 
+**Classifying must not execute.** duckdb-go's `PrepareContext` runs every
+statement of multi-statement SQL but the last, so classification uses its plain
+`Prepare`, which refuses such SQL without running it. That refusal reads as
+`STATEMENT_TYPE_MULTI`: dirty, and no transaction intent, so a script's own
+BEGIN/COMMIT run as written. Two consequences: scripts aren't atomic, so a
+failure midway keeps what the earlier statements did in autocommit, and bound
+parameters re-run the leading statements once per row. And a script is exempt
+from `REJECT_CLIENT_EXTENSIONS`, which only sees a single statement's type.
+
 **Prepared statements.** Query-string-based with bind parameters applied at
 execute time (`DoGetPreparedStatement` binds the last parameter row through
 DuckDB's positional bind; `DoPutPreparedStatementUpdate` loops all rows). A
@@ -259,8 +268,9 @@ All via environment variables. See README.md for the full table. Key ones:
   change (`internal/engine/reconcile.go`). DuckDB temporary secrets and
   loaded extensions are instance-wide, so rotation reaches every pooled
   connection without a restart. Errors report a label, never the SQL text.
-- `REJECT_CLIENT_EXTENSIONS` — refuse client-issued `INSTALL`/`LOAD` (both
-  classify as `STATEMENT_TYPE_LOAD`); extensions become operator-only
+- `REJECT_CLIENT_EXTENSIONS` — refuse a client-issued single `INSTALL`/`LOAD`
+  statement (both classify as `STATEMENT_TYPE_LOAD`); multi-statement scripts
+  are not covered
 - `TEMP_DIRECTORY` — DuckDB spill directory; without it an in-memory engine
   errors on larger-than-memory operations
 

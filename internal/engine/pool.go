@@ -75,17 +75,34 @@ const (
 	TxnIntentEnd                    // COMMIT / ROLLBACK / ABORT / END
 )
 
-// statementType asks DuckDB's parser to classify query. Returns
-// STATEMENT_TYPE_INVALID when the statement cannot be prepared (syntax error,
-// unknown table, …); callers treat that as "no classification available".
+// statementType asks DuckDB to classify query without running any of it.
+// Returns STATEMENT_TYPE_INVALID when the statement cannot be prepared (syntax
+// error, unknown table, …); callers treat that as "no classification
+// available". Returns STATEMENT_TYPE_MULTI when query expands to more than one
+// statement.
+//
+// It must use the driver's plain Prepare. PrepareContext is not its cancellable
+// twin: for multi-statement SQL it executes every statement but the last and
+// prepares the last, so classifying `INSERT …; SELECT 1` performed the INSERT,
+// and the real execution then performed it again. Prepare refuses such SQL
+// without running anything, and the two differ in no other way that matters
+// here: neither can interrupt a prepare in flight, only check ctx up front.
+//
+// That refusal is an untyped error, while everything DuckDB itself rejects is a
+// *duckdb.Error, which is how the two are told apart. The other untyped errors
+// (empty query, closed connection) also land on MULTI: it only costs a recycled
+// connection, which is the safe answer for SQL that can't be classified.
 func (ac *ArrowConn) statementType(ctx context.Context, query string) duckdb.StmtType {
-	preparer, ok := ac.conn.(driver.ConnPrepareContext)
-	if !ok {
+	if ctx.Err() != nil {
 		return duckdb.STATEMENT_TYPE_INVALID
 	}
-	stmt, err := preparer.PrepareContext(ctx, query)
+	stmt, err := ac.conn.Prepare(query)
 	if err != nil {
-		return duckdb.STATEMENT_TYPE_INVALID
+		var duckErr *duckdb.Error
+		if errors.As(err, &duckErr) {
+			return duckdb.STATEMENT_TYPE_INVALID
+		}
+		return duckdb.STATEMENT_TYPE_MULTI
 	}
 	defer func() { _ = stmt.Close() }()
 
@@ -108,6 +125,9 @@ func (ac *ArrowConn) statementType(ctx context.Context, query string) duckdb.Stm
 // CREATE/DROP/ALTER are included because DuckDB's statement type does not
 // distinguish `CREATE TEMP TABLE` from `CREATE TABLE`; recycling on schema DDL
 // is cheap relative to how rarely analytics clients issue it.
+//
+// STATEMENT_TYPE_MULTI falls to the default: a script can do any of this, and
+// nothing looks inside it.
 func mutatesConnState(t duckdb.StmtType) bool {
 	switch t {
 	case duckdb.STATEMENT_TYPE_SELECT,

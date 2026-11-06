@@ -469,6 +469,79 @@ func (s *IcebergSuite) TestIceberg_MissingTableKeepsPoolAlive() {
 		"replacement connections should still boot into lake.default")
 }
 
+// TestIceberg_MultiStatementRunsOnce: multi-statement SQL leaves the same rows
+// on an Iceberg table as it does in memory, its leading statements not run twice.
+func (s *IcebergSuite) TestIceberg_MultiStatementRunsOnce() {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	const table = "lake.default.multi_stmt"
+	count := func() string {
+		recs := s.execQuery("SELECT count(*)::VARCHAR FROM " + table)
+		defer releaseRecs(recs)
+		s.Require().Len(recs, 1)
+		return recs[0].Column(0).ValueStr(0)
+	}
+	cases := []struct {
+		name string
+		run  func() error
+		want string
+	}{
+		{"update", func() error {
+			_, err := s.client.ExecuteUpdate(ctx, "INSERT INTO "+table+" VALUES (1); INSERT INTO "+table+" VALUES (2)")
+			return err
+		}, "2"},
+		{"doget", func() error {
+			info, err := s.client.Execute(ctx, "INSERT INTO "+table+" VALUES (1); SELECT 1")
+			if err != nil {
+				return err
+			}
+			rdr, err := s.client.DoGet(ctx, info.Endpoint[0].Ticket)
+			if err != nil {
+				return err
+			}
+			defer rdr.Release()
+			for rdr.Next() {
+			}
+			return rdr.Err()
+		}, "1"},
+		{"flight transaction", func() error {
+			tx, err := s.client.BeginTransaction(ctx)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecuteUpdate(ctx, "INSERT INTO "+table+" VALUES (1); INSERT INTO "+table+" VALUES (2)"); err != nil {
+				return err
+			}
+			return tx.Commit(ctx)
+		}, "2"},
+		{"prepared", func() error {
+			st, err := s.client.Prepare(ctx, "INSERT INTO "+table+" VALUES (1); INSERT INTO "+table+" VALUES (2)")
+			if err != nil {
+				return err
+			}
+			defer func() { _ = st.Close(ctx) }()
+			_, err = st.ExecuteUpdate(ctx)
+			return err
+		}, "2"},
+		{"script with its own transaction", func() error {
+			_, err := s.client.ExecuteUpdate(ctx, "BEGIN TRANSACTION; INSERT INTO "+table+" VALUES (1); COMMIT")
+			return err
+		}, "1"},
+	}
+	for _, tc := range cases {
+		s.Run(tc.name, func() {
+			_, err := s.client.ExecuteUpdate(ctx, "DROP TABLE IF EXISTS "+table)
+			s.Require().NoError(err)
+			_, err = s.client.ExecuteUpdate(ctx, "CREATE TABLE "+table+" (i INTEGER)")
+			s.Require().NoError(err)
+
+			s.Require().NoError(tc.run())
+			s.Equal(tc.want, count())
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Run
 // ---------------------------------------------------------------------------
