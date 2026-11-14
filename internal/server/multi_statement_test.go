@@ -389,10 +389,11 @@ func TestEmptyStatement(t *testing.T) {
 	}
 }
 
-// TestRejectClientExtensionsCoverage pins what the guard does today. The first
-// half is the guarantee. The second half documents a known open gap, not desired
-// behavior: scripts pass because classification only reaches a single statement.
-// If the maintainer closes the gap, this test is meant to change.
+// TestRejectClientExtensionsCoverage pins that REJECT_CLIENT_EXTENSIONS holds
+// for a LOAD/INSTALL anywhere in a script, not only for a lone statement: a
+// script is split and classified statement by statement on the guard's
+// isolated instance before any of it runs. This used to be a known gap — a
+// script classified as STATEMENT_TYPE_MULTI and passed wherever its LOAD sat.
 func TestRejectClientExtensionsCoverage(t *testing.T) {
 	ctx := context.Background()
 	client, verify := newMultiStatementClients(t, false, 4, func(cfg *config.Config) {
@@ -403,24 +404,36 @@ func TestRejectClientExtensionsCoverage(t *testing.T) {
 
 	for _, sql := range []string{
 		"LOAD json", "LOAD json;", "LOAD json; -- c", "/* c */ LOAD json", "load json", "INSTALL json", "INSTALL json;",
+		"UPDATE EXTENSIONS",
+		"LOAD json; SELECT 1",
+		"SELECT 1; LOAD json",
+		"INSERT INTO m VALUES (1); LOAD json",
+		"LOAD json; LOAD json",
+		"SELECT 1; INSTALL json",
+		"BEGIN; INSERT INTO m VALUES (1); LOAD json; COMMIT",
 	} {
 		_, err := client.ExecuteUpdate(ctx, sql)
 		require.Equal(t, codes.PermissionDenied, status.Code(err), "update %q: %v", sql, err)
 		_, err = queryString(ctx, client, sql)
 		require.Equal(t, codes.PermissionDenied, status.Code(err), "doget %q: %v", sql, err)
 	}
+	// Refused before anything ran: the INSERTs leading those scripts did not
+	// happen.
+	got, err := queryString(ctx, verify, "SELECT count(*) FROM m")
+	require.NoError(t, err)
+	require.Equal(t, "0", got)
 
-	// The known gap.
-	for _, sql := range []string{
-		"LOAD json; SELECT 1",
-		"SELECT 1; LOAD json",
-		"INSERT INTO m VALUES (1); LOAD json",
-		"LOAD json; LOAD json",
-		"SELECT 1; INSTALL json",
-	} {
-		_, err := client.ExecuteUpdate(ctx, sql)
-		require.NoError(t, err, "update %q", sql)
-	}
+	// The schema probe wraps client SQL in a subselect; SQL that closes it
+	// would make the probe a script. GetSchema refuses that too.
+	_, err = client.GetExecuteSchema(ctx, "SELECT 1) AS t; LOAD json; SELECT * FROM (SELECT 1")
+	require.Equal(t, codes.PermissionDenied, status.Code(err), "schema probe: %v", err)
+
+	// Scripts without an extension statement still run.
+	_, err = client.ExecuteUpdate(ctx, "INSERT INTO m VALUES (1); INSERT INTO m VALUES (2)")
+	require.NoError(t, err)
+	got, err = queryString(ctx, verify, "SELECT count(*) FROM m")
+	require.NoError(t, err)
+	require.Equal(t, "2", got)
 }
 
 // TestMultiStatementDoesNotDirtyPool: only the last statement used to be

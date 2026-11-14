@@ -191,7 +191,14 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	// from executing the statement: a trailing line comment would swallow the
 	// suffix, and `UPDATE … RETURNING x LIMIT 0` is a valid statement that
 	// performs the update.
-	rdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query))
+	probe := fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query)
+	if err := s.checkWrappedProbe(ctx, ac, probe); err != nil {
+		// Skip the probe, not the statement: DoGet/DoPut classify the
+		// client's own SQL before executing it and refuse it there.
+		span.AddEvent("prepared.schema_unavailable")
+		return flightsql.ActionCreatePreparedStatementResult{Handle: handle}, nil
+	}
+	rdr, err := ac.Arrow.QueryContext(ctx, probe)
 	if err != nil {
 		// Return handle without schema if schema detection fails. This covers
 		// statements that aren't queries (DML, DDL, bare BEGIN/COMMIT) —

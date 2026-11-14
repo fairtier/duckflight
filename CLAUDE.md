@@ -126,8 +126,10 @@ statement of multi-statement SQL but the last, so classification uses its plain
 `STATEMENT_TYPE_MULTI`: dirty, and no transaction intent, so a script's own
 BEGIN/COMMIT run as written. Two consequences: scripts aren't atomic, so a
 failure midway keeps what the earlier statements did in autocommit, and bound
-parameters re-run the leading statements once per row. And a script is exempt
-from `REJECT_CLIENT_EXTENSIONS`, which only sees a single statement's type.
+parameters re-run the leading statements once per row. Policy checks that
+must see inside a script (`REJECT_CLIENT_EXTENSIONS`, read-only sessions) use
+`internal/sqlguard`, which splits and classifies on its own isolated DuckDB
+instance instead of on the serving connection.
 
 **Prepared statements.** Query-string-based with bind parameters applied at
 execute time (`DoGetPreparedStatement` binds the last parameter row through
@@ -268,9 +270,9 @@ All via environment variables. See README.md for the full table. Key ones:
   change (`internal/engine/reconcile.go`). DuckDB temporary secrets and
   loaded extensions are instance-wide, so rotation reaches every pooled
   connection without a restart. Errors report a label, never the SQL text.
-- `REJECT_CLIENT_EXTENSIONS` — refuse a client-issued single `INSTALL`/`LOAD`
-  statement (both classify as `STATEMENT_TYPE_LOAD`); multi-statement scripts
-  are not covered
+- `REJECT_CLIENT_EXTENSIONS` — refuse a client-issued `INSTALL`/`LOAD`/`UPDATE
+  EXTENSIONS`, alone or anywhere in a multi-statement script (split by
+  `internal/sqlguard` before any of the script runs), and in a GetSchema probe
 - `TEMP_DIRECTORY` — DuckDB spill directory; without it an in-memory engine
   errors on larger-than-memory operations
 
