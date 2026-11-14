@@ -103,8 +103,12 @@ func New() (*Guard, error) {
 	return g, nil
 }
 
-// Close releases the private instances. Safe to call more than once.
+// Close releases the private instances. Safe to call more than once, and on
+// a nil Guard.
 func (g *Guard) Close() {
+	if g == nil {
+		return
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.closeLocked()

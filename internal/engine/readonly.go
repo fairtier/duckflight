@@ -16,6 +16,10 @@ import (
 // boot SQL runs. Persistent secrets would be read from the server user's home
 // directory; the read-only instance gets exactly the secrets boot SQL creates
 // and nothing else. Community extensions are never needed there.
+// ReadOnlyPoolLabel is the pool=… metric attribute of the read-only
+// instance's pool and session manager.
+const ReadOnlyPoolLabel = "read_only"
+
 const readOnlyDSN = "?allow_persistent_secrets=false&allow_community_extensions=false"
 
 // NewReadOnlyEngine creates the separate in-memory DuckDB instance that serves
@@ -81,7 +85,7 @@ func NewReadOnlyEngine(cfg *config.Config) (*Engine, error) {
 	if poolSize <= 0 {
 		poolSize = cfg.PoolSize
 	}
-	return newEngine(connector, cfg, poolSize)
+	return newEngine(connector, cfg, poolSize, ReadOnlyPoolLabel)
 }
 
 // readOnlyAllowedDirectories resolves the configured allowlist, defaulting to

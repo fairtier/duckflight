@@ -59,11 +59,11 @@ func NewEngine(cfg *config.Config) (*Engine, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create DuckDB connector: %w", err)
 	}
-	return newEngine(connector, cfg, cfg.PoolSize)
+	return newEngine(connector, cfg, cfg.PoolSize, "")
 }
 
-func newEngine(connector *duckdb.Connector, cfg *config.Config, poolSize int) (*Engine, error) {
-	pool, err := NewArrowPool(connector, poolSize)
+func newEngine(connector *duckdb.Connector, cfg *config.Config, poolSize int, label string) (*Engine, error) {
+	pool, err := NewLabeledArrowPool(connector, poolSize, label)
 	if err != nil {
 		_ = connector.Close()
 		return nil, fmt.Errorf("failed to create arrow pool: %w", err)

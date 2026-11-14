@@ -6,6 +6,7 @@ import (
 	"context"
 	"log/slog"
 
+	"github.com/fairtier/duckflight/internal/engine"
 	"github.com/fairtier/duckflight/internal/otelutil"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -69,7 +70,7 @@ func buildSessionMetrics(meter metric.Meter, m *Manager) (*sessionMetrics, error
 	}
 
 	sm.reg, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		o.ObserveInt64(active, int64(m.Count()))
+		o.ObserveInt64(active, int64(m.Count()), engine.MetricLabel(m.pool.Label()))
 		return nil
 	}, active)
 	if err != nil {
@@ -78,8 +79,8 @@ func buildSessionMetrics(meter metric.Meter, m *Manager) (*sessionMetrics, error
 	return sm, nil
 }
 
-func (sm *sessionMetrics) recordEvicted(reason string) {
-	sm.evicted.Add(context.Background(), 1, metric.WithAttributes(attribute.String("reason", reason)))
+func (sm *sessionMetrics) recordEvicted(reason, label string) {
+	sm.evicted.Add(context.Background(), 1, engine.MetricLabel(label, attribute.String("reason", reason)))
 }
 
 // stop drops the gauge callback so a shut-down manager stops being polled.

@@ -155,10 +155,10 @@ func genHandle() []byte {
 	return []byte(hex.EncodeToString(b))
 }
 
-// acquirePoolConn acquires a connection from the pool, wrapping errors with
+// acquirePoolConn acquires a connection from p's pool, wrapping errors with
 // the appropriate gRPC status code.
-func (s *DuckFlightSQLServer) acquirePoolConn(ctx context.Context) (*engine.ArrowConn, error) {
-	ac, err := s.engine.Pool.Acquire(ctx)
+func (s *DuckFlightSQLServer) acquirePoolConn(ctx context.Context, p *plane) (*engine.ArrowConn, error) {
+	ac, err := p.engine.Pool.Acquire(ctx)
 	if err != nil {
 		return nil, status.Errorf(codes.ResourceExhausted, "pool acquire: %s", err)
 	}
@@ -166,7 +166,9 @@ func (s *DuckFlightSQLServer) acquirePoolConn(ctx context.Context) (*engine.Arro
 }
 
 // acquireConn returns a usable [engine.ArrowConn] and a release function that
-// callers MUST invoke when done. Routing precedence:
+// callers MUST invoke when done. The plane — main or read-only instance — is
+// decided by the request's identity first ([DuckFlightSQLServer.planeFor]);
+// within it, routing precedence is:
 //
 //  1. txnID set      → the txn's pinned conn (held by the open Flight txn).
 //     The session lock (if any) is held until release().
@@ -182,6 +184,11 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 	// its open transaction went missing.
 	reqSpan := trace.SpanFromContext(ctx)
 
+	p, err := s.planeFor(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	if txnID != "" {
 		reqSpan.SetAttributes(
 			attribute.String(attrConnSource, connSourceTransaction),
@@ -190,6 +197,13 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 		val, ok := s.openTransactions.Load(txnID)
 		if !ok {
 			return nil, nil, status.Error(codes.InvalidArgument, "invalid transaction handle")
+		}
+		// A transaction lives on the plane that began it. A read-only
+		// request must not reach a read-write transaction's connection
+		// (and the reverse would run unchecked SQL on the read-only one).
+		if val.(*txnState).plane != p {
+			return nil, nil, status.Error(codes.PermissionDenied,
+				"transaction belongs to a session of a different access mode")
 		}
 		// Locks either the session (for session-bound transactions) or the
 		// transaction's own mutex, so two RPCs carrying the same transaction
@@ -202,7 +216,7 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 			attribute.String(attrConnSource, connSourceSession),
 			attribute.String(attrSessionID, sid),
 		)
-		sess, release, err := s.sessions.Acquire(ctx, sid)
+		sess, release, err := p.sessions.Acquire(ctx, sid)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -214,11 +228,11 @@ func (s *DuckFlightSQLServer) acquireConn(ctx context.Context, txnID string) (*e
 	ctx, span := s.tracer.Start(ctx, "pool.acquire")
 	defer span.End()
 
-	ac, err := s.acquirePoolConn(ctx)
+	ac, err := s.acquirePoolConn(ctx, p)
 	if err != nil {
 		return nil, nil, otelutil.Failed(span, err)
 	}
-	return ac, func() { s.engine.Pool.Release(ac) }, nil
+	return ac, func() { p.engine.Pool.Release(ac) }, nil
 }
 
 // GetFlightInfoStatement stores the query for later execution by DoGetStatement.
@@ -230,6 +244,12 @@ func (s *DuckFlightSQLServer) GetFlightInfoStatement(
 ) (*flight.FlightInfo, error) {
 	query := cmd.GetQuery()
 	txnID := string(cmd.GetTransactionId())
+
+	// Refused here already so the client's Execute fails, not only its
+	// DoGet; DoGet checks again, for the caller that redeems the ticket.
+	if err := s.checkReadOnlySQL(ctx, query); err != nil {
+		return nil, err
+	}
 
 	handle := genHandle()
 	s.tracker.Register(string(handle), query, txnID)
@@ -273,6 +293,12 @@ func (s *DuckFlightSQLServer) DoGetStatement(
 
 	reqSpan := trace.SpanFromContext(ctx)
 	reqSpan.SetAttributes(attribute.String(attrStatementHandle, handle))
+
+	if err := s.checkReadOnlySQL(ctx, query); err != nil {
+		s.tracker.Complete(handle)
+		queryCountAdd(ctx, "error")
+		return nil, nil, err
+	}
 
 	ac, release, err := s.acquireConn(ctx, txnID)
 	if err != nil {
@@ -431,6 +457,13 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
 	cmd flightsql.StatementUpdate,
 ) (int64, error) {
 	txnID := string(cmd.GetTransactionId())
+	query := cmd.GetQuery()
+
+	// A read-only caller may still send a SELECT through the update RPC
+	// (some clients route everything there); the policy decides, not the RPC.
+	if err := s.checkReadOnlySQL(ctx, query); err != nil {
+		return 0, err
+	}
 
 	ac, release, err := s.acquireConn(ctx, txnID)
 	if err != nil {
@@ -438,7 +471,6 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementUpdate(
 	}
 	defer release()
 
-	query := cmd.GetQuery()
 	skip, err := s.shouldSkipTxnControl(ctx, ac, query)
 	if err != nil {
 		return 0, err
@@ -473,6 +505,12 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 	desc *flight.FlightDescriptor,
 ) (*flight.SchemaResult, error) {
 	query := cmd.GetQuery()
+	// What the probe runs is the wrapped text, so that is what the policy
+	// sees: SQL crafted to close the subselect turns the probe into a script.
+	probe := fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query)
+	if err := s.checkReadOnlySQL(ctx, probe); err != nil {
+		return nil, err
+	}
 
 	// Use the session's conn if there is one so that session-local state
 	// (search_path, temp tables, attached databases) is honored during the
@@ -491,7 +529,6 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 	defer span.End()
 
 	// Execute with LIMIT 0 to get schema without results.
-	probe := fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query)
 	if err := s.checkWrappedProbe(ctx, ac, probe); err != nil {
 		return nil, otelutil.Failed(span, err)
 	}
@@ -551,6 +588,12 @@ func (s *DuckFlightSQLServer) PollFlightInfoStatement(
 ) (*flight.PollInfo, error) {
 	query := cmd.GetQuery()
 	txnID := string(cmd.GetTransactionId())
+
+	// Refused here already so the client's Execute fails, not only its
+	// DoGet; DoGet checks again, for the caller that redeems the ticket.
+	if err := s.checkReadOnlySQL(ctx, query); err != nil {
+		return nil, err
+	}
 
 	handle := genHandle()
 	s.tracker.Register(string(handle), query, txnID)
@@ -641,6 +684,9 @@ func (s *DuckFlightSQLServer) DoPutCommandStatementIngest(
 	cmd flightsql.StatementIngest,
 	rdr flight.MessageReader,
 ) (ingested int64, err error) {
+	if err := refuseReadOnly(ctx, "bulk ingestion"); err != nil {
+		return 0, err
+	}
 	table := cmd.GetTable()
 	if table == "" {
 		return 0, status.Error(codes.InvalidArgument, "table name is required for ingestion")

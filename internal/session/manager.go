@@ -151,7 +151,7 @@ func (m *Manager) Acquire(ctx context.Context, sid string) (*Session, func(), er
 					"no pool connection available for new session: %s", err))
 			}
 			sess.conn = ac
-			m.metrics.created.Add(ctx, 1)
+			m.metrics.created.Add(ctx, 1, engine.MetricLabel(m.pool.Label()))
 		}
 		span.SetAttributes(attribute.Bool("session.new", fresh))
 
@@ -256,7 +256,7 @@ func (m *Manager) evict(sess *Session, reason string) *engine.ArrowConn {
 	conn := sess.conn
 	sess.conn = nil
 	sess.evicted = true
-	m.metrics.recordEvicted(reason)
+	m.metrics.recordEvicted(reason, m.pool.Label())
 	return conn
 }
 

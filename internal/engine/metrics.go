@@ -87,8 +87,8 @@ func buildPoolMetrics(meter metric.Meter, p *ArrowPool) (*poolMetrics, error) {
 	}
 
 	pm.reg, err = meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
-		o.ObserveInt64(idle, int64(p.Len()))
-		o.ObserveInt64(size, int64(p.Cap()))
+		o.ObserveInt64(idle, int64(p.Len()), MetricLabel(p.label))
+		o.ObserveInt64(size, int64(p.Cap()), MetricLabel(p.label))
 		return nil
 	}, idle, size)
 	if err != nil {
@@ -97,8 +97,18 @@ func buildPoolMetrics(meter metric.Meter, p *ArrowPool) (*poolMetrics, error) {
 	return pm, nil
 }
 
-func (pm *poolMetrics) recordRecycled(reason string) {
-	pm.recycled.Add(context.Background(), 1, metric.WithAttributes(attribute.String("reason", reason)))
+func (pm *poolMetrics) recordRecycled(reason, label string) {
+	pm.recycled.Add(context.Background(), 1, MetricLabel(label, attribute.String("reason", reason)))
+}
+
+// MetricLabel builds the attribute option for a pool's (or its session
+// manager's) instruments: pool=<label> when the label is set, nothing for the
+// main pool, so the series a single-pool deployment exports are unchanged.
+func MetricLabel(label string, extra ...attribute.KeyValue) metric.MeasurementOption {
+	if label != "" {
+		extra = append(extra, attribute.String("pool", label))
+	}
+	return metric.WithAttributes(extra...)
 }
 
 // stop drops the gauge callback so a closed pool stops being polled.

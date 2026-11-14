@@ -30,6 +30,10 @@ import (
 // silently mint a fresh, transaction-less connection and let a COMMIT report
 // success without committing anything.
 type txnState struct {
+	// plane is the instance the transaction runs on. Every later RPC on it
+	// must come from a request routed to the same plane, and an anonymous
+	// transaction's connection goes back to this plane's pool.
+	plane     *plane
 	sess      *session.Session
 	createdAt time.Time
 	lastUsed  atomic.Int64 // unix nanos
@@ -41,8 +45,8 @@ type txnState struct {
 	conn *engine.ArrowConn
 }
 
-func newTxnState() *txnState {
-	ts := &txnState{createdAt: time.Now()}
+func newTxnState(p *plane) *txnState {
+	ts := &txnState{plane: p, createdAt: time.Now()}
 	ts.touch()
 	return ts
 }
@@ -109,6 +113,10 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 	defer span.End()
 
 	sid := auth.SessionIDFromContext(ctx)
+	p, err := s.planeFor(ctx)
+	if err != nil {
+		return nil, otelutil.Failed(span, err)
+	}
 
 	var (
 		ac      *engine.ArrowConn
@@ -120,18 +128,18 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 			attribute.String(attrConnSource, connSourceSession),
 			attribute.String(attrSessionID, sid),
 		)
-		sw, rel, err := s.sessions.Acquire(ctx, sid)
+		sw, rel, err := p.sessions.Acquire(ctx, sid)
 		if err != nil {
 			return nil, otelutil.Failed(span, err)
 		}
 		sess, ac, release = sw, sw.Conn(), rel
 	} else {
 		span.SetAttributes(attribute.String(attrConnSource, connSourcePool))
-		c, err := s.acquirePoolConn(ctx)
+		c, err := s.acquirePoolConn(ctx, p)
 		if err != nil {
 			return nil, otelutil.Failed(span, err)
 		}
-		ac, release = c, func() { s.engine.Pool.Release(c) }
+		ac, release = c, func() { p.engine.Pool.Release(c) }
 	}
 
 	// Pre-flight: avoid issuing BEGIN if DuckDB is already in an explicit
@@ -174,7 +182,7 @@ func (s *DuckFlightSQLServer) BeginTransaction(
 		span.AddEvent("transaction.attached_to_existing")
 	}
 
-	state := newTxnState()
+	state := newTxnState(p)
 	if sess != nil {
 		state.sess = sess
 		// Drop the per-RPC session lock; future RPCs on this txn re-acquire it.
@@ -229,6 +237,14 @@ func (s *DuckFlightSQLServer) EndTransaction(
 		return status.Error(codes.InvalidArgument, "transaction id not found")
 	}
 	ts := val.(*txnState)
+	if p, err := s.planeFor(ctx); err != nil || p != ts.plane {
+		s.openTransactions.Store(handle, ts)
+		if err == nil {
+			err = status.Error(codes.PermissionDenied,
+				"transaction belongs to a session of a different access mode")
+		}
+		return otelutil.Failed(span, err)
+	}
 
 	ac, release, err := ts.acquire(ctx)
 	if err != nil {
@@ -247,7 +263,7 @@ func (s *DuckFlightSQLServer) EndTransaction(
 		ts.conn = nil
 		release()
 		if conn != nil {
-			s.engine.Pool.Release(conn)
+			ts.plane.engine.Pool.Release(conn)
 		}
 	}()
 

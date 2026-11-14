@@ -4,6 +4,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -40,8 +42,10 @@ const (
 type DuckFlightSQLServer struct {
 	flightsql.BaseServer
 
-	engine           *engine.Engine
-	sessions         *session.Manager
+	// rw is the main DuckDB instance; ro the hardened read-only one, nil
+	// unless read-only sessions are enabled. See [plane].
+	rw               *plane
+	ro               *plane
 	preparedStmts    sync.Map // handle string -> *preparedStatement
 	openTransactions sync.Map // handle string -> *txnState
 	queryTimeout     time.Duration
@@ -58,6 +62,10 @@ type DuckFlightSQLServer struct {
 	// guard classifies client SQL on its own isolated DuckDB instance. Only
 	// opened when a policy needs it; nil otherwise.
 	guard *sqlguard.Guard
+	// roInfo holds the SqlInfo answered to read-only callers, which differs
+	// from the main registration in what the session can do (read-only, no
+	// DDL, no bulk ingestion). See [DuckFlightSQLServer.DoGetSqlInfo].
+	roInfo flightsql.BaseServer
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
@@ -90,18 +98,28 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 	ticketTTL := max(2*timeout, minTicketTTL)
 
 	var guard *sqlguard.Guard
-	if cfg.RejectClientExtensions {
+	if cfg.RejectClientExtensions || cfg.ReadOnly != nil {
 		if guard, err = sqlguard.New(); err != nil {
 			_ = eng.Close()
 			return nil, err
 		}
 	}
 
+	// Booted after the main instance, which creates lake."default" for the
+	// read-only instance's USE to find.
+	var roEng *engine.Engine
+	if cfg.ReadOnly != nil {
+		if roEng, err = engine.NewReadOnlyEngine(cfg); err != nil {
+			guard.Close()
+			_ = eng.Close()
+			return nil, fmt.Errorf("read-only engine: %w", err)
+		}
+	}
+
 	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
 
 	srv := &DuckFlightSQLServer{
-		engine:                 eng,
-		sessions:               session.NewManager(eng.Pool, resourceTTL),
+		rw:                     &plane{engine: eng, sessions: session.NewManager(eng.Pool, resourceTTL)},
 		queryTimeout:           timeout,
 		maxResultBytes:         cfg.MaxResultBytes,
 		tracker:                &queryTracker{ttl: ticketTTL},
@@ -111,13 +129,23 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 		rejectClientExtensions: cfg.RejectClientExtensions,
 		guard:                  guard,
 	}
+	if roEng != nil {
+		srv.ro = &plane{engine: roEng, sessions: session.NewManager(roEng.Pool, resourceTTL), readOnly: true}
+	}
 	srv.gauges = registerServerGauges(srv)
 	srv.Alloc = memory.DefaultAllocator
+	srv.roInfo.Alloc = memory.DefaultAllocator
 	srv.tracker.StartCleanup(cleanupCtx)
 	srv.startResourceCleanup(cleanupCtx)
-	srv.sessions.StartReaper(cleanupCtx)
-	if cfg.ReconcileSQLPath != "" {
-		engine.NewReconciler(eng, cfg.ReconcileSQLPath).Start(cleanupCtx)
+	for _, p := range srv.planes() {
+		p.sessions.StartReaper(cleanupCtx)
+		if cfg.ReconcileSQLPath != "" {
+			// Secrets are per instance, so rotation must reach both. On the
+			// read-only instance, statements that need external access
+			// (INSTALL/LOAD, ATTACH of a file) fail after its lockdown and are
+			// logged by label like any other reconcile error.
+			engine.NewReconciler(p.engine, cfg.ReconcileSQLPath).Start(cleanupCtx)
+		}
 	}
 	registerSqlInfo(srv)
 
@@ -125,16 +153,46 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 	return srv, nil
 }
 
+// planes returns the server's planes, the main one first.
+func (s *DuckFlightSQLServer) planes() []*plane {
+	if s.ro == nil {
+		return []*plane{s.rw}
+	}
+	return []*plane{s.rw, s.ro}
+}
+
+// DoGetSqlInfo answers from the read-only registration for a read-only
+// caller, so SqlInfoFlightSqlServerReadOnly (and DDL/ingestion support)
+// describe the session the caller actually has.
+func (s *DuckFlightSQLServer) DoGetSqlInfo(ctx context.Context, cmd flightsql.GetSqlInfo) (*arrow.Schema, <-chan flight.StreamChunk, error) {
+	if auth.ReadOnlyFromContext(ctx) {
+		return s.roInfo.DoGetSqlInfo(ctx, cmd)
+	}
+	return s.BaseServer.DoGetSqlInfo(ctx, cmd)
+}
+
 func registerSqlInfo(srv *DuckFlightSQLServer) {
+	readOnlyOverrides := map[flightsql.SqlInfo]any{
+		flightsql.SqlInfoFlightSqlServerReadOnly:                    true,
+		flightsql.SqlInfoDDLCatalog:                                 false,
+		flightsql.SqlInfoDDLSchema:                                  false,
+		flightsql.SqlInfoDDLTable:                                   false,
+		flightsql.SqlInfoFlightSqlServerBulkIngestion:               false,
+		flightsql.SqlInfoFlightSqlServerIngestTransactionsSupported: false,
+	}
 	reg := func(id flightsql.SqlInfo, val any) {
 		_ = srv.RegisterSqlInfo(id, val)
+		if ro, ok := readOnlyOverrides[id]; ok {
+			val = ro
+		}
+		_ = srv.roInfo.RegisterSqlInfo(id, val)
 	}
 
 	// Server identity. The version string is prefixed with "duckdb " because some
 	// clients (e.g. gizmosql SQLAlchemy dialect) gate behavior on the underlying
 	// SQL engine vendor reported via SqlInfoFlightSqlServerVersion.
 	reg(flightsql.SqlInfoFlightSqlServerName, "DuckFlight")
-	reg(flightsql.SqlInfoFlightSqlServerVersion, "duckdb "+fetchDuckDBVersion(srv.engine))
+	reg(flightsql.SqlInfoFlightSqlServerVersion, "duckdb "+fetchDuckDBVersion(srv.rw.engine))
 	reg(flightsql.SqlInfoFlightSqlServerArrowVersion, arrow.PkgVersion)
 	reg(flightsql.SqlInfoFlightSqlServerReadOnly, false)
 	reg(flightsql.SqlInfoFlightSqlServerSql, true)
@@ -168,7 +226,7 @@ func registerSqlInfo(srv *DuckFlightSQLServer) {
 
 	reg(flightsql.SqlInfoSupportsConvert, buildConvertMap())
 
-	reg(flightsql.SqlInfoKeywords, fetchKeywords(srv.engine))
+	reg(flightsql.SqlInfoKeywords, fetchKeywords(srv.rw.engine))
 	reg(flightsql.SqlInfoNumericFunctions, []string{})
 	reg(flightsql.SqlInfoStringFunctions, []string{})
 	reg(flightsql.SqlInfoSystemFunctions, []string{})
@@ -323,8 +381,12 @@ func fetchKeywords(eng *engine.Engine) []string {
 // CloseSession releases the DuckDB connection pinned to the caller's session
 // (if any) back to the pool. Idempotent — calling on an unknown sid is a no-op.
 func (s *DuckFlightSQLServer) CloseSession(ctx context.Context, _ *flight.CloseSessionRequest) (*flight.CloseSessionResult, error) {
+	// A read-only request on a server without read-only sessions has no
+	// session to close; that is not an error here.
 	if sid := auth.SessionIDFromContext(ctx); sid != "" {
-		s.sessions.Close(sid)
+		if p, err := s.planeFor(ctx); err == nil {
+			p.sessions.Close(sid)
+		}
 	}
 	return &flight.CloseSessionResult{Status: flight.CloseSessionResultClosed}, nil
 }
@@ -394,7 +456,7 @@ func (s *DuckFlightSQLServer) reapResources(now time.Time) {
 		if conn != nil {
 			// Release rolls back whatever the client left open and recycles
 			// the connection rather than pooling its leftover state.
-			s.engine.Pool.Release(conn)
+			ts.plane.engine.Pool.Release(conn)
 		}
 		txnCountAdd(context.Background(), "reaped")
 		slog.Warn("reaped stale transaction", "handle", key, "idle", idle)
@@ -410,8 +472,12 @@ func (s *DuckFlightSQLServer) Close() error {
 	s.closeOnce.Do(func() {
 		s.gauges.stop()
 		s.stopCleanup()
-		s.sessions.CloseAll()
-		err = s.engine.Close()
+		var errs []error
+		for _, p := range s.planes() {
+			p.sessions.CloseAll()
+			errs = append(errs, p.engine.Close())
+		}
+		err = errors.Join(errs...)
 		if s.guard != nil {
 			s.guard.Close()
 		}
@@ -421,7 +487,17 @@ func (s *DuckFlightSQLServer) Close() error {
 
 // Engine returns the underlying engine for direct access.
 func (s *DuckFlightSQLServer) Engine() *engine.Engine {
-	return s.engine
+	return s.rw.engine
+}
+
+// ReadOnlyEngine returns the read-only instance's engine, or nil when
+// read-only sessions are disabled. For tests that probe the instance below
+// the statement policy.
+func (s *DuckFlightSQLServer) ReadOnlyEngine() *engine.Engine {
+	if s.ro == nil {
+		return nil
+	}
+	return s.ro.engine
 }
 
 // OpenTransactionCount returns the number of currently open transactions.

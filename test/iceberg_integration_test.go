@@ -18,6 +18,7 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/flight"
 	"github.com/apache/arrow-go/v18/arrow/flight/flightsql"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/config"
 	duckserver "github.com/fairtier/duckflight/internal/server"
 	"github.com/stretchr/testify/suite"
@@ -49,8 +50,14 @@ const (
 type IcebergSuite struct {
 	suite.Suite
 
-	server      flight.Server
-	client      *flightsql.Client
+	server flight.Server
+	client *flightsql.Client
+	srv    *duckserver.DuckFlightSQLServer
+	// authServer serves the same DuckFlight server behind the auth
+	// middleware, so the read-only credential can be exercised against the
+	// lake. roClient presents the read-only token.
+	authServer  flight.Server
+	roClient    *flightsql.Client
 	mem         *memory.CheckedAllocator
 	network     *testcontainers.DockerNetwork
 	postgresC   *postgres.PostgresContainer
@@ -69,7 +76,8 @@ func (s *IcebergSuite) SetupSuite() {
 	s.network = nw
 
 	// 2. PostgreSQL (via module)
-	s.postgresC, err = postgres.Run(ctx,
+	s.postgresC, err = postgres.Run(
+		ctx,
 		"postgres:17",
 		postgres.WithDatabase(pgDB),
 		postgres.WithUsername(pgUser),
@@ -87,7 +95,8 @@ func (s *IcebergSuite) SetupSuite() {
 	// `quay.io/minio/mc` followed, so both images failed every test in this
 	// suite with "unauthorized". Pinned, because an unpinned tag is how a
 	// test starts failing without anything in this repo changing.
-	s.minioC, err = minio.Run(ctx,
+	s.minioC, err = minio.Run(
+		ctx,
 		siloImage,
 		minio.WithUsername(minioUser),
 		minio.WithPassword(minioPassword),
@@ -206,8 +215,15 @@ func (s *IcebergSuite) SetupSuite() {
 		S3SecretKey: minioPassword,
 		S3Region:    "local-01",
 		S3URLStyle:  "path",
+		// Read-only sessions on, confined to the warehouse bucket — the
+		// narrowed allowlist the README recommends over the s3:// default.
+		ReadOnly: &config.ReadOnlyConfig{
+			PoolSize:           2,
+			AllowedDirectories: []string{"s3://" + minioBucket + "/"},
+		},
 	})
 	s.Require().NoError(err)
+	s.srv = srv
 
 	s.server = flight.NewServerWithMiddleware(nil)
 	s.server.RegisterFlightService(flightsql.NewFlightServer(srv))
@@ -221,6 +237,23 @@ func (s *IcebergSuite) SetupSuite() {
 	)
 	s.Require().NoError(err)
 	s.client = cl
+
+	authMW, err := auth.Middleware(auth.Config{
+		StaticTokens:         []string{rwTestToken},
+		ReadOnlyStaticTokens: []string{roTestToken},
+	})
+	s.Require().NoError(err)
+	s.authServer = flight.NewServerWithMiddleware([]flight.ServerMiddleware{*authMW})
+	s.authServer.RegisterFlightService(flightsql.NewFlightServer(srv))
+	s.Require().NoError(s.authServer.Init("localhost:0"))
+	go func() { _ = s.authServer.Serve() }()
+	s.roClient, err = flightsql.NewClient(
+		s.authServer.Addr().String(),
+		nil, nil,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithPerRPCCredentials(staticToken(roTestToken)),
+	)
+	s.Require().NoError(err)
 }
 
 func (s *IcebergSuite) TearDownSuite() {
@@ -229,8 +262,17 @@ func (s *IcebergSuite) TearDownSuite() {
 	if s.client != nil {
 		_ = s.client.Close()
 	}
+	if s.roClient != nil {
+		_ = s.roClient.Close()
+	}
+	if s.authServer != nil {
+		s.authServer.Shutdown()
+	}
 	if s.server != nil {
 		s.server.Shutdown()
+	}
+	if s.srv != nil {
+		_ = s.srv.Close()
 	}
 	if s.lakekeeperC != nil {
 		_ = s.lakekeeperC.Terminate(ctx)

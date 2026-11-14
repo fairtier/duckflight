@@ -136,6 +136,31 @@ func run() error {
 		TempDirectory:          os.Getenv("TEMP_DIRECTORY"),
 	}
 
+	// Read-only sessions: on when a read-only credential is configured, or
+	// explicitly (for callers that only self-restrict with the header).
+	roTokens := parseCSV(os.Getenv("AUTH_READONLY_TOKENS"))
+	roUsers := parseCSV(os.Getenv("AUTH_READONLY_USERS"))
+	if len(roTokens) > 0 || len(roUsers) > 0 || envBool("READ_ONLY_SESSIONS") {
+		roPoolSize, err := envInt("READ_ONLY_POOL_SIZE", 0)
+		if err != nil {
+			slog.Error("invalid configuration", slog.String("error", err.Error()))
+			return err
+		}
+		ro := &config.ReadOnlyConfig{
+			PoolSize:    roPoolSize,
+			MemoryLimit: os.Getenv("READ_ONLY_MEMORY_LIMIT"),
+		}
+		// Unset keeps the default (s3:// with Iceberg); set-but-empty means
+		// no allowlist at all, so the instance can open no file or URL.
+		if v, ok := os.LookupEnv("READ_ONLY_ALLOWED_DIRECTORIES"); ok {
+			ro.AllowedDirectories = parseCSV(v)
+			if ro.AllowedDirectories == nil {
+				ro.AllowedDirectories = []string{}
+			}
+		}
+		cfg.ReadOnly = ro
+	}
+
 	srv, err := duckserver.New(cfg)
 	if err != nil {
 		slog.Error("failed to create server", slog.String("error", err.Error()))
@@ -153,10 +178,12 @@ func run() error {
 		return err
 	}
 	authCfg := auth.Config{
-		Users:        users,
-		JWTSecret:    []byte(os.Getenv("AUTH_JWT_SECRET")),
-		JWTTTL:       jwtTTL,
-		StaticTokens: parseCSV(os.Getenv("AUTH_TOKENS")),
+		Users:                users,
+		JWTSecret:            []byte(os.Getenv("AUTH_JWT_SECRET")),
+		JWTTTL:               jwtTTL,
+		StaticTokens:         parseCSV(os.Getenv("AUTH_TOKENS")),
+		ReadOnlyStaticTokens: roTokens,
+		ReadOnlyUsers:        roUsers,
 	}
 	if iss := os.Getenv("OIDC_ISSUER"); iss != "" {
 		v, err := auth.NewOIDCVerifier(ctx, iss, os.Getenv("OIDC_AUDIENCE"))
@@ -259,8 +286,12 @@ func run() error {
 	// never something you have to infer from a missing log entry.
 	if authMW == nil {
 		slog.Warn("AUTH DISABLED — every network peer can execute arbitrary SQL; set AUTH_USERS, AUTH_TOKENS or OIDC_ISSUER")
+		if cfg.ReadOnly != nil {
+			slog.Warn("READ_ONLY_SESSIONS is set but auth is disabled; no request can be read-only without a credential")
+		}
 	} else {
-		slog.Info("auth enabled", slog.String("backends", strings.Join(authCfg.Backends(), ",")))
+		slog.Info("auth enabled", slog.String("backends", strings.Join(authCfg.Backends(), ",")),
+			slog.Bool("read_only_sessions", cfg.ReadOnly != nil))
 		if !tlsEnabled {
 			slog.Warn("auth is enabled but TLS is not; credentials and bearer tokens cross the network in cleartext")
 		}
