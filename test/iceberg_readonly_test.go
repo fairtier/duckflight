@@ -4,6 +4,8 @@ package duckflight_test
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -192,3 +194,32 @@ func (s *IcebergSuite) TestIcebergReadOnly_EngineBackstop() {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// TestIcebergReadOnly_SecretRotation covers RECONCILE_SQL_PATH's job on the
+// read-only instance: a secret replaced after the lockdown takes effect there
+// (httpfs was loaded before it, so an S3 secret can still be created).
+func (s *IcebergSuite) TestIcebergReadOnly_SecretRotation() {
+	ctx := context.Background()
+	_, err := s.client.ExecuteUpdate(ctx, "DROP TABLE IF EXISTS lake.default.ro_rot")
+	s.Require().NoError(err)
+	_, err = s.client.ExecuteUpdate(ctx, "CREATE TABLE lake.default.ro_rot AS SELECT 1 AS i")
+	s.Require().NoError(err)
+
+	ins, err := s.minioC.Inspect(ctx)
+	s.Require().NoError(err)
+	endpoint := net.JoinHostPort(ins.NetworkSettings.Networks[s.network.Name].IPAddress.String(), "9000")
+	secret := func(key string) string {
+		return fmt.Sprintf(`CREATE OR REPLACE SECRET s3_secret (TYPE s3, KEY_ID '%s', SECRET '%s',
+			ENDPOINT '%s', REGION 'local-01', URL_STYLE 'path', USE_SSL false)`, minioUser, key, endpoint)
+	}
+	eng := s.srv.ReadOnlyEngine()
+
+	s.Require().NoError(eng.ExecSQL(ctx, "rotate to a wrong key", secret("not-the-password")))
+	_, err = s.query(s.roClient, "SELECT count(*) FROM lake.default.ro_rot")
+	s.Require().Error(err, "a wrong S3 key must break reads: rotation reached the instance")
+
+	s.Require().NoError(eng.ExecSQL(ctx, "rotate back", secret(minioPassword)))
+	got, err := s.query(s.roClient, "SELECT count(*) FROM lake.default.ro_rot")
+	s.Require().NoError(err)
+	s.Equal("1", got)
+}
