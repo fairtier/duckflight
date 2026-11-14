@@ -19,6 +19,7 @@ import (
 	"github.com/fairtier/duckflight/internal/auth"
 	"github.com/fairtier/duckflight/internal/engine"
 	"github.com/fairtier/duckflight/internal/otelutil"
+	"github.com/fairtier/duckflight/internal/sqlguard"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"google.golang.org/grpc/codes"
@@ -65,21 +66,13 @@ func duckDBToGRPCCode(err error) codes.Code {
 // An error here must not be swallowed: executing a BEGIN we failed to check
 // recreates exactly the BEGIN-in-BEGIN abort this exists to prevent.
 //
-// When RejectClientExtensions is configured, the same classification pass also
-// refuses a single INSTALL or LOAD statement (both surface as
-// STATEMENT_TYPE_LOAD in DuckDB's parser). That is all it covers: a
-// multi-statement script classifies as STATEMENT_TYPE_MULTI and passes wherever
-// the LOAD sits in it, so the setting does not make extensions operator-only.
-// TestRejectClientExtensionsCoverage pins this known gap. Ingest builds its own
-// INSERT server-side and needs no check. GetSchemaStatement wraps the query in a
-// subselect where a lone LOAD
-// cannot parse, though SQL crafted to close that subselect isn't
-// covered either.
+// When RejectClientExtensions is configured, the same pass refuses any
+// statement that installs, loads or updates an extension — see
+// [DuckFlightSQLServer.rejectExtensionStatements].
 func (s *DuckFlightSQLServer) shouldSkipTxnControl(ctx context.Context, ac *engine.ArrowConn, query string) (bool, error) {
 	intent, stmtType := ac.ClassifyStatement(ctx, query)
-	if s.rejectClientExtensions && stmtType == duckdb.STATEMENT_TYPE_LOAD {
-		return false, status.Error(codes.PermissionDenied,
-			"INSTALL/LOAD statements are managed by the server and cannot be issued by clients")
+	if err := s.rejectExtensionStatements(query, stmtType); err != nil {
+		return false, err
 	}
 	if intent == engine.TxnIntentNone {
 		return false, nil
@@ -95,6 +88,65 @@ func (s *DuckFlightSQLServer) shouldSkipTxnControl(ctx context.Context, ac *engi
 		return !inTxn, nil // COMMIT/ROLLBACK outside a txn → skip
 	}
 	return false, nil
+}
+
+// errClientExtensions is the refusal for a client-issued INSTALL/LOAD.
+var errClientExtensions = status.Error(codes.PermissionDenied,
+	"INSTALL/LOAD statements are managed by the server and cannot be issued by clients")
+
+// rejectExtensionStatements enforces REJECT_CLIENT_EXTENSIONS on query, whose
+// statement type the serving connection already reported as stmtType.
+//
+// A single INSTALL or LOAD classifies as STATEMENT_TYPE_LOAD and is refused on
+// that alone. Everything else that could hide one — a multi-statement script,
+// and the statement types that aren't plain reads or DML (UPDATE EXTENSIONS
+// has no constant in duckdb-go) — is split and classified statement by
+// statement by the guard on its own isolated instance, so a LOAD anywhere in a
+// script is refused before any of the script runs. The plain SELECT/DML hot
+// path never pays for the guard.
+//
+// SQL that the guard cannot even split is refused as a syntax error: the
+// serving connection would reject it too, and "no LOAD in here" would be a
+// guess about text nobody could parse.
+func (s *DuckFlightSQLServer) rejectExtensionStatements(query string, stmtType duckdb.StmtType) error {
+	if !s.rejectClientExtensions {
+		return nil
+	}
+	switch stmtType {
+	case duckdb.STATEMENT_TYPE_LOAD:
+		return errClientExtensions
+	case duckdb.STATEMENT_TYPE_SELECT,
+		duckdb.STATEMENT_TYPE_INSERT,
+		duckdb.STATEMENT_TYPE_UPDATE,
+		duckdb.STATEMENT_TYPE_DELETE,
+		duckdb.STATEMENT_TYPE_TRANSACTION:
+		return nil
+	}
+	found, err := s.guard.ExtensionStatements(query)
+	if err != nil {
+		var pe *sqlguard.ParseError
+		if errors.As(err, &pe) {
+			return status.Errorf(codes.InvalidArgument, "syntax error: %s", pe.Msg)
+		}
+		return status.Errorf(codes.Internal, "classify statement: %s", err)
+	}
+	if found {
+		return errClientExtensions
+	}
+	return nil
+}
+
+// checkWrappedProbe applies statement policy to the SQL a schema probe
+// actually runs. The probe wraps client SQL in `SELECT * FROM (…) AS t LIMIT
+// 0`, and SQL crafted to close that subselect turns the probe into a script
+// whose leading statements duckdb-go executes. Classifying the wrapped text
+// rather than the client's catches exactly that.
+func (s *DuckFlightSQLServer) checkWrappedProbe(ctx context.Context, ac *engine.ArrowConn, wrapped string) error {
+	if !s.rejectClientExtensions {
+		return nil
+	}
+	_, stmtType := ac.ClassifyStatement(ctx, wrapped)
+	return s.rejectExtensionStatements(wrapped, stmtType)
 }
 
 func genHandle() []byte {
@@ -439,7 +491,11 @@ func (s *DuckFlightSQLServer) GetSchemaStatement(
 	defer span.End()
 
 	// Execute with LIMIT 0 to get schema without results.
-	rdr, err := ac.Arrow.QueryContext(ctx, fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query))
+	probe := fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query)
+	if err := s.checkWrappedProbe(ctx, ac, probe); err != nil {
+		return nil, otelutil.Failed(span, err)
+	}
+	rdr, err := ac.Arrow.QueryContext(ctx, probe)
 	if err != nil {
 		return nil, otelutil.Failed(span, status.Errorf(duckDBToGRPCCode(err), "query error: %s", err))
 	}

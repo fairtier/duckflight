@@ -20,6 +20,7 @@ import (
 	"github.com/fairtier/duckflight/internal/engine"
 	"github.com/fairtier/duckflight/internal/otelutil"
 	"github.com/fairtier/duckflight/internal/session"
+	"github.com/fairtier/duckflight/internal/sqlguard"
 	"go.opentelemetry.io/otel/trace"
 )
 
@@ -54,6 +55,9 @@ type DuckFlightSQLServer struct {
 	// rejectClientExtensions refuses client-issued INSTALL/LOAD statements;
 	// extensions are then managed exclusively through boot/reconcile SQL.
 	rejectClientExtensions bool
+	// guard classifies client SQL on its own isolated DuckDB instance. Only
+	// opened when a policy needs it; nil otherwise.
+	guard *sqlguard.Guard
 }
 
 // globalEngine is used by the SeedSQL helper for test setup.
@@ -85,6 +89,14 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 	// outlive a DoGet retry, not a client's whole idle window.
 	ticketTTL := max(2*timeout, minTicketTTL)
 
+	var guard *sqlguard.Guard
+	if cfg.RejectClientExtensions {
+		if guard, err = sqlguard.New(); err != nil {
+			_ = eng.Close()
+			return nil, err
+		}
+	}
+
 	cleanupCtx, stopCleanup := context.WithCancel(context.Background())
 
 	srv := &DuckFlightSQLServer{
@@ -97,6 +109,7 @@ func New(cfg *config.Config) (*DuckFlightSQLServer, error) {
 		stopCleanup:            stopCleanup,
 		tracer:                 otelutil.Tracer(),
 		rejectClientExtensions: cfg.RejectClientExtensions,
+		guard:                  guard,
 	}
 	srv.gauges = registerServerGauges(srv)
 	srv.Alloc = memory.DefaultAllocator
@@ -399,6 +412,9 @@ func (s *DuckFlightSQLServer) Close() error {
 		s.stopCleanup()
 		s.sessions.CloseAll()
 		err = s.engine.Close()
+		if s.guard != nil {
+			s.guard.Close()
+		}
 	})
 	return err
 }
