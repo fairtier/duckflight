@@ -153,6 +153,12 @@ spec:
                   name: {{ .Values.auth.existingSecret }}
                   key: auth-tokens
                   optional: true
+            - name: AUTH_READONLY_TOKENS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.auth.existingSecret }}
+                  key: auth-readonly-tokens
+                  optional: true
             - name: AUTH_USERS
               valueFrom:
                 secretKeyRef:
@@ -165,6 +171,28 @@ spec:
                   name: {{ .Values.auth.existingSecret }}
                   key: jwt-secret
                   optional: true
+            {{- end }}
+            {{- with .Values.readOnly }}
+            {{- if .enabled }}
+            - name: READ_ONLY_SESSIONS
+              value: "true"
+            {{- end }}
+            {{- if .users }}
+            - name: AUTH_READONLY_USERS
+              value: {{ join "," .users | quote }}
+            {{- end }}
+            {{- if .poolSize }}
+            - name: READ_ONLY_POOL_SIZE
+              value: {{ .poolSize | quote }}
+            {{- end }}
+            {{- if .memoryLimit }}
+            - name: READ_ONLY_MEMORY_LIMIT
+              value: {{ .memoryLimit | quote }}
+            {{- end }}
+            {{- if .allowedDirectories }}
+            - name: READ_ONLY_ALLOWED_DIRECTORIES
+              value: {{ join "," .allowedDirectories | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.auth.jwtTTL }}
             - name: AUTH_JWT_TTL
