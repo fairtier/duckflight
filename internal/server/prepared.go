@@ -5,6 +5,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -164,6 +165,12 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	query := req.GetQuery()
 	txnID := string(req.GetTransactionId())
 
+	// Refused at prepare time, where the client expects a bad statement to
+	// fail; DoGet/DoPut check again for the caller that executes it.
+	if err := s.checkReadOnlySQL(ctx, query); err != nil {
+		return flightsql.ActionCreatePreparedStatementResult{}, err
+	}
+
 	handle := genHandle()
 	ps := &preparedStatement{query: query, txnID: txnID, createdAt: time.Now()}
 	ps.touch()
@@ -192,7 +199,7 @@ func (s *DuckFlightSQLServer) CreatePreparedStatement(
 	// suffix, and `UPDATE … RETURNING x LIMIT 0` is a valid statement that
 	// performs the update.
 	probe := fmt.Sprintf("SELECT * FROM (%s) AS t LIMIT 0", query)
-	if err := s.checkWrappedProbe(ctx, ac, probe); err != nil {
+	if err := errors.Join(s.checkReadOnlySQL(ctx, probe), s.checkWrappedProbe(ctx, ac, probe)); err != nil {
 		// Skip the probe, not the statement: DoGet/DoPut classify the
 		// client's own SQL before executing it and refuse it there.
 		span.AddEvent("prepared.schema_unavailable")
@@ -260,6 +267,12 @@ func (s *DuckFlightSQLServer) DoGetPreparedStatement(
 
 	reqSpan := trace.SpanFromContext(ctx)
 	reqSpan.SetAttributes(attribute.String(attrPreparedHandle, handle))
+
+	// Checked against the caller executing it, not the one that prepared it.
+	if err := s.checkReadOnlySQL(ctx, ps.query); err != nil {
+		queryCountAdd(ctx, "error")
+		return nil, nil, err
+	}
 
 	ac, release, err := s.resolveConn(ctx, ps)
 	if err != nil {
@@ -435,6 +448,10 @@ func (s *DuckFlightSQLServer) DoPutPreparedStatementUpdate(
 	// Merge: prefer inline params, fall back to previously stored params.
 	if len(args) == 0 {
 		args = ps.getParams()
+	}
+
+	if err := s.checkReadOnlySQL(ctx, ps.query); err != nil {
+		return 0, err
 	}
 
 	ac, release, err := s.resolveConn(ctx, ps)

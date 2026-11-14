@@ -283,6 +283,9 @@ type ArrowPool struct {
 	// SQL, so replacements start from the same state as the originals).
 	newConn func() (*ArrowConn, error)
 	metrics *poolMetrics
+	// label tells this pool's metrics apart from another's in the same
+	// process ("" for the main pool, which keeps its unlabeled series).
+	label string
 
 	mu     sync.Mutex
 	closed bool
@@ -293,12 +296,19 @@ type ArrowPool struct {
 
 // NewArrowPool creates a pool of size Arrow connections from the given connector.
 func NewArrowPool(connector *duckdb.Connector, size int) (*ArrowPool, error) {
+	return NewLabeledArrowPool(connector, size, "")
+}
+
+// NewLabeledArrowPool is [NewArrowPool] for a second pool in the same process:
+// its metrics carry pool=<label>, so they don't collide with the main pool's.
+func NewLabeledArrowPool(connector *duckdb.Connector, size int, label string) (*ArrowPool, error) {
 	if size < 1 {
 		return nil, fmt.Errorf("pool size must be at least 1, got %d", size)
 	}
 	p := &ArrowPool{
-		pool: make(chan *ArrowConn, size),
-		live: make(map[*ArrowConn]struct{}, size),
+		pool:  make(chan *ArrowConn, size),
+		live:  make(map[*ArrowConn]struct{}, size),
+		label: label,
 	}
 	// Before the boot loop below: a failure there calls Close, which stops the
 	// metrics registration.
@@ -339,7 +349,9 @@ func (p *ArrowPool) Acquire(ctx context.Context) (*ArrowConn, error) {
 	start := time.Now()
 	// The wait is measured on every path, failed ones included: an acquire that
 	// ends in a deadline is precisely the saturation signal worth keeping.
-	defer func() { p.metrics.acquireDuration.Record(ctx, time.Since(start).Seconds()) }()
+	defer func() {
+		p.metrics.acquireDuration.Record(ctx, time.Since(start).Seconds(), MetricLabel(p.label))
+	}()
 
 	select {
 	case ac, ok := <-p.pool:
@@ -419,7 +431,7 @@ func (p *ArrowPool) discard(ac *ArrowConn, reason string) {
 	if ac == nil {
 		return
 	}
-	p.metrics.recordRecycled(reason)
+	p.metrics.recordRecycled(reason, p.label)
 	p.mu.Lock()
 	closed := p.closed
 	delete(p.live, ac)
@@ -434,7 +446,7 @@ func (p *ArrowPool) discard(ac *ArrowConn, reason string) {
 		// Losing a connection shrinks the pool but keeps the server serving;
 		// a permanently smaller pool is far better than handing out a dirty
 		// or closed connection.
-		p.metrics.lost.Add(context.Background(), 1)
+		p.metrics.lost.Add(context.Background(), 1, MetricLabel(p.label))
 		slog.Error("failed to replace pooled connection", slog.String("error", err.Error()))
 		return
 	}
@@ -463,6 +475,9 @@ func (p *ArrowPool) put(ac *ArrowConn) {
 	p.mu.Unlock()
 	_ = ac.conn.Close()
 }
+
+// Label is the pool's metric label ("" for the main pool).
+func (p *ArrowPool) Label() string { return p.label }
 
 // Len returns the number of currently available connections in the pool.
 func (p *ArrowPool) Len() int { return len(p.pool) }

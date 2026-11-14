@@ -31,6 +31,13 @@ const (
 	bearerScheme = "Bearer"
 )
 
+// ReadOnlyHeader lets a caller holding a read-write credential restrict a
+// request to a read-only session: `x-duckflight-read-only: true` (or `1`).
+// It can only take privileges away. `false`/`0` and absence leave the
+// credential's own mode in place, and any other value is refused rather than
+// guessed at, so a typo never silently runs read-write.
+const ReadOnlyHeader = "x-duckflight-read-only"
+
 // minJWTSecretLen is the shortest accepted AUTH_JWT_SECRET. HS256 tokens are
 // only as strong as their key: a short secret is brute-forceable offline, and
 // forging one yields a token with an attacker-chosen subject *and* session id,
@@ -65,6 +72,11 @@ type Identity struct {
 	// answer, and they are cheap, bounded and free of user identifiers.
 	Method        string
 	SessionSource string
+	// ReadOnly routes the request to the read-only DuckDB instance and
+	// subjects its SQL to the read-only statement policy. Set when the
+	// credential is configured read-only, or when the caller asked for it
+	// with [ReadOnlyHeader]; never cleared by anything the client sends.
+	ReadOnly bool
 }
 
 // Values for [Identity.Method].
@@ -101,6 +113,14 @@ type Config struct {
 	OIDC *oidcVerifier
 	// StaticTokens is the opaque-token allowlist (legacy AUTH_TOKENS).
 	StaticTokens []string
+	// ReadOnlyStaticTokens are opaque tokens whose every request is
+	// read-only (AUTH_READONLY_TOKENS). A token listed in both lists is
+	// read-only.
+	ReadOnlyStaticTokens []string
+	// ReadOnlyUsers names Users whose handshake-issued tokens are read-only
+	// (AUTH_READONLY_USERS). Decided per request from the token's subject,
+	// so changing the list affects tokens already issued.
+	ReadOnlyUsers []string
 }
 
 // Backends names the auth backends a Config enables, for the startup log line.
@@ -112,6 +132,12 @@ func (c Config) Backends() []string {
 	if len(c.StaticTokens) > 0 {
 		out = append(out, "static-tokens")
 	}
+	if len(c.ReadOnlyStaticTokens) > 0 {
+		out = append(out, "static-tokens(read-only)")
+	}
+	if len(c.ReadOnlyUsers) > 0 {
+		out = append(out, "basic+jwt(read-only users)")
+	}
 	if c.OIDC != nil {
 		out = append(out, "oidc")
 	}
@@ -121,17 +147,28 @@ func (c Config) Backends() []string {
 // Middleware builds the Flight ServerMiddleware. Returns nil when no backend
 // is configured (auth disabled).
 func Middleware(cfg Config) (*flight.ServerMiddleware, error) {
-	if len(cfg.Users) == 0 && len(cfg.StaticTokens) == 0 && cfg.OIDC == nil {
+	if len(cfg.Users) == 0 && len(cfg.StaticTokens) == 0 && len(cfg.ReadOnlyStaticTokens) == 0 && cfg.OIDC == nil {
 		return nil, nil
 	}
 
 	v := &validator{
-		users:        cfg.Users,
-		staticTokens: make(map[[sha256.Size]byte]struct{}, len(cfg.StaticTokens)),
-		oidc:         cfg.OIDC,
+		users:         cfg.Users,
+		staticTokens:  make(map[[sha256.Size]byte]bool, len(cfg.StaticTokens)+len(cfg.ReadOnlyStaticTokens)),
+		oidc:          cfg.OIDC,
+		readOnlyUsers: make(map[string]bool, len(cfg.ReadOnlyUsers)),
 	}
 	for _, t := range cfg.StaticTokens {
-		v.staticTokens[sha256.Sum256([]byte(t))] = struct{}{}
+		v.staticTokens[sha256.Sum256([]byte(t))] = false
+	}
+	// After the read-write tokens, so a token in both lists ends up read-only.
+	for _, t := range cfg.ReadOnlyStaticTokens {
+		v.staticTokens[sha256.Sum256([]byte(t))] = true
+	}
+	for _, u := range cfg.ReadOnlyUsers {
+		if _, ok := cfg.Users[u]; !ok {
+			return nil, fmt.Errorf("read-only user %q is not a configured user", u)
+		}
+		v.readOnlyUsers[u] = true
 	}
 	if len(cfg.Users) > 0 {
 		secret := cfg.JWTSecret
@@ -201,10 +238,12 @@ func (w *wrappedStream) Context() context.Context { return w.ctx }
 
 // validator implements the auth backends.
 type validator struct {
-	users        map[string]string
-	local        *localJWT
-	oidc         *oidcVerifier
-	staticTokens map[[sha256.Size]byte]struct{}
+	users map[string]string
+	local *localJWT
+	oidc  *oidcVerifier
+	// staticTokens maps a token digest to whether it is read-only.
+	staticTokens  map[[sha256.Size]byte]bool
+	readOnlyUsers map[string]bool
 	// cookies mints/verifies the session cookie that gives static/OIDC
 	// clients a per-client session id independent of the transport. Always
 	// non-nil when the middleware is enabled.
@@ -251,6 +290,11 @@ func (v *validator) authenticate(ctx context.Context) (context.Context, error) {
 	if err != nil {
 		return nil, err
 	}
+	selfRestricted, err := readOnlyRequested(ctx)
+	if err != nil {
+		return nil, err
+	}
+	id.ReadOnly = id.ReadOnly || selfRestricted
 
 	// Attributes on the RPC's existing span rather than a span of their own:
 	// authentication is a step inside the call, not a unit of work worth its
@@ -260,6 +304,7 @@ func (v *validator) authenticate(ctx context.Context) (context.Context, error) {
 		attribute.String("auth.method", id.Method),
 		attribute.String("session.source", id.SessionSource),
 		attribute.String("session.id", id.SessionID),
+		attribute.Bool("auth.read_only", id.ReadOnly),
 	)
 	if setCookie != "" {
 		// Best effort: a client without a cookie jar ignores it, and a
@@ -321,24 +366,53 @@ func (v *validator) issueToken(username, password string) (string, error) {
 	return tok, nil
 }
 
-// matchesStaticToken reports whether token is in the allowlist, comparing
-// digests in constant time and without short-circuiting on the first match.
-// The digest already destroys any prefix correlation an attacker could time,
-// so this is consistency with the password path rather than a live fix.
-func (v *validator) matchesStaticToken(token string) bool {
+// matchesStaticToken reports whether token is in the allowlist and whether it
+// is a read-only token, comparing digests in constant time and without
+// short-circuiting on the first match. The digest already destroys any prefix
+// correlation an attacker could time, so this is consistency with the
+// password path rather than a live fix.
+func (v *validator) matchesStaticToken(token string) (match, readOnly bool) {
 	sum := sha256.Sum256([]byte(token))
-	var match int
-	for candidate := range v.staticTokens {
-		match |= subtle.ConstantTimeCompare(sum[:], candidate[:])
+	var m, ro int
+	for candidate, isRO := range v.staticTokens {
+		eq := subtle.ConstantTimeCompare(sum[:], candidate[:])
+		m |= eq
+		if isRO {
+			ro |= eq
+		}
 	}
-	return match == 1
+	return m == 1, ro == 1
+}
+
+// readOnlyRequested parses [ReadOnlyHeader].
+func readOnlyRequested(ctx context.Context) (bool, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return false, nil
+	}
+	vals := md.Get(ReadOnlyHeader)
+	if len(vals) == 0 {
+		return false, nil
+	}
+	ro := false
+	for _, val := range vals {
+		switch strings.ToLower(strings.TrimSpace(val)) {
+		case "true", "1":
+			ro = true
+		case "false", "0", "":
+		default:
+			return false, status.Errorf(codes.InvalidArgument,
+				"invalid %s header %q: expected true or false", ReadOnlyHeader, val)
+		}
+	}
+	return ro, nil
 }
 
 // identify resolves a bearer token to an [Identity]. The second return value
 // is a Set-Cookie header value to send back, or "" — returned rather than set
 // here so identify stays free of gRPC side effects.
 func (v *validator) identify(ctx context.Context, token string) (Identity, string, error) {
-	if v.matchesStaticToken(token) {
+	if ok, readOnly := v.matchesStaticToken(token); ok {
 		// Bind to the raw token: every static token shares the "static"
 		// subject, so binding to the subject would merge distinct tokens
 		// that happen to present the same cookie.
@@ -348,6 +422,7 @@ func (v *validator) identify(ctx context.Context, token string) (Identity, strin
 			SessionID:     sid,
 			Method:        MethodStatic,
 			SessionSource: src,
+			ReadOnly:      readOnly,
 		}, setCookie, nil
 	}
 
@@ -388,6 +463,7 @@ func (v *validator) identify(ctx context.Context, token string) (Identity, strin
 				SessionID:     sid,
 				Method:        MethodJWT,
 				SessionSource: SessionSourceJWT,
+				ReadOnly:      v.readOnlyUsers[sub],
 			}, "", nil
 		}
 		sid, setCookie, src := v.sessionForToken(ctx, token, token)
@@ -396,6 +472,7 @@ func (v *validator) identify(ctx context.Context, token string) (Identity, strin
 			SessionID:     sid,
 			Method:        MethodJWT,
 			SessionSource: src,
+			ReadOnly:      v.readOnlyUsers[sub],
 		}, setCookie, nil
 	default:
 		return Identity{}, "", status.Error(codes.Unauthenticated, "unknown token issuer")
@@ -450,6 +527,14 @@ func deriveSessionID(ctx context.Context, token string) string {
 func IdentityFromContext(ctx context.Context) (Identity, bool) {
 	id, ok := ctx.Value(identityCtxKey{}).(Identity)
 	return id, ok
+}
+
+// ReadOnlyFromContext reports whether the authenticated request is read-only.
+// False when auth is disabled: without a credential there is nothing to mark
+// read-only, so an unauthenticated server has no read-only sessions.
+func ReadOnlyFromContext(ctx context.Context) bool {
+	id, _ := IdentityFromContext(ctx)
+	return id.ReadOnly
 }
 
 // SessionIDFromContext returns the session id of the authenticated request,
