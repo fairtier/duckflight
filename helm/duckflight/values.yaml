@@ -81,11 +81,34 @@ tempDir:
 auth:
   # Optional Secret containing static bearer tokens, basic-auth users, and the
   # JWT signing key. Recognized keys (all optional):
-  #   auth-tokens  — comma-separated opaque bearer tokens
-  #   auth-users   — comma-separated user:password pairs
-  #   jwt-secret   — HMAC secret used to sign handshake-issued JWTs
+  #   auth-tokens           — comma-separated opaque bearer tokens
+  #   auth-readonly-tokens  — comma-separated bearer tokens whose sessions are
+  #                           read-only (see readOnly below); setting this key
+  #                           turns read-only sessions on
+  #   auth-users            — comma-separated user:password pairs
+  #   jwt-secret            — HMAC secret used to sign handshake-issued JWTs
   existingSecret: ""
   jwtTTL: ""    # e.g. "1h"; default 1h when empty
+
+# Read-only sessions: a credential marked read-only (auth-readonly-tokens in
+# the auth Secret, or a user listed in readOnly.users) is served by a second,
+# hardened DuckDB instance — external access off, Iceberg catalog attached
+# READ_ONLY, configuration locked — and may only run SELECT-shaped statements.
+# See the README's "Read-only sessions" and "Security" sections.
+readOnly:
+  # Start the read-only instance even without a read-only credential, for
+  # callers that self-restrict with the `x-duckflight-read-only: true` header.
+  enabled: false
+  # Basic-auth users (from auth-users) whose sessions are read-only.
+  users: []
+  # Size of the read-only instance. It has its own buffer pool: budget pod
+  # memory for resources.memoryLimit + readOnly.memoryLimit.
+  poolSize: 0        # 0 = resources.poolSize
+  memoryLimit: ""    # "" = resources.memoryLimit
+  # Paths the read-only instance may open (DuckDB allowed_directories). Must
+  # cover the warehouse location. Empty list = the default, "s3://" (any
+  # bucket the S3 credential can read); narrow it, e.g. ["s3://warehouse/"].
+  allowedDirectories: []
 
 oidc:
   issuer: ""    # full issuer URL; enables OIDC bearer-token acceptance

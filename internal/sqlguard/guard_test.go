@@ -81,6 +81,8 @@ func TestCheckReadOnly(t *testing.T) {
 		{"window and aggregates", "SELECT sum(x) OVER (PARTITION BY y), count(*) FROM t GROUP BY ALL", allow, ""},
 		{"string mentioning a path", "SELECT '/proc/self/environ' AS p", allow, ""},
 		{"current_setting", "SELECT current_setting('threads')", allow, ""},
+		{"standard pivot in from", "SELECT * FROM t PIVOT (sum(b) FOR a IN (1, 2))", allow, ""},
+		{"unpivot statement", "UNPIVOT t ON a, b INTO NAME k VALUE v", allow, ""},
 
 		// --- statement types the parser does not call SELECT
 		{"insert", "INSERT INTO t VALUES (1)", deny, "only SELECT"},

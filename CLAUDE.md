@@ -35,9 +35,11 @@ internal/
   engine/
     engine.go                DuckDB connector lifecycle, boot SQL, Iceberg ATTACH
     pool.go                  Bounded channel-based ArrowConn pool
+    readonly.go              Hardened read-only DuckDB instance (ext access off, lake READ_ONLY, config locked)
     metrics.go               Per-pool instruments (idle/max gauges, acquire duration, recycle counters)
   otelutil/otelutil.go       Shared OTel scope name, Tracer()/Meter(), span error recording
   telemetry/telemetry.go     OTel SDK setup: OTLP traces/logs, Prometheus metrics, stderr logs
+  sqlguard/                  Parser-based statement policy (read-only allowlist, extension statements) on an isolated DuckDB instance
   auth/middleware.go         Bearer token flight.ServerMiddleware (own header parsing, not arrow-go's); resolves the sid (JWT claim → cookie → peer)
   auth/jwt.go                HS256 token mint/verify with sid (session id) claim
   auth/cookie.go             HMAC-signed session cookie mint/verify/parse (Flight arrow_flight_session_id)
@@ -49,6 +51,7 @@ internal/
     statements.go            GetFlightInfoStatement, DoGetStatement, DoPutCommandStatementUpdate, GetSchemaStatement; acquireConn routing
     prepared.go              CreatePreparedStatement, ClosePreparedStatement, DoGet/DoPut prepared
     transactions.go          BeginTransaction, EndTransaction — bind to session conn when present, pool conn otherwise
+    readonly.go              plane (engine + sessions) routing by identity, read-only statement check
     metadata.go              DoGetCatalogs, DoGetDBSchemas, DoGetTables, DoGetTableTypes
     primarykeys.go           DoGetPrimaryKeys via duckdb_constraints()
     foreignkeys.go           DoGetImportedKeys, DoGetExportedKeys, DoGetCrossReference
@@ -91,6 +94,30 @@ back to one-shot pool borrowing. Sessions idle longer than the resource TTL
 on a reaped session gets a fresh one, but an open transaction bound to it fails
 with `FailedPrecondition` rather than silently continuing in autocommit. See
 [internal/session/manager.go](internal/session/manager.go).
+
+**Read-only sessions are a second DuckDB instance.** A request whose identity
+is read-only (`AUTH_READONLY_TOKENS`, `AUTH_READONLY_USERS`, or the
+`x-duckflight-read-only: true` header, which can only restrict) is routed to a
+separate *plane* — its own engine, pool and session manager — on an instance
+that, after booting like the main one with the lake attached `READ_ONLY`, sets
+`allowed_directories`, `enable_external_access=false` and
+`lock_configuration=true`. Those are instance-wide and one-way, hence a second
+instance rather than a second pool. Every SQL-bearing RPC first runs
+`sqlguard.CheckReadOnly`: `json_serialize_sql` (which only serializes SELECT
+nodes) on the guard's own isolated instance, then an AST walk — table
+functions by allowlist, a scalar denylist, no path-like replacement scans.
+Transactions remember their plane; a request may only use a transaction of
+its own plane. No read-only setting ⇒ no second instance and no behavior
+change; a read-only request without the instance ⇒ `FailedPrecondition`.
+Empirics behind the design (all pinned by tests): Iceberg reads, including
+tables created after the lockdown, keep working because the REST catalog's HTTP
+traffic bypasses `allowed_directories` while S3 object reads are checked
+against it; `allowed_directories` permits writes too (COPY TO an allowed
+prefix succeeds), so the parser check is not optional; spilling still works
+(temp_directory is implicitly allowed); `disabled_filesystems='LocalFileSystem'`
+breaks spilling; external access off at open time prevents loading the
+extensions at all; the read-only instance must `LOAD httpfs/avro` explicitly
+because nothing can be autoloaded after the lockdown.
 
 **`acquireConn` precedence** (`internal/server/statements.go`):
 1. explicit Flight transaction (`txnID != ""`) → the txn's pinned conn,
@@ -206,6 +233,10 @@ infrastructure underneath it.
 | `duckflight_sessions_created_total`       | Counter   | —                                             |
 | `duckflight_sessions_evicted_total`       | Counter   | `reason` (closed/reaped/reclaimed/shutdown)   |
 
+The `duckflight_pool_*` and `duckflight_sessions_*` series of the read-only
+instance carry `pool="read_only"`; the main instance's series have no `pool`
+label, so a deployment without read-only sessions exports exactly what it did.
+
 The gauges are OTel observable instruments whose callbacks read live server
 state; each is unregistered when its pool/manager/server closes, so a shut-down
 component stops reporting instead of reporting stale numbers.
@@ -274,7 +305,12 @@ All via environment variables. See README.md for the full table. Key ones:
   EXTENSIONS`, alone or anywhere in a multi-statement script (split by
   `internal/sqlguard` before any of the script runs), and in a GetSchema probe
 - `TEMP_DIRECTORY` — DuckDB spill directory; without it an in-memory engine
-  errors on larger-than-memory operations
+  errors on larger-than-memory operations (the read-only instance uses
+  `<TEMP_DIRECTORY>/read-only`)
+- `AUTH_READONLY_TOKENS`, `AUTH_READONLY_USERS`, `READ_ONLY_SESSIONS`,
+  `READ_ONLY_POOL_SIZE`, `READ_ONLY_MEMORY_LIMIT`,
+  `READ_ONLY_ALLOWED_DIRECTORIES` — read-only sessions (README "Read-only
+  sessions" and "Security")
 
 ## Testing Patterns
 

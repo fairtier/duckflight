@@ -124,6 +124,12 @@ All configuration is via environment variables:
 | `EXTENSION_DIR`         | `/extensions` (image) | DuckDB `extension_directory` holding pre-installed extensions                                                    |
 | `RECONCILE_SQL_PATH`    |                 | Path to a SQL file executed instance-wide at startup and re-executed whenever its content changes (~10s poll). Meant for operator-managed `CREATE OR REPLACE SECRET` / `LOAD` statements delivered as a mounted Secret; rotation reaches every pooled connection with no restart. Missing file = nothing to do; a failing file is logged (label only, never the SQL text) and does not stop the server |
 | `REJECT_CLIENT_EXTENSIONS` | `false`      | `true`/`1` to refuse a client-issued `INSTALL`/`LOAD`/`UPDATE EXTENSIONS` (`PermissionDenied`), alone or anywhere in a multi-statement script — the script is split with DuckDB's parser and refused before any of it runs. Provision extensions via `EXTENSION_DIR` and reconcile SQL. Note this only covers extensions: for a caller that must not write or reach files/network, use a read-only credential (see [Read-only sessions](#read-only-sessions)) |
+| `AUTH_READONLY_TOKENS`  |                 | Comma-separated bearer tokens whose every request is read-only (see [Read-only sessions](#read-only-sessions)). Setting it turns read-only sessions on. A token in both this and `AUTH_TOKENS` is read-only |
+| `AUTH_READONLY_USERS`   |                 | Comma-separated usernames from `AUTH_USERS` whose handshake-issued tokens are read-only (decided per request, so it also applies to tokens already issued). An unknown name refuses startup. Setting it turns read-only sessions on |
+| `READ_ONLY_SESSIONS`    | `false`         | `true`/`1` to start the read-only instance without any read-only credential, for callers that only self-restrict with the `x-duckflight-read-only` header |
+| `READ_ONLY_POOL_SIZE`   | `POOL_SIZE`     | Connection pool of the read-only instance                                                                              |
+| `READ_ONLY_MEMORY_LIMIT`| `MEMORY_LIMIT`  | Buffer pool of the read-only instance. It is separate from the main one: the process can use up to the sum of both     |
+| `READ_ONLY_ALLOWED_DIRECTORIES` | `s3://` with Iceberg, else none | Comma-separated path/URL prefixes the read-only instance may open (DuckDB `allowed_directories`). Must cover the warehouse location; narrow it to the bucket, e.g. `s3://warehouse/`. Set but empty = nothing at all |
 | `TEMP_DIRECTORY`        |                 | DuckDB `temp_directory`. Without it an in-memory engine errors on larger-than-memory operations instead of spilling to disk |
 | `LOG_LEVEL`             | `INFO`          | Log level: DEBUG, INFO, WARN, ERROR. `DEBUG` also puts SQL text on logs and spans                                      |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` |           | OTLP collector (`host:port`, scheme optional). Enables trace and log export; empty = traces off, logs to stderr only    |
@@ -207,6 +213,112 @@ databow --driver flightsql --uri grpc+tls://duckflight.example.com:443 \
   --query "SELECT 1"
 ```
 
+## Read-only sessions
+
+A caller can be limited to reading. The credential decides — the client cannot
+opt out:
+
+- **`AUTH_READONLY_TOKENS`** — bearer tokens that are always read-only.
+- **`AUTH_READONLY_USERS`** — `AUTH_USERS` names whose handshake tokens are read-only.
+- **`x-duckflight-read-only: true`** (or `1`) — a request header with which a
+  caller holding a read-write credential restricts *itself*, e.g. one service
+  that runs both trusted queries and queries written by an AI agent. The header
+  only ever takes privileges away; `false`/`0`/absent leave the credential's
+  mode, any other value is refused (`InvalidArgument`) rather than guessed at.
+  OIDC tokens have no read-only mapping yet; use the header.
+
+```bash
+AUTH_TOKENS="$RW_TOKEN" AUTH_READONLY_TOKENS="$AGENT_TOKEN" ./duckflight
+databow --driver flightsql --uri grpc+tcp://localhost:31337 \
+  --option "adbc.flight.sql.authorization_header=Bearer $AGENT_TOKEN" \
+  --query "SELECT count(*) FROM lake.default.orders"
+```
+
+A read-only request:
+
+1. is served by a **second DuckDB instance** with its own pool, sessions and
+   memory limit. It boots like the main one (extensions, secrets, the Iceberg
+   catalog — attached `READ_ONLY`) and then, before serving anything, sets
+   `allowed_directories` (`READ_ONLY_ALLOWED_DIRECTORIES`),
+   `enable_external_access = false` and `lock_configuration = true`. These
+   settings are instance-wide and one-way in DuckDB, which is why it is a
+   separate instance rather than a pool on the main one;
+2. has every statement checked by **DuckDB's own parser** before it reaches
+   that instance (`internal/sqlguard`, on a third, empty, isolated DuckDB
+   instance): only what parses as a SELECT is allowed — `SELECT`, `WITH … SELECT`,
+   `FROM tbl`, `VALUES`, `DESCRIBE`, `SHOW`, `SUMMARIZE`, plain `EXPLAIN` —
+   a script only if every statement is; table functions by allowlist (generators,
+   `duckdb_*` catalog functions, `iceberg_snapshots`/`iceberg_metadata`), no
+   `read_*`/`glob`/`query()`/`duckdb_secrets()`/`getenv`/`FROM 'path'` scans.
+   A refusal is `PermissionDenied` with a reason naming the construct; a syntax
+   error is `InvalidArgument`;
+3. cannot ingest (`DoPut` bulk ingestion is refused), cannot use a transaction a
+   read-write request began, and gets `SqlInfoFlightSqlServerReadOnly = true`
+   (and no DDL/ingestion support) from `GetSqlInfo`.
+
+A read-only request to a server without read-only sessions enabled is refused
+(`FailedPrecondition`), never served read-write. With no read-only setting at
+all, nothing changes: no second instance is started.
+
+The read-only instance sees the Iceberg lake exactly like the main one (tables
+and commits made after it started included). It does **not** see the main
+instance's in-memory tables, temp tables or `SET` overrides. `RECONCILE_SQL_PATH`
+is applied to both instances; on the read-only one, statements that need
+external access after its lockdown (`INSTALL`/`LOAD`, a secret type whose
+extension was not loaded at boot) fail and are logged.
+
+## Security
+
+**Threat model.** Any holder of a read-write credential is fully trusted: it
+runs arbitrary DuckDB SQL with the server's privileges — it can write and drop
+lake tables, `COPY … TO 's3://…'`, read local files (including
+`/proc/self/environ`, which holds the S3 and catalog credentials) and reach the
+network. Read-write credentials belong to operators and trusted services only.
+`REJECT_CLIENT_EXTENSIONS` keeps extension management server-side but is not a
+privilege boundary.
+
+A read-only credential is meant for a less trusted caller — an AI agent, an
+ad-hoc explore UI. The boundary is two independent layers: the parser check
+above, and the engine confinement below it, which holds on its own if the
+parser check ever misses something. Verified against Lakekeeper + S3 in
+`test/iceberg_integration_test.go`, the read-only *instance itself* (with the
+parser check bypassed) refuses: writes to the lake (`READ_ONLY` attach); local
+files and `http(s)://` URLs; any S3 path outside `allowed_directories`;
+`INSTALL`/`LOAD`; any `SET`/`RESET`/`PRAGMA` of a setting
+(`lock_configuration`); and unredacted secrets (`duckdb_secrets()` is redacted,
+`redact := false` is refused).
+
+**What a read-only caller can still do:**
+
+- Read every table in the attached lake, and the catalog metadata. There is no
+  per-table authorization.
+- Consume resources: queries are bounded by `QUERY_TIMEOUT`,
+  `READ_ONLY_MEMORY_LIMIT`, `MAX_RESULT_BYTES` and the rate limiter, not by
+  anything read-only specific.
+- Within `allowed_directories`, DuckDB itself permits raw reads *and writes*
+  of objects. The parser check is what stops `read_parquet('s3://…')`,
+  `FROM 's3://…'` and `COPY … TO` there; with the default `s3://` that is every
+  bucket the S3 credential reaches. Narrow `READ_ONLY_ALLOWED_DIRECTORIES` to
+  the warehouse bucket to shrink what a parser-check gap could expose.
+- Call any scalar function not on the short denylist. The table-function
+  allowlist and the scalar denylist in `internal/sqlguard/readonly.go` are the
+  place to review on every DuckDB upgrade: a new function that touches files,
+  the network or state is admitted by the denylist until it is named there
+  (the engine confinement still applies to it).
+
+**Known gaps.** The Iceberg REST catalog's HTTP traffic is not subject to
+`allowed_directories` (it does not go through DuckDB's file system), which is
+why Iceberg keeps working; a read-only caller can make the instance send
+catalog lookups for any table name, but only to the configured catalog. The
+DuckDB-specific `PIVOT t ON … USING …` *statement* is refused (the parser
+check cannot serialize it); the SQL-standard `FROM t PIVOT (… FOR … IN …)`
+and `UNPIVOT` work. OAuth2-authenticated catalogs were not exercised by the
+integration tests (Lakekeeper runs without auth there), so token refresh after
+the lockdown is untested.
+Settings tried and rejected: `disabled_filesystems = 'LocalFileSystem'` is
+global and breaks spilling to `temp_directory`; `enable_external_access =
+false` at open time (DSN) prevents loading the Iceberg extensions at all.
+
 ## Observability
 
 DuckFlight is instrumented with OpenTelemetry end to end.
@@ -259,14 +371,16 @@ go test -tags="duckdb_arrow iceberg_integration" ./test/...
 ```
 cmd/server/          Entry point, env config, graceful shutdown
 internal/
-  auth/              gRPC bearer token middleware
+  auth/              gRPC bearer token middleware, read-only credentials
   config/            Config struct and defaults
-  engine/            DuckDB lifecycle, Arrow connection pool
+  engine/            DuckDB lifecycle, Arrow connection pool, hardened read-only instance
+  sqlguard/          Parser-based statement policy on an isolated DuckDB instance
   server/
     server.go          FlightSQL server core, SqlInfo registration
     statements.go      Query execution, DML
     prepared.go        Prepared statements
     transactions.go    BEGIN/COMMIT/ROLLBACK
+    readonly.go        Read-only plane routing and statement policy
     metadata.go        Catalog/schema/table/table-type endpoints
     primarykeys.go     Primary key metadata
     foreignkeys.go     Imported/exported keys, cross-reference
