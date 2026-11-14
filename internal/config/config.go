@@ -47,6 +47,30 @@ type Config struct {
 
 	// Metering
 	MaxResultBytes int64
+
+	// ReadOnly enables read-only sessions, served by a second, hardened
+	// DuckDB instance. nil (the default) disables them: no second instance
+	// is created and a read-only request is refused.
+	ReadOnly *ReadOnlyConfig
+}
+
+// ReadOnlyConfig sizes and confines the DuckDB instance behind read-only
+// sessions. It shares the Iceberg/S3 settings of the main Config.
+type ReadOnlyConfig struct {
+	// PoolSize is the connection pool of the read-only instance. 0 means
+	// the main PoolSize.
+	PoolSize int
+	// MemoryLimit is the read-only instance's own buffer pool. "" means the
+	// main MemoryLimit. The two instances do not share memory, so the
+	// process can use up to the sum of both.
+	MemoryLimit string
+	// AllowedDirectories are the only paths/URL prefixes the read-only
+	// instance may open once external access is disabled (DuckDB's
+	// allowed_directories). Iceberg metadata and data files are read through
+	// it, so it must cover the warehouse location. nil means ["s3://"] when
+	// an Iceberg catalog is configured and nothing otherwise; narrow it to
+	// the warehouse bucket (e.g. "s3://warehouse/") where possible.
+	AllowedDirectories []string
 }
 
 // DefaultConfig returns a Config with sensible defaults for development.
