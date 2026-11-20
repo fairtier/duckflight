@@ -45,7 +45,7 @@ func TestCookieMintVerifyRoundTrip(t *testing.T) {
 		"",
 		"not-base64!!",
 		val[:len(val)-4],                         // truncated
-		"A" + val[1:],                            // flipped id byte
+		flip(val[0]) + val[1:],                   // flipped id byte
 		val[:len(val)-1] + flip(val[len(val)-1]), // flipped tag byte
 		val + val,                                // wrong length
 	} {
