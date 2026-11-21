@@ -328,3 +328,89 @@ func TestReadOnlyRequestWithoutReadOnlyEngine(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, sqlInfoReadOnly(ctx, t, rw))
 }
+
+// TestReadOnlyMultiStatement pins how the read-only boundary meets scripts.
+// The statement check is applied to the whole text, so every statement of a
+// script is classified and one refused statement anywhere refuses all of it
+// before any of it runs; a script that passes runs on the locked-down
+// instance. Read-write sessions on the same server keep the run-once
+// behavior: a script's leading statements are not executed twice.
+func TestReadOnlyMultiStatement(t *testing.T) {
+	f := newReadOnlyFixture(t, true)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	rw := f.dial(t, &bearer{token: rwToken})
+	ro := f.dial(t, &bearer{token: roToken})
+
+	_, err := rw.ExecuteUpdate(ctx, "CREATE TABLE ms_rw (i INT)")
+	require.NoError(t, err)
+
+	t.Run("read-only refuses a script with any refused statement", func(t *testing.T) {
+		for _, q := range []string{
+			"SELECT 1; DROP TABLE ms_rw",
+			"SELECT 1; SET threads = 1",
+			"SET threads = 1; SELECT 1",
+			"SELECT 1; SELECT 2; RESET threads",
+			"SELECT 1; PRAGMA threads = 1",
+			"SELECT 1; CREATE TEMP TABLE t AS SELECT 1; SELECT 2",
+			"SELECT 1; INSERT INTO ms_rw VALUES (1)",
+			"SELECT 1; COPY (SELECT 1) TO '/tmp/duckflight-ro-ms-leak.csv'",
+			"SELECT 1; ATTACH ':memory:' AS m",
+			"SELECT 1; LOAD json",
+			"SELECT 1; BEGIN; SELECT 2; COMMIT",
+			"SELECT 1; SELECT * FROM read_text('/proc/self/environ')",
+			"SELECT 1; SELECT getenv('HOME')",
+			"SELECT 1;\n-- comment\nCALL pragma_version()",
+		} {
+			_, err := ro.Execute(ctx, q)
+			requireCode(t, codes.PermissionDenied, err, "execute %q", q)
+			_, err = ro.ExecuteUpdate(ctx, q)
+			requireCode(t, codes.PermissionDenied, err, "update %q", q)
+			_, err = ro.Prepare(ctx, q)
+			requireCode(t, codes.PermissionDenied, err, "prepare %q", q)
+
+			tx, err := ro.BeginTransaction(ctx)
+			require.NoError(t, err)
+			_, err = tx.ExecuteUpdate(ctx, q)
+			requireCode(t, codes.PermissionDenied, err, "txn update %q", q)
+			require.NoError(t, tx.Rollback(ctx))
+		}
+
+		// Nothing leading those scripts took effect: the setting is
+		// unchanged on the read-only instance, and the read-write table is
+		// still there and empty.
+		got, err := queryString(ctx, ro, "SELECT current_setting('threads')")
+		require.NoError(t, err)
+		require.Equal(t, "2", got)
+		got, err = queryString(ctx, rw, "SELECT count(*) FROM ms_rw")
+		require.NoError(t, err)
+		require.Equal(t, "0", got)
+	})
+
+	t.Run("read-only script runs on the locked-down instance", func(t *testing.T) {
+		got, err := queryString(ctx, ro,
+			"SELECT 1; SELECT current_setting('enable_external_access')::VARCHAR || ',' || current_setting('lock_configuration')::VARCHAR")
+		require.NoError(t, err)
+		require.Equal(t, "false,true", got)
+		// The read-write instance's table is not visible from a script either.
+		_, err = queryString(ctx, ro, "SELECT 1; SELECT count(*) FROM ms_rw")
+		require.Error(t, err)
+	})
+
+	t.Run("read-write scripts run once", func(t *testing.T) {
+		got, err := queryString(ctx, rw, "INSERT INTO ms_rw VALUES (1); SELECT count(*) FROM ms_rw")
+		require.NoError(t, err)
+		require.Equal(t, "1", got)
+		_, err = rw.ExecuteUpdate(ctx, "INSERT INTO ms_rw VALUES (2); INSERT INTO ms_rw VALUES (3)")
+		require.NoError(t, err)
+		got, err = queryString(ctx, rw, "SELECT count(*) FROM ms_rw")
+		require.NoError(t, err)
+		require.Equal(t, "3", got)
+		_, err = rw.ExecuteUpdate(ctx, "BEGIN TRANSACTION; INSERT INTO ms_rw VALUES (4); COMMIT")
+		require.NoError(t, err)
+		got, err = queryString(ctx, rw, "SELECT count(*) FROM ms_rw")
+		require.NoError(t, err)
+		require.Equal(t, "4", got)
+	})
+}
